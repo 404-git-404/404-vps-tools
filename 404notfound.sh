@@ -15,12 +15,12 @@ readonly SSH_DROPIN="$SSH_DROPIN_DIR/00-hardening.conf"
 readonly LEGACY_SSH_DROPIN="$SSH_DROPIN_DIR/00-vps-bootstrap.conf"
 readonly AUTHORIZED_KEYS='/root/.ssh/authorized_keys'
 readonly CLOUDFLARE_UFW_TOOL='/usr/local/sbin/update-cloudflare-ufw'
+readonly DOMAIN_CHECK_SOURCE='https://raw.githubusercontent.com/404-git-404/404notfound/main/domain-check.sh'
+readonly DOMAIN_CHECK_TARGET='/usr/local/bin/domain-check'
 readonly SAGER_KEY_FINGERPRINT='2C317FBD5D886B4E89BAE8DA6D9152172A2B2F0C'
-readonly DEFAULT_REALITY_CHECKER_REPOSITORY='V2RaySSR/RealityChecker'
 
 SSH_PORT="$DEFAULT_SSH_PORT"
 SING_BOX_VERSION=''
-REALITY_CHECKER_REPOSITORY="$DEFAULT_REALITY_CHECKER_REPOSITORY"
 PUBKEY_ARGUMENT=''
 PUBKEY_FILE=''
 PUBLIC_KEY=''
@@ -45,7 +45,8 @@ SMARTDNS_READY=false
 DNS_READY=false
 SYSTEM_UPDATE_READY=false
 BASE_TOOLS_READY=false
-REALITY_CHECKER_STATE='安装失败'
+DOMAIN_CHECK_STATE='未安装'
+DOMAIN_CHECK_INSTALL_STAGE=''
 SSH_ROLLBACK_STATE='未触发'
 FAILURE_STEP=''
 FAILURE_REASON=''
@@ -85,10 +86,8 @@ usage() {
   --pubkey "SSH_PUBLIC_KEY"       预先提供一个 OpenSSH 公钥
   --pubkey-file /path/key.pub     从文件读取公钥（优先级更高）
   --sing-box-version VERSION      安装官方 APT 仓库中的指定 sing-box 版本
-  --reality-checker-repo O/R      覆盖 RealityChecker GitHub OWNER/REPO
   --help                          显示帮助
 
-RealityChecker 默认仓库：V2RaySSR/RealityChecker。
 所有交互均从 /dev/tty 读取。无 TTY 时，体检完成后明确退出。
 SmartDNS 验证成功后会成为系统唯一 DNS；脚本不执行外部 SSH 登录确认。
 EOF
@@ -136,6 +135,10 @@ cleanup() {
   set +e
   if (( exit_code != 0 )) && [[ "$RESULT_REPORTED" == false ]]; then
     print_failure_report >&2
+  fi
+  if [[ -n "$DOMAIN_CHECK_INSTALL_STAGE" &&
+    "$DOMAIN_CHECK_INSTALL_STAGE" == /usr/local/bin/.domain-check.* ]]; then
+    rm -f -- "$DOMAIN_CHECK_INSTALL_STAGE"
   fi
   if [[ -n "$TMP_DIR" && -d "$TMP_DIR" ]]; then
     rm -rf -- "$TMP_DIR"
@@ -531,11 +534,6 @@ parse_args() {
         SING_BOX_VERSION=${2#v}
         shift 2
         ;;
-      --reality-checker-repo)
-        require_option_value "$1" "$#"
-        REALITY_CHECKER_REPOSITORY=$2
-        shift 2
-        ;;
       --help|-h)
         usage
         exit 0
@@ -550,10 +548,6 @@ parse_args() {
   if [[ -n "$SING_BOX_VERSION" ]]; then
     [[ "$SING_BOX_VERSION" =~ ^[0-9A-Za-z.+:~_-]+$ ]] ||
       die 'sing-box 版本包含不允许的字符。'
-  fi
-  if [[ -n "$REALITY_CHECKER_REPOSITORY" ]]; then
-    [[ "$REALITY_CHECKER_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] ||
-      die 'RealityChecker 仓库必须使用 GitHub OWNER/REPO 格式。'
   fi
 }
 
@@ -2129,84 +2123,48 @@ EOF
   log '系统 DNS 已验证仅使用 127.0.0.1；未配置任何备用 nameserver。'
 }
 
-install_reality_checker_impl() {
-  local asset_name
-  local asset_url
-  local work_dir
-  local archive
-  local extract_dir
-  case "$CPU_ARCH" in
-    amd64) asset_name='reality-checker-linux-amd64.zip' ;;
-    arm64) asset_name='reality-checker-linux-arm64.zip' ;;
-    *) return 2 ;;
-  esac
+install_domain_check() {
+  CURRENT_STEP='安装 domain-check'
+  local downloaded_file
+  local first_line=''
+  local installed_metadata=''
 
-  work_dir=$(mktemp -d "$TMP_DIR/reality-checker.XXXXXXXX") || return 1
-  archive="$work_dir/$asset_name"
-  extract_dir="$work_dir/extracted"
-  asset_url="https://github.com/$REALITY_CHECKER_REPOSITORY/releases/latest/download/$asset_name"
-
+  DOMAIN_CHECK_STATE='安装失败'
+  downloaded_file=$(mktemp "$TMP_DIR/domain-check.XXXXXXXX")
   curl --fail --silent --show-error --location \
-    --connect-timeout 5 --max-time 120 --retry 3 --retry-delay 1 \
-    "$asset_url" --output "$archive" || return 1
-  [[ -s "$archive" ]] || return 1
-  mkdir -p "$extract_dir" || return 1
-  unzip -q "$archive" -d "$extract_dir" || return 1
+    --connect-timeout 5 --max-time 60 --retry 3 --retry-delay 1 \
+    --retry-connrefused \
+    "$DOMAIN_CHECK_SOURCE" --output "$downloaded_file" ||
+    die '下载 domain-check.sh 失败。'
+  [[ -s "$downloaded_file" ]] || die '下载的 domain-check.sh 为空。'
+  IFS= read -r first_line <"$downloaded_file" ||
+    die '无法读取下载的 domain-check.sh。'
+  [[ "$first_line" == '#!/usr/bin/env bash' ]] ||
+    die '下载的 domain-check.sh 没有有效的 Bash shebang。'
+  bash -n "$downloaded_file" ||
+    die '下载的 domain-check.sh 未通过 bash -n。'
 
-  local candidate=''
-  local candidate_file
-  local file_description
-  while IFS= read -r -d '' candidate_file; do
-    file_description=$(file -b "$candidate_file" 2>/dev/null || true)
-    case "$CPU_ARCH:$file_description" in
-      amd64:*ELF*x86-64*|arm64:*ELF*aarch64*) candidate=$candidate_file; break ;;
-    esac
-  done < <(find "$extract_dir" -type f -name 'reality-checker' -print0)
-  [[ -n "$candidate" ]] || return 2
-
-  backup_file /usr/local/bin/reality-checker || return 1
-  if ! install -o root -g root -m 0755 "$candidate" /usr/local/bin/reality-checker; then
-    restore_file /usr/local/bin/reality-checker || true
-    return 1
+  DOMAIN_CHECK_INSTALL_STAGE=$(mktemp /usr/local/bin/.domain-check.XXXXXXXX) ||
+    die '无法在 /usr/local/bin 创建 domain-check 临时安装文件。'
+  install -o root -g root -m 0755 \
+    "$downloaded_file" "$DOMAIN_CHECK_INSTALL_STAGE" ||
+    die '无法准备 domain-check 原子安装文件。'
+  backup_file "$DOMAIN_CHECK_TARGET"
+  if ! mv -f -- "$DOMAIN_CHECK_INSTALL_STAGE" "$DOMAIN_CHECK_TARGET"; then
+    restore_file "$DOMAIN_CHECK_TARGET" || true
+    die '无法将 domain-check 原子安装到正式路径。'
   fi
+  DOMAIN_CHECK_INSTALL_STAGE=''
 
-  if ! verify_reality_checker_command version &&
-    ! verify_reality_checker_command --help; then
-    restore_file /usr/local/bin/reality-checker || true
-    return 1
+  installed_metadata=$(stat -c '%U:%G:%a' "$DOMAIN_CHECK_TARGET" 2>/dev/null || true)
+  if [[ ! -x "$DOMAIN_CHECK_TARGET" ]] ||
+    [[ "$installed_metadata" != 'root:root:755' ]] ||
+    ! bash -n "$DOMAIN_CHECK_TARGET"; then
+    restore_file "$DOMAIN_CHECK_TARGET" || true
+    die 'domain-check 正式安装文件或权限验证失败，已尝试恢复。'
   fi
-  log "RealityChecker 已从 $REALITY_CHECKER_REPOSITORY 官方 Release 安装并验证：$asset_name"
-}
-
-verify_reality_checker_command() {
-  local output
-  local exit_code
-  if output=$(timeout 10 /usr/local/bin/reality-checker "$@" 2>&1); then
-    exit_code=0
-  else
-    exit_code=$?
-  fi
-  [[ -n "$output" && "$exit_code" != 124 && "$exit_code" != 126 &&
-    "$exit_code" != 127 && "$exit_code" -lt 128 ]]
-}
-
-install_reality_checker() {
-  CURRENT_STEP='安装 RealityChecker'
-  local exit_code
-  REALITY_CHECKER_STATE='安装失败'
-  set +e
-  install_reality_checker_impl
-  exit_code=$?
-  set -e
-  if (( exit_code == 0 )); then
-    REALITY_CHECKER_STATE='已安装'
-  else
-    if (( exit_code == 2 )); then
-      warn "RealityChecker 不支持当前架构或压缩包中缺少匹配 $CPU_ARCH 的 reality-checker；未安装错误架构文件。"
-    else
-      warn 'RealityChecker 下载、解压或执行验证失败；其余初始化继续。'
-    fi
-  fi
+  DOMAIN_CHECK_STATE='已安装'
+  log "domain-check 已安装并验证：$DOMAIN_CHECK_TARGET"
 }
 
 service_state() {
@@ -2363,6 +2321,7 @@ print_final_report() {
   local ufw_state=''
   local smartdns_state=''
   local dns_state=''
+  local domain_check_metadata=''
   local sing_enabled
   local sing_active
   [[ -e /var/run/reboot-required ]] &&
@@ -2464,10 +2423,14 @@ print_final_report() {
     [[ -n "$dns_state" ]] || dns_state='未通过安装流程验证'
     result_row FAIL '系统 DNS' "$dns_state"
   fi
-  if [[ "$REALITY_CHECKER_STATE" == '已安装' && -x /usr/local/bin/reality-checker ]]; then
-    result_row OK 'RealityChecker' "$REALITY_CHECKER_STATE"
+  domain_check_metadata=$(
+    stat -c '%U:%G:%a' "$DOMAIN_CHECK_TARGET" 2>/dev/null || true
+  )
+  if [[ "$DOMAIN_CHECK_STATE" == '已安装' && -x "$DOMAIN_CHECK_TARGET" ]] &&
+    [[ "$domain_check_metadata" == 'root:root:755' ]]; then
+    result_row OK 'domain-check' "$DOMAIN_CHECK_STATE：$DOMAIN_CHECK_TARGET"
   else
-    result_row WARN 'RealityChecker' "$REALITY_CHECKER_STATE"
+    result_row FAIL 'domain-check' "$DOMAIN_CHECK_STATE：$DOMAIN_CHECK_TARGET"
   fi
   result_row INFO '备份目录' "$(current_backup_state)"
   result_row INFO '建议重启' "$reboot_required"
@@ -2492,7 +2455,7 @@ custom_phase_one() {
     case "$choice" in
       1) return 0 ;;
       2)
-        printf '\n已在基础工具阶段停止：软件包保留；未修改 SSH、UFW、BBR、SmartDNS 或系统 DNS，也未安装 Cloudflare UFW 工具、sing-box 或 RealityChecker。\n'
+        printf '\n已在基础工具阶段停止：软件包保留；未修改 SSH、UFW、BBR、SmartDNS 或系统 DNS，也未安装 Cloudflare UFW 工具、sing-box 或 domain-check。\n'
         exit 0
         ;;
       *) printf '无效选择。\n' >/dev/tty ;;
@@ -2507,7 +2470,7 @@ run_remaining_initialization() {
   install_sing_box
   install_smartdns
   configure_system_dns
-  install_reality_checker
+  install_domain_check
   configure_ssh
   configure_ufw
   print_final_report
