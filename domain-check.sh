@@ -20,6 +20,14 @@ ACTIVE_PID=''
 REASONS=''
 REDIRECT_STATUS='PASS'
 REDIRECT_DETAIL='-'
+HTTP_REQUEST_OK=false
+HTTP_CODE=''
+HTTP_STATUS='-'
+HTTP_LOCATION=''
+HTTP_5XX_COUNT=0
+HTTP_SHOULD_RETRY=false
+HTTP_RESULT_STATUS='PASS'
+HTTP_RESULT_REASON=''
 
 print_usage() {
   printf '%s\n' "$USAGE_TEXT" >&2
@@ -196,6 +204,93 @@ aggregate_exit_code() {
   return 0
 }
 
+reset_http_retry_state() {
+  HTTP_REQUEST_OK=false
+  HTTP_CODE=''
+  HTTP_STATUS='-'
+  HTTP_LOCATION=''
+  HTTP_5XX_COUNT=0
+  HTTP_SHOULD_RETRY=false
+}
+
+record_http_attempt() {
+  local attempt=$1
+  local request_ok=$2
+  local status=$3
+  local location=$4
+
+  HTTP_REQUEST_OK=false
+  HTTP_CODE=''
+  HTTP_STATUS='-'
+  HTTP_LOCATION=''
+  HTTP_SHOULD_RETRY=false
+
+  if [[ "$request_ok" == true && "$status" =~ ^[0-9]{3}$ &&
+    "$status" != '000' ]]; then
+    HTTP_REQUEST_OK=true
+    HTTP_CODE=$status
+    HTTP_STATUS=$status
+    HTTP_LOCATION=$location
+    if [[ "$status" =~ ^5[0-9][0-9]$ ]]; then
+      (( HTTP_5XX_COUNT += 1 ))
+      (( attempt < 3 )) && HTTP_SHOULD_RETRY=true
+    fi
+  fi
+  return 0
+}
+
+analyze_http_redirect() {
+  local domain=$1
+  local request_ok=$2
+  local status=$3
+  local location=$4
+
+  REDIRECT_STATUS='PASS'
+  REDIRECT_DETAIL='-'
+  if [[ "$request_ok" == true && -n "$location" ]]; then
+    classify_redirect "$domain" "$location"
+  elif [[ "$request_ok" == true &&
+    "$status" =~ ^(301|302|303|307|308)$ ]]; then
+    REDIRECT_STATUS='WARN'
+    REDIRECT_DETAIL='缺少 Location'
+  fi
+}
+
+classify_http_result() {
+  local request_ok=$1
+  local status=$2
+  local consecutive_5xx=$3
+
+  HTTP_RESULT_STATUS='PASS'
+  HTTP_RESULT_REASON=''
+  if [[ "$request_ok" != true ]]; then
+    HTTP_RESULT_STATUS='WARN'
+    HTTP_RESULT_REASON='HTTP 请求失败'
+    return 0
+  fi
+
+  case "$status" in
+    200|204|301|302|303|307|308|404)
+      ;;
+    401|403|429)
+      HTTP_RESULT_STATUS='WARN'
+      HTTP_RESULT_REASON="HTTP $status"
+      ;;
+    5??)
+      HTTP_RESULT_STATUS='WARN'
+      if (( consecutive_5xx == 3 )); then
+        HTTP_RESULT_REASON="HTTP $status（连续 3 次 5xx）"
+      else
+        HTTP_RESULT_REASON="HTTP $status"
+      fi
+      ;;
+    *)
+      HTTP_RESULT_STATUS='WARN'
+      HTTP_RESULT_REASON="HTTP $status"
+      ;;
+  esac
+}
+
 append_reason() {
   local reason=$1
   if [[ -n "$REASONS" ]]; then
@@ -298,7 +393,12 @@ check_domain() {
   local http_request_ok=false
   local http_code=''
   local location=''
+  local http_5xx_count=0
   local attempt
+  local attempt_request_ok
+  local attempt_http_code
+  local attempt_http_status
+  local attempt_location
   local dns_a_file="$TEMP_DIR/dns-a-$index"
   local dns_aaaa_file="$TEMP_DIR/dns-aaaa-$index"
   local tcp_file="$TEMP_DIR/tcp-$index"
@@ -372,8 +472,7 @@ check_domain() {
 
   if run_network_command "$x25519_file" "$TLS_TIMEOUT" \
     openssl s_client -connect "$domain:443" -servername "$domain" \
-      -tls1_3 -groups X25519 -verify_hostname "$domain" \
-      -verify_return_error; then
+      -tls1_3 -groups X25519; then
     x25519_command_ok=true
   fi
   if [[ "$x25519_command_ok" == true ]] &&
@@ -385,38 +484,44 @@ check_domain() {
     append_reason '强制 X25519 握手失败'
   fi
 
+  reset_http_retry_state
   for attempt in 1 2 3; do
+    attempt_request_ok=false
+    attempt_http_code=''
+    attempt_http_status='-'
+    attempt_location=''
     http_output_file="$TEMP_DIR/http-output-$index-$attempt"
     http_header_file="$TEMP_DIR/http-header-$index-$attempt"
     if run_network_command "$http_output_file" "$HTTP_TIMEOUT" \
       curl --silent --output /dev/null --dump-header "$http_header_file" \
         --write-out '%{http_code}\n' --connect-timeout 5 --max-time 9 \
-        --proto '=https' --user-agent "$HTTP_USER_AGENT" \
+        --noproxy '*' --proto '=https' --user-agent "$HTTP_USER_AGENT" \
         "https://$domain/"; then
-      http_code=$(extract_http_code "$http_output_file")
-      if [[ "$http_code" =~ ^[0-9]{3}$ && "$http_code" != '000' ]]; then
-        http_request_ok=true
-        http_status=$http_code
-        location=$(extract_location "$http_header_file")
+      attempt_http_code=$(extract_http_code "$http_output_file")
+      if [[ "$attempt_http_code" =~ ^[0-9]{3}$ &&
+        "$attempt_http_code" != '000' ]]; then
+        attempt_request_ok=true
+        attempt_http_status=$attempt_http_code
+        attempt_location=$(extract_location "$http_header_file")
       fi
     fi
-    if [[ "$http_request_ok" == true && "$http_status" =~ ^5[0-9][0-9]$ &&
-      "$attempt" -lt 3 ]]; then
-      http_request_ok=false
+    record_http_attempt "$attempt" "$attempt_request_ok" \
+      "$attempt_http_status" "$attempt_location"
+    if [[ "$HTTP_SHOULD_RETRY" == true ]]; then
       continue
     fi
     break
   done
+  http_request_ok=$HTTP_REQUEST_OK
+  http_code=$HTTP_CODE
+  http_status=$HTTP_STATUS
+  [[ -z "$http_code" ]] || http_status=$http_code
+  location=$HTTP_LOCATION
+  http_5xx_count=$HTTP_5XX_COUNT
 
-  if [[ -n "$location" ]]; then
-    classify_redirect "$domain" "$location"
-    redirect_status=$REDIRECT_STATUS
-    redirect_detail=$REDIRECT_DETAIL
-  elif [[ "$http_request_ok" == true &&
-    "$http_status" =~ ^(301|302|303|307|308)$ ]]; then
-    redirect_status='WARN'
-    redirect_detail='缺少 Location'
-  fi
+  analyze_http_redirect "$domain" "$http_request_ok" "$http_status" "$location"
+  redirect_status=$REDIRECT_STATUS
+  redirect_detail=$REDIRECT_DETAIL
 
   if [[ "$dns_status" == 'FAIL' || "$tcp_status" == 'FAIL' ||
     "$tls_status" == 'FAIL' || "$x25519_status" == 'FAIL' ||
@@ -432,29 +537,14 @@ check_domain() {
     append_reason "不允许的跳转：$redirect_detail"
   fi
 
-  if [[ "$http_request_ok" != true ]]; then
-    if [[ "$tls_status" == 'PASS' && "$x25519_status" == 'PASS' &&
-      "$h2_status" == 'PASS' && "$certificate_status" == 'PASS' ]]; then
-      append_reason 'HTTP 请求失败'
+  classify_http_result "$http_request_ok" "$http_status" "$http_5xx_count"
+  if [[ "$HTTP_RESULT_STATUS" == 'WARN' ]]; then
+    if [[ "$http_request_ok" == true ]] ||
+      [[ "$tls_status" == 'PASS' && "$x25519_status" == 'PASS' &&
+        "$h2_status" == 'PASS' && "$certificate_status" == 'PASS' ]]; then
+      append_reason "$HTTP_RESULT_REASON"
       [[ "$final_status" == 'FAIL' ]] || final_status='WARN'
     fi
-  else
-    case "$http_status" in
-      200|204|301|302|303|307|308|404)
-        ;;
-      401|403|429)
-        append_reason "HTTP $http_status"
-        [[ "$final_status" == 'FAIL' ]] || final_status='WARN'
-        ;;
-      5??)
-        append_reason "HTTP $http_status（连续 3 次 5xx）"
-        [[ "$final_status" == 'FAIL' ]] || final_status='WARN'
-        ;;
-      *)
-        append_reason "HTTP $http_status"
-        [[ "$final_status" == 'FAIL' ]] || final_status='WARN'
-        ;;
-    esac
   fi
 
   [[ -n "$REASONS" ]] || REASONS='-'

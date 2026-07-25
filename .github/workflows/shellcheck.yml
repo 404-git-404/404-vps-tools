@@ -27,7 +27,7 @@ jobs:
           bash -n request-cloudflare-certificate.sh
           bash -n tests/domain-check-test.sh
 
-      - name: Check script files
+      - name: Check script files and executable modes
         run: |
           for script in \
             404notfound.sh \
@@ -35,8 +35,13 @@ jobs:
             scripts/update-smartdns.sh \
             request-cloudflare-certificate.sh \
             tests/domain-check-test.sh; do
-            test -x "$script"
+            test -s "$script"
             ! grep -q $'\r' "$script"
+          done
+          for executable_script in \
+            domain-check.sh \
+            tests/domain-check-test.sh; do
+            test -x "$executable_script"
           done
 
       - name: Extract and check embedded Cloudflare tool
