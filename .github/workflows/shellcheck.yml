@@ -116,10 +116,17 @@ jobs:
           test "$(wc -l < README.md)" -eq 3
           cmp -s README.md /tmp/expected-readme
 
+      - name: Install ShellCheck and mawk
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes shellcheck mawk
+
       - name: Run domain-check offline tests
         run: |
-          awk -W version
-          bash tests/domain-check-test.sh
+          mkdir -p "$RUNNER_TEMP/mawk-bin"
+          ln -s "$(command -v mawk)" "$RUNNER_TEMP/mawk-bin/awk"
+          PATH="$RUNNER_TEMP/mawk-bin:$PATH" awk -W version
+          PATH="$RUNNER_TEMP/mawk-bin:$PATH" bash tests/domain-check-test.sh
 
       - name: Check SmartDNS updater regressions
         run: |
@@ -161,11 +168,6 @@ jobs:
           ! grep -Fq 'smartdns -V' 404notfound.sh
           ! grep -Fq 'smartdns --version' 404notfound.sh
           grep -Fq 'sort -nu' 404notfound.sh
-
-      - name: Install ShellCheck
-        run: |
-          sudo apt-get update
-          sudo apt-get install --yes shellcheck
 
       - name: Run ShellCheck
         run: |
