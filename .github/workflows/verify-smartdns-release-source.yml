@@ -1,0 +1,113 @@
+name: Verify SmartDNS release source
+
+on:
+  push:
+    branches:
+      - codex/pin-smartdns-packages
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download and verify official Debian assets
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          mkdir assets
+          cd assets
+
+          download() {
+            local output=$1
+            local upstream=$2
+            local sha256=$3
+
+            curl \
+              --fail \
+              --location \
+              --silent \
+              --show-error \
+              --connect-timeout 10 \
+              --max-time 120 \
+              --retry 3 \
+              --retry-delay 2 \
+              --retry-connrefused \
+              --output "$output" \
+              "https://ftp.debian.org/debian/pool/main/s/smartdns/$upstream"
+            test -s "$output"
+            printf '%s  %s\n' "$sha256" "$output" | sha256sum --check -
+          }
+
+          verify_deb() {
+            local file=$1
+            local version=$2
+            local architecture=$3
+
+            dpkg-deb --info "$file" >/dev/null
+            test "$(dpkg-deb -f "$file" Package)" = smartdns
+            test "$(dpkg-deb -f "$file" Version)" = "$version"
+            test "$(dpkg-deb -f "$file" Architecture)" = "$architecture"
+          }
+
+          download \
+            smartdns_40+dfsg-1_bookworm_amd64.deb \
+            smartdns_40+dfsg-1_amd64.deb \
+            8388fb543f870fc77d17dbaa9874277d2ef37d120ad2ab24af730d7032a80bcb
+          download \
+            smartdns_40+dfsg-1_bookworm_arm64.deb \
+            smartdns_40+dfsg-1_arm64.deb \
+            7aadb6fb0e6d2f38d8ce11db60561c2c8c7c9d0aacf1e54f9e27f44a4abfb9ca
+          download \
+            smartdns_46.1+dfsg-1.1~deb13u1_trixie_amd64.deb \
+            smartdns_46.1+dfsg-1.1~deb13u1_amd64.deb \
+            d2dfe591dbdabf3655c2ead30975ee20f6720346552bda989b212ccffde5ba4e
+          download \
+            smartdns_46.1+dfsg-1.1~deb13u1_trixie_arm64.deb \
+            smartdns_46.1+dfsg-1.1~deb13u1_arm64.deb \
+            d9eeb9050ab6e0c95011de83955f65ca8020779c8c32aba90d708bc54c33823f
+
+          verify_deb smartdns_40+dfsg-1_bookworm_amd64.deb 40+dfsg-1 amd64
+          verify_deb smartdns_40+dfsg-1_bookworm_arm64.deb 40+dfsg-1 arm64
+          verify_deb \
+            smartdns_46.1+dfsg-1.1~deb13u1_trixie_amd64.deb \
+            46.1+dfsg-1.1~deb13u1 \
+            amd64
+          verify_deb \
+            smartdns_46.1+dfsg-1.1~deb13u1_trixie_arm64.deb \
+            46.1+dfsg-1.1~deb13u1 \
+            arm64
+
+          download \
+            smartdns_40+dfsg-1.dsc \
+            smartdns_40+dfsg-1.dsc \
+            0c8c9713ce15483dbaf756f8e6eb279b83d38b1f449978e4d452b7c518449667
+          download \
+            smartdns_40+dfsg.orig.tar.xz \
+            smartdns_40+dfsg.orig.tar.xz \
+            3ce4c89547501eb39306e491d7be8dd745c89eb9d019dd6294fdfbe5af553351
+          download \
+            smartdns_40+dfsg-1.debian.tar.xz \
+            smartdns_40+dfsg-1.debian.tar.xz \
+            3cb389dd3d70dce844fb7e2f6908041eaa0d1d09390d921ac19f3d797a95315d
+          download \
+            smartdns_46.1+dfsg-1.1~deb13u1.dsc \
+            smartdns_46.1+dfsg-1.1~deb13u1.dsc \
+            9454afaa68e63568db9085da9804e5f8473840bb58963dbd9f40b93ab646a297
+          download \
+            smartdns_46.1+dfsg.orig.tar.xz \
+            smartdns_46.1+dfsg.orig.tar.xz \
+            3c459e79be7f413ded7fcb23c49b38f1d1adc2c6ff642e2b355c87babd96bb0c
+          download \
+            smartdns_46.1+dfsg-1.1~deb13u1.debian.tar.xz \
+            smartdns_46.1+dfsg-1.1~deb13u1.debian.tar.xz \
+            911def7596c138485ec3558f4dd253cef11487d9a487d2ee92220db4f38f862f
+
+      - name: Upload verified release inputs
+        uses: actions/upload-artifact@v4
+        with:
+          name: smartdns-release-inputs
+          path: assets/
+          if-no-files-found: error
