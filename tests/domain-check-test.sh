@@ -299,10 +299,12 @@ assert_contains 'domain-check.sh' "$executable_mode_block" \
   'CI checks the domain tool executable bit'
 assert_contains 'tests/domain-check-test.sh' "$executable_mode_block" \
   'CI checks the offline test executable bit'
+assert_contains 'scripts/update-smartdns.sh' "$executable_mode_block" \
+  'CI checks the standalone SmartDNS updater executable bit'
+assert_contains 'tests/smartdns-test.sh' "$executable_mode_block" \
+  'CI checks the SmartDNS offline test executable bit'
 assert_not_contains '404notfound.sh' "$executable_mode_block" \
   'CI does not require the installer executable bit'
-assert_not_contains 'scripts/update-smartdns.sh' "$executable_mode_block" \
-  'CI does not require the SmartDNS updater executable bit'
 assert_not_contains 'request-cloudflare-certificate.sh' "$executable_mode_block" \
   'CI does not require the certificate tool executable bit'
 

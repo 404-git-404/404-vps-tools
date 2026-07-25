@@ -18,6 +18,9 @@ readonly CLOUDFLARE_UFW_TOOL='/usr/local/sbin/update-cloudflare-ufw'
 readonly DOMAIN_CHECK_SOURCE='https://raw.githubusercontent.com/404-git-404/404notfound/main/domain-check.sh'
 readonly DOMAIN_CHECK_TARGET='/usr/local/bin/domain-check'
 readonly SAGER_KEY_FINGERPRINT='2C317FBD5D886B4E89BAE8DA6D9152172A2B2F0C'
+readonly SMARTDNS_CONFIG_TARGET='/etc/smartdns/smartdns.conf'
+readonly SMARTDNS_RELEASE_TAG='smartdns-debian-pinned-2026-07'
+readonly SMARTDNS_RELEASE_BASE='https://github.com/404-git-404/404notfound/releases/download/smartdns-debian-pinned-2026-07'
 
 SSH_PORT="$DEFAULT_SSH_PORT"
 SING_BOX_VERSION=''
@@ -38,6 +41,19 @@ TMP_DIR=''
 BACKUP_DIR=''
 DEBIAN_VERSION=''
 CPU_ARCH=''
+SMARTDNS_CONFIG_VARIANT=''
+SMARTDNS_ASSET_NAME=''
+SMARTDNS_EXPECTED_VERSION=''
+SMARTDNS_EXPECTED_SHA256=''
+SMARTDNS_DOWNLOAD_URL=''
+SMARTDNS_PACKAGE_PATH=''
+SMARTDNS_IPV4_ANSWER=''
+SMARTDNS_IPV4_ATTEMPTS=0
+SMARTDNS_LAST_DIG_OUTPUT=''
+SMARTDNS_WAS_HELD=false
+SMARTDNS_WAS_ENABLED=false
+SMARTDNS_WAS_ACTIVE=false
+SMARTDNS_TRANSACTION_ACTIVE=false
 SSHD_EFFECTIVE=''
 SSHD_EFFECTIVE_ROOT=''
 SSH_READY=false
@@ -106,6 +122,10 @@ warn() {
 }
 
 die() {
+  if [[ "${SMARTDNS_TRANSACTION_ACTIVE:-false}" == true ]] &&
+    declare -F restore_smartdns_transaction >/dev/null 2>&1; then
+    restore_smartdns_transaction || true
+  fi
   FAILURE_STEP=$CURRENT_STEP
   FAILURE_REASON=$*
   printf '[%s] [ERROR] 步骤“%s”失败：%s\n' "$(timestamp)" "$CURRENT_STEP" "$*" >&2
@@ -116,6 +136,10 @@ on_error() {
   local exit_code=$?
   local line_number=$1
   trap - ERR
+  if [[ "${SMARTDNS_TRANSACTION_ACTIVE:-false}" == true ]] &&
+    declare -F restore_smartdns_transaction >/dev/null 2>&1; then
+    restore_smartdns_transaction || true
+  fi
   FAILURE_STEP=$CURRENT_STEP
   FAILURE_REASON="第 $line_number 行发生未处理错误（退出码 $exit_code）"
   printf '[%s] [ERROR] 步骤“%s”在第 %s 行失败（退出码 %s）。\n' \
@@ -640,25 +664,72 @@ configure_custom_network_choices() {
   fi
 }
 
+select_smartdns_target() {
+  local debian_version=$1
+  local architecture=$2
+
+  case "$debian_version:$architecture" in
+    12:amd64)
+      SMARTDNS_EXPECTED_VERSION='40+dfsg-1'
+      SMARTDNS_CONFIG_VARIANT='v40'
+      SMARTDNS_ASSET_NAME='smartdns_40+dfsg-1_bookworm_amd64.deb'
+      SMARTDNS_EXPECTED_SHA256='8388fb543f870fc77d17dbaa9874277d2ef37d120ad2ab24af730d7032a80bcb'
+      ;;
+    12:arm64)
+      SMARTDNS_EXPECTED_VERSION='40+dfsg-1'
+      SMARTDNS_CONFIG_VARIANT='v40'
+      SMARTDNS_ASSET_NAME='smartdns_40+dfsg-1_bookworm_arm64.deb'
+      SMARTDNS_EXPECTED_SHA256='7aadb6fb0e6d2f38d8ce11db60561c2c8c7c9d0aacf1e54f9e27f44a4abfb9ca'
+      ;;
+    13:amd64)
+      SMARTDNS_EXPECTED_VERSION='46.1+dfsg-1.1~deb13u1'
+      SMARTDNS_CONFIG_VARIANT='v46'
+      SMARTDNS_ASSET_NAME='smartdns_46.1+dfsg-1.1.deb13u1_trixie_amd64.deb'
+      SMARTDNS_EXPECTED_SHA256='d2dfe591dbdabf3655c2ead30975ee20f6720346552bda989b212ccffde5ba4e'
+      ;;
+    13:arm64)
+      SMARTDNS_EXPECTED_VERSION='46.1+dfsg-1.1~deb13u1'
+      SMARTDNS_CONFIG_VARIANT='v46'
+      SMARTDNS_ASSET_NAME='smartdns_46.1+dfsg-1.1.deb13u1_trixie_arm64.deb'
+      SMARTDNS_EXPECTED_SHA256='d9eeb9050ab6e0c95011de83955f65ca8020779c8c32aba90d708bc54c33823f'
+      ;;
+    *)
+      die "不支持的 Debian/架构组合：Debian $debian_version，$architecture；仅支持 Debian 12/13 的 amd64/arm64。"
+      ;;
+  esac
+  SMARTDNS_DOWNLOAD_URL="$SMARTDNS_RELEASE_BASE/$SMARTDNS_ASSET_NAME"
+}
+
+validate_smartdns_platform() {
+  local os_id=$1
+  local debian_version=$2
+  local architecture=$3
+
+  [[ "$os_id" == 'debian' ]] ||
+    die "仅支持 Debian，当前系统 ID=${os_id:-未知}。"
+  case "$debian_version" in
+    12|13) ;;
+    *) die "仅支持 Debian 12 或 Debian 13，当前 VERSION_ID=${debian_version:-未知}。" ;;
+  esac
+  case "$architecture" in
+    amd64|arm64) ;;
+    *) die "仅支持 amd64 或 arm64，当前架构为 ${architecture:-未知}。" ;;
+  esac
+  select_smartdns_target "$debian_version" "$architecture"
+}
+
 preflight() {
   CURRENT_STEP='运行环境预检'
+  local os_id
   (( EUID == 0 )) || die '必须以 root 身份运行。'
   [[ -r /etc/os-release ]] || die '无法读取 /etc/os-release。'
 
-  # shellcheck disable=SC1091
-  source /etc/os-release
-  [[ "${ID:-}" == 'debian' ]] || die '仅支持 Debian。'
-  case "${VERSION_ID:-}" in
-    12|13) DEBIAN_VERSION=$VERSION_ID ;;
-    *) die "仅支持 Debian 12 或 Debian 13，当前 VERSION_ID=${VERSION_ID:-未知}。" ;;
-  esac
-
   command -v dpkg >/dev/null 2>&1 || die '缺少 dpkg。'
+  os_id=$(awk -F= '$1 == "ID" { print $2; exit }' /etc/os-release | tr -d '"')
+  DEBIAN_VERSION=$(awk -F= '$1 == "VERSION_ID" { print $2; exit }' \
+    /etc/os-release | tr -d '"')
   CPU_ARCH=$(dpkg --print-architecture)
-  case "$CPU_ARCH" in
-    amd64|arm64) ;;
-    *) die "仅支持 amd64 或 arm64，当前架构为 $CPU_ARCH。" ;;
-  esac
+  validate_smartdns_platform "$os_id" "$DEBIAN_VERSION" "$CPU_ARCH"
 
   [[ -d /run/systemd/system ]] || die '此脚本要求 systemd 正在运行。'
   command -v systemctl >/dev/null 2>&1 || die '缺少 systemctl。'
@@ -667,7 +738,7 @@ preflight() {
   command -v base64 >/dev/null 2>&1 || die '缺少 base64。'
   TMP_DIR=$(mktemp -d -t 404notfound-bootstrap.XXXXXXXX)
   BACKUP_DIR="/var/backups/404notfound-bootstrap/$(date -u '+%Y%m%dT%H%M%SZ')-$$"
-  log "环境预检通过：Debian $DEBIAN_VERSION，$CPU_ARCH。"
+  log "环境预检通过：Debian $DEBIAN_VERSION，$CPU_ARCH；SmartDNS 固定版本 $SMARTDNS_EXPECTED_VERSION（$SMARTDNS_CONFIG_VARIANT）。"
 }
 
 collect_public_key() {
@@ -1924,6 +1995,148 @@ smartdns_version_text() {
   printf '%s' "$output"
 }
 
+write_smartdns_configuration() {
+  local target=$1
+  local variant=$2
+
+  cat >"$target" <<'SMARTDNS_CONFIG_COMMON'
+bind 127.0.0.1:53
+bind-tcp 127.0.0.1:53
+
+cache-persist yes
+cache-file /var/cache/smartdns/smartdns.cache
+cache-checkpoint-time 86400
+serve-expired yes
+serve-expired-ttl 259200
+serve-expired-reply-ttl 3
+serve-expired-prefetch-time 21600
+prefetch-domain yes
+
+speed-check-mode tcp:443,ping
+response-mode first-ping
+dualstack-ip-selection yes
+dualstack-ip-selection-threshold 10
+
+log-level warn
+log-console no
+log-syslog yes
+audit-enable no
+
+ca-file /etc/ssl/certs/ca-certificates.crt
+
+SMARTDNS_CONFIG_COMMON
+
+  case "$variant" in
+    v40)
+      cat >>"$target" <<'SMARTDNS_CONFIG_VARIANT'
+server-https https://1.1.1.1/dns-query -host-name cloudflare-dns.com -http-host cloudflare-dns.com -tls-host-verify cloudflare-dns.com
+server-https https://8.8.8.8/dns-query -host-name dns.google -http-host dns.google -tls-host-verify dns.google
+server-https https://9.9.9.10/dns-query -host-name dns.quad9.net -http-host dns.quad9.net -tls-host-verify dns.quad9.net -fallback
+SMARTDNS_CONFIG_VARIANT
+      ;;
+    v46)
+      cat >>"$target" <<'SMARTDNS_CONFIG_VARIANT'
+server-https https://cloudflare-dns.com/dns-query -host-ip 1.1.1.1
+server-https https://dns.google/dns-query -host-ip 8.8.8.8
+server-https https://dns.quad9.net/dns-query -host-ip 9.9.9.10 -fallback
+SMARTDNS_CONFIG_VARIANT
+      ;;
+    *)
+      die "未知 SmartDNS 配置变体：$variant。"
+      ;;
+  esac
+  [[ -s "$target" ]] || die '生成 SmartDNS 配置失败。'
+}
+
+download_and_verify_smartdns_package() {
+  local actual_sha256
+  local package_architecture
+  local package_name
+  local package_version
+
+  SMARTDNS_PACKAGE_PATH="$TMP_DIR/$SMARTDNS_ASSET_NAME"
+  if ! curl --fail --location --silent --show-error \
+    --connect-timeout 10 --max-time 120 --retry 3 --retry-delay 2 \
+    --retry-connrefused "$SMARTDNS_DOWNLOAD_URL" -o "$SMARTDNS_PACKAGE_PATH"; then
+    die "下载固定 SmartDNS Debian 软件包失败：$SMARTDNS_ASSET_NAME。"
+  fi
+  [[ -s "$SMARTDNS_PACKAGE_PATH" ]] || die '下载的 SmartDNS Debian 软件包为空。'
+
+  actual_sha256=$(sha256sum "$SMARTDNS_PACKAGE_PATH" | awk '{print $1}')
+  [[ "$actual_sha256" == "$SMARTDNS_EXPECTED_SHA256" ]] ||
+    die "SmartDNS 软件包 SHA-256 不匹配：期望 $SMARTDNS_EXPECTED_SHA256，实际 $actual_sha256。"
+  printf '%s  %s\n' "$SMARTDNS_EXPECTED_SHA256" "$SMARTDNS_PACKAGE_PATH" |
+    sha256sum --check --status || die 'sha256sum 二次校验失败。'
+
+  dpkg-deb --info "$SMARTDNS_PACKAGE_PATH" >/dev/null ||
+    die 'dpkg-deb --info 无法读取下载的软件包。'
+  package_name=$(dpkg-deb --field "$SMARTDNS_PACKAGE_PATH" Package)
+  package_version=$(dpkg-deb --field "$SMARTDNS_PACKAGE_PATH" Version)
+  package_architecture=$(dpkg-deb --field "$SMARTDNS_PACKAGE_PATH" Architecture)
+  [[ "$package_name" == 'smartdns' ]] ||
+    die "下载的软件包名称不是 smartdns：$package_name。"
+  [[ "$package_version" == "$SMARTDNS_EXPECTED_VERSION" ]] ||
+    die "下载的软件包版本不是 $SMARTDNS_EXPECTED_VERSION：$package_version。"
+  [[ "$package_architecture" == "$CPU_ARCH" ]] ||
+    die "下载的软件包架构不是 $CPU_ARCH：$package_architecture。"
+  log "固定 Release 资产验证通过：$SMARTDNS_ASSET_NAME，SHA-256=$actual_sha256。"
+}
+
+capture_smartdns_transaction_state() {
+  SMARTDNS_WAS_HELD=false
+  SMARTDNS_WAS_ENABLED=false
+  SMARTDNS_WAS_ACTIVE=false
+  if apt-mark showhold | grep -Fxq smartdns; then
+    SMARTDNS_WAS_HELD=true
+  fi
+  if systemctl is-enabled --quiet smartdns.service 2>/dev/null; then
+    SMARTDNS_WAS_ENABLED=true
+  fi
+  if systemctl is-active --quiet smartdns.service 2>/dev/null; then
+    SMARTDNS_WAS_ACTIVE=true
+  fi
+  backup_file "$SMARTDNS_CONFIG_TARGET"
+  mkdir -p -- "$BACKUP_DIR/smartdns-state"
+  printf 'held=%s\nenabled=%s\nactive=%s\n' \
+    "$SMARTDNS_WAS_HELD" "$SMARTDNS_WAS_ENABLED" "$SMARTDNS_WAS_ACTIVE" \
+    >"$BACKUP_DIR/smartdns-state/before.txt"
+  dpkg-query -W smartdns >"$BACKUP_DIR/smartdns-state/package-before.txt" 2>&1 ||
+    printf 'smartdns package not installed\n' \
+      >"$BACKUP_DIR/smartdns-state/package-before.txt"
+}
+
+restore_smartdns_transaction() {
+  local restore_status=0
+
+  SMARTDNS_TRANSACTION_ACTIVE=false
+  set +e
+  warn '正在恢复 SmartDNS 原配置、服务状态和 hold 状态。'
+  rm -f -- "$SMARTDNS_CONFIG_TARGET" || restore_status=1
+  restore_file "$SMARTDNS_CONFIG_TARGET" || restore_status=1
+  systemctl daemon-reload >/dev/null 2>&1 || restore_status=1
+  if [[ "$SMARTDNS_WAS_ENABLED" == true ]]; then
+    systemctl enable smartdns.service >/dev/null 2>&1 || restore_status=1
+  else
+    systemctl disable smartdns.service >/dev/null 2>&1 || restore_status=1
+  fi
+  if [[ "$SMARTDNS_WAS_ACTIVE" == true ]]; then
+    systemctl restart smartdns.service >/dev/null 2>&1 || restore_status=1
+  else
+    systemctl stop smartdns.service >/dev/null 2>&1 || restore_status=1
+  fi
+  if [[ "$SMARTDNS_WAS_HELD" == true ]]; then
+    apt-mark hold smartdns >/dev/null 2>&1 || restore_status=1
+  else
+    apt-mark unhold smartdns >/dev/null 2>&1 || restore_status=1
+  fi
+  if ((restore_status == 0)); then
+    warn 'SmartDNS 原配置、服务状态和 hold 状态已恢复。'
+  else
+    warn "SmartDNS 自动恢复未完全成功；请检查备份目录：$BACKUP_DIR。"
+  fi
+  return "$restore_status"
+}
+
 print_smartdns_recent_journal() {
   warn 'SmartDNS 健康检查失败；以下是 smartdns.service 最近 50 行日志：'
   journalctl -u smartdns.service -n 50 --no-pager >&2 ||
@@ -1965,80 +2178,219 @@ stop_and_clean_smartdns() {
   log 'SmartDNS 服务已停止，残留进程和 PID 文件已清理。'
 }
 
-install_smartdns() {
-  CURRENT_STEP='安装并配置 SmartDNS'
-  local smartdns_version
-  local dig_output=''
-  apt_get install -y ca-certificates dnsutils smartdns
-  command -v smartdns >/dev/null 2>&1 || die '安装后找不到 smartdns。'
-  command -v dig >/dev/null 2>&1 || die '安装 dnsutils 后仍找不到 dig。'
-  [[ -r /etc/ssl/certs/ca-certificates.crt && -s /etc/ssl/certs/ca-certificates.crt ]] ||
-    die '系统 CA 文件不可读或为空：/etc/ssl/certs/ca-certificates.crt。'
-  smartdns_version=$(smartdns_version_text) || die 'SmartDNS 版本验证失败。'
-  stop_and_clean_smartdns
+smartdns_package_is_current() {
+  local installed_architecture
+  local installed_status
+  local installed_version
 
-  local staged_config
-  staged_config=$(mktemp "$TMP_DIR/smartdns.conf.XXXXXXXX")
-  cat >"$staged_config" <<'SMARTDNS_CONFIG'
-bind 127.0.0.1:53
-bind-tcp 127.0.0.1:53
+  installed_status=$(dpkg-query -W -f='${db:Status-Abbrev}' smartdns 2>/dev/null || true)
+  installed_version=$(dpkg-query -W -f='${Version}' smartdns 2>/dev/null || true)
+  installed_architecture=$(dpkg-query -W -f='${Architecture}' smartdns 2>/dev/null || true)
+  [[ "$installed_status" == ii* &&
+    "$installed_version" == "$SMARTDNS_EXPECTED_VERSION" &&
+    "$installed_architecture" == "$CPU_ARCH" ]]
+}
 
-cache-persist yes
-cache-file /var/cache/smartdns/smartdns.cache
-cache-checkpoint-time 86400
-serve-expired yes
-serve-expired-ttl 259200
-serve-expired-reply-ttl 3
-serve-expired-prefetch-time 21600
-prefetch-domain yes
+find_smartdns_validation_port() {
+  local port
+  local socket_output
 
-speed-check-mode tcp:443,ping
-response-mode first-ping
-dualstack-ip-selection yes
-dualstack-ip-selection-threshold 10
+  for ((port = 6053; port <= 6152; port++)); do
+    socket_output=$(ss -H -lntu "sport = :$port" 2>/dev/null || true)
+    if [[ -z "$socket_output" ]]; then
+      printf '%s' "$port"
+      return 0
+    fi
+  done
+  return 1
+}
 
-log-level warn
-log-console no
-log-syslog yes
-audit-enable no
+validate_smartdns_configuration() {
+  local staged_config=$1
+  local validation_config
+  local validation_log
+  local validation_pid
+  local validation_port
 
-ca-file /etc/ssl/certs/ca-certificates.crt
+  validation_port=$(find_smartdns_validation_port) ||
+    die '找不到可用于 SmartDNS 配置验证的本地高端口。'
+  validation_config=$(mktemp "$TMP_DIR/smartdns-validation.conf.XXXXXXXX")
+  validation_log=$(mktemp "$TMP_DIR/smartdns-validation.log.XXXXXXXX")
+  sed \
+    -e "s/^bind 127\\.0\\.0\\.1:53$/bind 127.0.0.1:$validation_port/" \
+    -e "s/^bind-tcp 127\\.0\\.0\\.1:53$/bind-tcp 127.0.0.1:$validation_port/" \
+    "$staged_config" >"$validation_config"
 
-server-https https://cloudflare-dns.com/dns-query -host-ip 1.1.1.1
-server-https https://dns.google/dns-query -host-ip 8.8.8.8
-server-https https://dns10.quad9.net/dns-query -host-ip 9.9.9.10 -fallback
-SMARTDNS_CONFIG
-
-  local port_53_output
-  local port_53_conflicts
-  if ! port_53_output=$(ss -H -lntup 'sport = :53' 2>/dev/null); then
-    die '无法检查 53 端口监听状态，拒绝继续配置 SmartDNS。'
+  smartdns -f -x -c "$validation_config" -p "$TMP_DIR/smartdns-validation.pid" \
+    >"$validation_log" 2>&1 &
+  validation_pid=$!
+  sleep 2
+  if ! kill -0 "$validation_pid" 2>/dev/null; then
+    wait "$validation_pid" 2>/dev/null || true
+    die "SmartDNS 独立配置验证启动失败：$(shorten_line "$(<"$validation_log")")"
   fi
-  port_53_conflicts=$(awk '
+  if ! ss -H -lntu "sport = :$validation_port" 2>/dev/null |
+    grep -Fq "127.0.0.1:$validation_port"; then
+    kill -TERM "$validation_pid" 2>/dev/null || true
+    wait "$validation_pid" 2>/dev/null || true
+    die 'SmartDNS 独立配置验证实例未监听预期端口。'
+  fi
+  kill -TERM "$validation_pid" 2>/dev/null || true
+  wait "$validation_pid" 2>/dev/null || true
+  if grep -Eiq \
+    'unsupported[[:space:]]+config|configuration[[:space:]]+error|parse[[:space:]]+error|load[[:space:]]+config[[:space:]]+failed' \
+    "$validation_log"; then
+    die "SmartDNS 独立配置验证发现错误：$(shorten_line "$(<"$validation_log")")"
+  fi
+  log "SmartDNS $SMARTDNS_CONFIG_VARIANT 配置已通过独立端口 $validation_port 的短时启动验证。"
+}
+
+check_smartdns_port_53_conflicts() {
+  local conflicts
+  local output
+
+  output=$(ss -H -lntup 'sport = :53' 2>/dev/null) ||
+    die '无法检查 53 端口监听状态，拒绝继续配置 SmartDNS。'
+  conflicts=$(awk '
     {
       endpoint = $5
+      if ($0 ~ /users:\(\("smartdns"/) {
+        next
+      }
       is_systemd_resolved = ($0 ~ /users:\(\("systemd-resolve(d)?"/)
-
       if (endpoint ~ /^127\.0\.0\.(53|54)(%[^:[:space:]]+)?:53$/) {
         if (!is_systemd_resolved) {
           print
         }
         next
       }
-
       if (endpoint ~ /^127\.0\.0\.1(%[^:[:space:]]+)?:53$/ ||
           endpoint == "0.0.0.0:53" || endpoint == "*:53" ||
           endpoint == "[::]:53" || endpoint == "[::1]:53") {
         print
       }
     }
-  ' <<<"$port_53_output")
-  if [[ -n "$port_53_conflicts" ]]; then
-    die "53 端口存在冲突监听，拒绝覆盖：$(shorten_line "$port_53_conflicts")"
-  fi
+  ' <<<"$output")
+  [[ -z "$conflicts" ]] ||
+    die "53 端口存在冲突监听，拒绝覆盖：$(shorten_line "$conflicts")"
+}
 
+smartdns_listener_present() {
+  local protocol=$1
+  local socket_output=$2
+
+  awk -v protocol="$protocol" '
+    $1 == protocol &&
+    $5 ~ /^127\.0\.0\.1(%[^:[:space:]]+)?:53$/ &&
+    $0 ~ /users:\(\("smartdns"/ { found = 1 }
+    END { exit !found }
+  ' <<<"$socket_output"
+}
+
+first_valid_ipv4() {
+  awk '
+    {
+      candidate = $1
+      if (split(candidate, octets, /\./) != 4) {
+        next
+      }
+      valid = 1
+      for (i = 1; i <= 4; i++) {
+        if (octets[i] !~ /^[0-9]+$/ || octets[i] < 0 || octets[i] > 255) {
+          valid = 0
+        }
+      }
+      if (valid) {
+        print candidate
+        exit
+      }
+    }
+    END { exit !valid }
+  '
+}
+
+query_smartdns_ipv4() {
+  local attempt
+  local candidate
+  local output
+  local query_status
+
+  SMARTDNS_IPV4_ANSWER=''
+  SMARTDNS_IPV4_ATTEMPTS=0
+  SMARTDNS_LAST_DIG_OUTPUT=''
+  for attempt in {1..10}; do
+    SMARTDNS_IPV4_ATTEMPTS=$attempt
+    if output=$(dig @127.0.0.1 cloudflare.com A +short +time=4 +tries=1 2>&1); then
+      query_status=0
+    else
+      query_status=$?
+    fi
+    SMARTDNS_LAST_DIG_OUTPUT=$output
+    candidate=$(first_valid_ipv4 <<<"$output" || true)
+    if ((query_status == 0)) && [[ -n "$candidate" ]]; then
+      SMARTDNS_IPV4_ANSWER=$candidate
+      return 0
+    fi
+    if ((attempt < 10)); then
+      sleep 2
+    fi
+  done
+  return 1
+}
+
+install_smartdns() {
+  CURRENT_STEP='安装并配置 SmartDNS'
+  local aaaa_output=''
+  local installed_architecture
+  local installed_package
+  local installed_version
+  local smartdns_version
+  local socket_output=''
+  local staged_config
   local service_user
   local service_group
+
+  apt_get install -y ca-certificates dnsutils
+  command -v curl >/dev/null 2>&1 || die '缺少 curl。'
+  command -v dig >/dev/null 2>&1 || die '安装 dnsutils 后仍找不到 dig。'
+  command -v dpkg-deb >/dev/null 2>&1 || die '缺少 dpkg-deb。'
+  command -v sha256sum >/dev/null 2>&1 || die '缺少 sha256sum。'
+  [[ -r /etc/ssl/certs/ca-certificates.crt && -s /etc/ssl/certs/ca-certificates.crt ]] ||
+    die '系统 CA 文件不可读或为空：/etc/ssl/certs/ca-certificates.crt。'
+
+  staged_config=$(mktemp "$TMP_DIR/smartdns.conf.XXXXXXXX")
+  write_smartdns_configuration "$staged_config" "$SMARTDNS_CONFIG_VARIANT"
+  log "使用固定 SmartDNS Release：$SMARTDNS_RELEASE_TAG。"
+  download_and_verify_smartdns_package
+  capture_smartdns_transaction_state
+  SMARTDNS_TRANSACTION_ACTIVE=true
+
+  stop_and_clean_smartdns
+  if smartdns_package_is_current; then
+    log "已安装精确目标版本 $SMARTDNS_EXPECTED_VERSION；跳过重复安装。"
+  else
+    apt-mark unhold smartdns >/dev/null 2>&1 ||
+      die '安装前无法取消 smartdns hold。'
+    apt_get -o Dpkg::Options::='--force-confold' install -y \
+      --allow-downgrades "$SMARTDNS_PACKAGE_PATH"
+    hash -r
+    stop_and_clean_smartdns
+  fi
+
+  command -v smartdns >/dev/null 2>&1 || die '安装后找不到 smartdns。'
+  smartdns_version=$(smartdns_version_text) || die 'SmartDNS 版本验证失败。'
+  [[ "$smartdns_version" == "smartdns $SMARTDNS_EXPECTED_VERSION" ]] ||
+    die "smartdns -v 与预期版本 $SMARTDNS_EXPECTED_VERSION 不一致：$smartdns_version。"
+  installed_package=$(dpkg-query -W -f='${Package}' smartdns)
+  installed_version=$(dpkg-query -W -f='${Version}' smartdns)
+  installed_architecture=$(dpkg-query -W -f='${Architecture}' smartdns)
+  [[ "$installed_package" == 'smartdns' ]] ||
+    die "已安装 Debian 软件包名称不是 smartdns：$installed_package。"
+  [[ "$installed_version" == "$SMARTDNS_EXPECTED_VERSION" ]] ||
+    die "已安装 SmartDNS 版本不是 $SMARTDNS_EXPECTED_VERSION：$installed_version。"
+  [[ "$installed_architecture" == "$CPU_ARCH" ]] ||
+    die "已安装 SmartDNS 架构不是 $CPU_ARCH：$installed_architecture。"
+
   service_user=$(systemctl show smartdns.service -p User --value 2>/dev/null || true)
   [[ -n "$service_user" ]] || service_user='root'
   if id "$service_user" >/dev/null 2>&1; then
@@ -2050,7 +2402,9 @@ SMARTDNS_CONFIG
 
   install -d -o root -g root -m 0755 /etc/smartdns
   install -d -o "$service_user" -g "$service_group" -m 0750 /var/cache/smartdns
-  write_managed_file /etc/smartdns/smartdns.conf 0644 root root <"$staged_config"
+  validate_smartdns_configuration "$staged_config"
+  check_smartdns_port_53_conflicts
+  write_managed_file "$SMARTDNS_CONFIG_TARGET" 0644 root root <"$staged_config"
 
   systemctl reset-failed smartdns.service ||
     smartdns_health_fail '无法重置 SmartDNS 服务失败状态。'
@@ -2060,28 +2414,46 @@ SMARTDNS_CONFIG
     smartdns_health_fail '无法重启 SmartDNS 服务。'
   systemctl is-active --quiet smartdns.service ||
     smartdns_health_fail 'SmartDNS 服务未处于 active 状态。'
+  systemctl is-enabled --quiet smartdns.service ||
+    smartdns_health_fail 'SmartDNS 服务未设置为 enabled。'
+  pgrep -x smartdns >/dev/null 2>&1 ||
+    smartdns_health_fail '未找到运行中的 SmartDNS 进程。'
+  if [[ ! -s /run/smartdns.pid && ! -s /var/run/smartdns.pid ]]; then
+    warn '未找到 SmartDNS PID 文件；进程与服务状态正常，因此不单独判定失败。'
+  fi
 
   for _ in {1..10}; do
-    if ss -H -lun 'sport = :53' 2>/dev/null | grep -q '127\.0\.0\.1:53' &&
-      ss -H -ltn 'sport = :53' 2>/dev/null | grep -q '127\.0\.0\.1:53'; then
+    socket_output=$(ss -H -lntup 'sport = :53' 2>/dev/null || true)
+    if smartdns_listener_present udp "$socket_output" &&
+      smartdns_listener_present tcp "$socket_output"; then
       break
     fi
     sleep 1
   done
-  ss -H -lun 'sport = :53' 2>/dev/null | grep -q '127\.0\.0\.1:53' ||
+  smartdns_listener_present udp "$socket_output" ||
     smartdns_health_fail 'SmartDNS 未在 127.0.0.1:53/udp 监听。'
-  ss -H -ltn 'sport = :53' 2>/dev/null | grep -q '127\.0\.0\.1:53' ||
+  smartdns_listener_present tcp "$socket_output" ||
     smartdns_health_fail 'SmartDNS 未在 127.0.0.1:53/tcp 监听。'
-  if dig_output=$(dig +time=5 +tries=1 +noall +answer @127.0.0.1 debian.org A 2>&1) &&
-    awk 'NF >= 5 && $3 == "IN" && $4 == "A" { found = 1 }
-      END { exit !found }' <<<"$dig_output"; then
-    log 'SmartDNS DoH 解析验证通过：debian.org answer section 包含 IN A 记录。'
-  else
-    smartdns_health_fail 'SmartDNS DoH 解析未返回 IN A 记录，系统 DNS 尚未修改。'
+  if ! query_smartdns_ipv4; then
+    smartdns_health_fail "SmartDNS IPv4 查询连续 $SMARTDNS_IPV4_ATTEMPTS 次未返回合法 IPv4；最后输出：$(shorten_line "$SMARTDNS_LAST_DIG_OUTPUT")"
   fi
+  if ! aaaa_output=$(dig @127.0.0.1 cloudflare.com AAAA +time=4 +tries=1 2>&1); then
+    smartdns_health_fail "SmartDNS AAAA 查询执行失败：$(shorten_line "$aaaa_output")"
+  fi
+  grep -Eq 'status:[[:space:]]*NOERROR([,[:space:]]|$)' <<<"$aaaa_output" ||
+    smartdns_health_fail "SmartDNS AAAA 查询状态不是 NOERROR：$(shorten_line "$aaaa_output")"
+
+  apt-mark hold smartdns >/dev/null ||
+    smartdns_health_fail '健康检查通过后无法 hold smartdns。'
+  apt-mark showhold | grep -Fxq smartdns ||
+    smartdns_health_fail 'apt-mark 未确认 smartdns 处于 hold 状态。'
 
   SMARTDNS_READY=true
-  log "SmartDNS 已安装并验证：$smartdns_version，127.0.0.1:53/udp+tcp。"
+  SMARTDNS_TRANSACTION_ACTIVE=false
+  log "SmartDNS 已安装并验证：Debian $DEBIAN_VERSION/$CPU_ARCH，$installed_version，$SMARTDNS_CONFIG_VARIANT。"
+  log "smartdns -v：$smartdns_version；127.0.0.1:53/udp+tcp。"
+  log "IPv4 查询第 $SMARTDNS_IPV4_ATTEMPTS 次成功：$SMARTDNS_IPV4_ANSWER；AAAA 状态 NOERROR。"
+  log 'smartdns 已设置为 hold。'
 }
 
 restore_resolv_conf() {

@@ -1,0 +1,274 @@
+name: Pinned SmartDNS validation
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  RELEASE_TAG: smartdns-debian-pinned-2026-07
+  RELEASE_BASE: https://github.com/404-git-404/404notfound/releases/download/smartdns-debian-pinned-2026-07
+
+jobs:
+  release-assets:
+    name: Release assets and package metadata
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Fetch actual Release asset names and URLs
+        run: |
+          curl --fail --location --silent --show-error \
+            --connect-timeout 10 --max-time 120 --retry 3 --retry-delay 2 \
+            --retry-connrefused \
+            "https://api.github.com/repos/404-git-404/404notfound/releases/tags/$RELEASE_TAG" \
+            -o /tmp/release.json
+          jq -e '
+            .tag_name == "smartdns-debian-pinned-2026-07" and
+            .draft == false and
+            .prerelease == false and
+            (.assets | length == 12) and
+            ([.assets[].name] | unique | length == 12) and
+            ([.assets[].state] | all(. == "uploaded"))
+          ' /tmp/release.json
+          jq -r '.assets[].name' /tmp/release.json | sort > /tmp/actual-assets
+          cat > /tmp/expected-assets <<'EOF'
+          SHA256SUMS
+          SOURCES.md
+          smartdns_40+dfsg-1.debian.tar.xz
+          smartdns_40+dfsg-1.dsc
+          smartdns_40+dfsg-1_bookworm_amd64.deb
+          smartdns_40+dfsg-1_bookworm_arm64.deb
+          smartdns_40+dfsg.orig.tar.xz
+          smartdns_46.1+dfsg-1.1.deb13u1.debian.tar.xz
+          smartdns_46.1+dfsg-1.1.deb13u1.dsc
+          smartdns_46.1+dfsg-1.1.deb13u1_trixie_amd64.deb
+          smartdns_46.1+dfsg-1.1.deb13u1_trixie_arm64.deb
+          smartdns_46.1+dfsg.orig.tar.xz
+          EOF
+          sort -o /tmp/expected-assets /tmp/expected-assets
+          diff -u /tmp/expected-assets /tmp/actual-assets
+          if grep -Eq '(~|starter)' /tmp/actual-assets; then
+            exit 1
+          fi
+          jq -e --arg base "$RELEASE_BASE/" '
+            [.assets[]
+              | (.browser_download_url | startswith($base))] | all
+          ' /tmp/release.json
+
+      - name: Confirm Release is not latest
+        run: |
+          curl --fail --location --silent --show-error \
+            --connect-timeout 10 --max-time 120 --retry 3 --retry-delay 2 \
+            --retry-connrefused \
+            https://api.github.com/repos/404-git-404/404notfound/releases/latest \
+            -o /tmp/latest.json
+          test "$(jq -r .tag_name /tmp/latest.json)" != "$RELEASE_TAG"
+
+      - name: Download through API-returned anonymous URLs
+        run: |
+          mkdir /tmp/assets
+          jq -r '.assets[] | [.name, .browser_download_url] | @tsv' \
+            /tmp/release.json |
+            while IFS=$'\t' read -r name url; do
+              curl --fail --location --silent --show-error \
+                --connect-timeout 10 --max-time 120 --retry 3 --retry-delay 2 \
+                --retry-connrefused "$url" -o "/tmp/assets/$name"
+              test -s "/tmp/assets/$name"
+            done
+          cd /tmp/assets
+          sha256sum --check SHA256SUMS
+          test "$(sha256sum SOURCES.md | awk '{print $1}')" = \
+            58ed7c09f565a382a1f6f5dafde34068fea2557defcd823110968982b4fc1984
+
+      - name: Verify all binary package metadata
+        run: |
+          cat > /tmp/package-expectations <<'EOF'
+          smartdns_40+dfsg-1_bookworm_amd64.deb|40+dfsg-1|amd64|8388fb543f870fc77d17dbaa9874277d2ef37d120ad2ab24af730d7032a80bcb
+          smartdns_40+dfsg-1_bookworm_arm64.deb|40+dfsg-1|arm64|7aadb6fb0e6d2f38d8ce11db60561c2c8c7c9d0aacf1e54f9e27f44a4abfb9ca
+          smartdns_46.1+dfsg-1.1.deb13u1_trixie_amd64.deb|46.1+dfsg-1.1~deb13u1|amd64|d2dfe591dbdabf3655c2ead30975ee20f6720346552bda989b212ccffde5ba4e
+          smartdns_46.1+dfsg-1.1.deb13u1_trixie_arm64.deb|46.1+dfsg-1.1~deb13u1|arm64|d9eeb9050ab6e0c95011de83955f65ca8020779c8c32aba90d708bc54c33823f
+          EOF
+          while IFS='|' read -r name version architecture digest; do
+            package="/tmp/assets/$name"
+            test "$(sha256sum "$package" | awk '{print $1}')" = "$digest"
+            dpkg-deb --info "$package" >/dev/null
+            test "$(dpkg-deb --field "$package" Package)" = smartdns
+            test "$(dpkg-deb --field "$package" Version)" = "$version"
+            test "$(dpkg-deb --field "$package" Architecture)" = "$architecture"
+          done < /tmp/package-expectations
+          grep -Fq 'smartdns_46.1+dfsg-1.1.deb13u1_trixie_amd64.deb' \
+            /tmp/assets/SOURCES.md
+          grep -Fq '46.1+dfsg-1.1~deb13u1' /tmp/assets/SOURCES.md
+
+      - name: Reject tampering and architecture mismatch
+        run: |
+          package=/tmp/assets/smartdns_40+dfsg-1_bookworm_amd64.deb
+          cp "$package" /tmp/tampered.deb
+          printf X | dd of=/tmp/tampered.deb bs=1 seek=0 conv=notrunc status=none
+          if printf '%s  %s\n' \
+            8388fb543f870fc77d17dbaa9874277d2ef37d120ad2ab24af730d7032a80bcb \
+            /tmp/tampered.deb | sha256sum --check --status; then
+            echo 'Tampered package unexpectedly passed SHA-256 validation.' >&2
+            exit 1
+          fi
+          verify_metadata() {
+            local candidate=$1
+            local expected_version=$2
+            local expected_architecture=$3
+            test "$(dpkg-deb --field "$candidate" Package)" = smartdns
+            test "$(dpkg-deb --field "$candidate" Version)" = "$expected_version"
+            test "$(dpkg-deb --field "$candidate" Architecture)" = \
+              "$expected_architecture"
+          }
+          if verify_metadata "$package" 40+dfsg-1 arm64; then
+            echo 'amd64 package unexpectedly passed the arm64 mapping.' >&2
+            exit 1
+          fi
+
+  integration:
+    name: Debian ${{ matrix.debian }} ${{ matrix.variant }} integration
+    runs-on: ubuntu-latest
+    container: debian:${{ matrix.debian }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - debian: "12"
+            variant: v40
+            version: 40+dfsg-1
+            asset: smartdns_40+dfsg-1_bookworm_amd64.deb
+            sha256: 8388fb543f870fc77d17dbaa9874277d2ef37d120ad2ab24af730d7032a80bcb
+          - debian: "13"
+            variant: v46
+            version: 46.1+dfsg-1.1~deb13u1
+            asset: smartdns_46.1+dfsg-1.1.deb13u1_trixie_amd64.deb
+            sha256: d2dfe591dbdabf3655c2ead30975ee20f6720346552bda989b212ccffde5ba4e
+    steps:
+      - name: Install integration dependencies
+        run: |
+          apt-get update
+          apt-get install --yes ca-certificates curl dnsutils iproute2 procps
+
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Download, validate and install pinned package
+        run: |
+          printf '#!/bin/sh\nexit 101\n' > /usr/sbin/policy-rc.d
+          chmod 0755 /usr/sbin/policy-rc.d
+          curl --fail --location --silent --show-error \
+            --connect-timeout 10 --max-time 120 --retry 3 --retry-delay 2 \
+            --retry-connrefused \
+            "$RELEASE_BASE/${{ matrix.asset }}" -o /tmp/smartdns.deb
+          test "$(sha256sum /tmp/smartdns.deb | awk '{print $1}')" = \
+            "${{ matrix.sha256 }}"
+          dpkg-deb --info /tmp/smartdns.deb >/dev/null
+          test "$(dpkg-deb --field /tmp/smartdns.deb Package)" = smartdns
+          test "$(dpkg-deb --field /tmp/smartdns.deb Version)" = \
+            "${{ matrix.version }}"
+          test "$(dpkg-deb --field /tmp/smartdns.deb Architecture)" = amd64
+          apt-get install --yes --allow-downgrades /tmp/smartdns.deb
+          test "$(dpkg-query -W -f='${Version}' smartdns)" = \
+            "${{ matrix.version }}"
+          test "$(dpkg-query -W -f='${Architecture}' smartdns)" = amd64
+          test "$(smartdns -v)" = "smartdns ${{ matrix.version }}"
+          dpkg-query -L smartdns | grep -Eq \
+            '^/(usr/)?lib/systemd/system/smartdns\.service$'
+          apt-mark hold smartdns
+          apt-mark showhold | grep -Fxq smartdns
+
+      - name: Generate and start the actual version-specific configuration
+        run: |
+          {
+            printf '%s\n' 'set -Eeuo pipefail'
+            printf '%s\n' 'die() { printf "%s\n" "$*" >&2; exit 1; }'
+            awk -v signature='write_smartdns_configuration() {' '
+              $0 == signature { capture = 1 }
+              capture { print }
+              capture && $0 == "}" { exit }
+            ' scripts/update-smartdns.sh
+            # shellcheck disable=SC2016
+            printf '%s\n' \
+              'write_smartdns_configuration /tmp/smartdns.conf "${CONFIG_VARIANT}"'
+          } > /tmp/render-config.sh
+          CONFIG_VARIANT="${{ matrix.variant }}" bash /tmp/render-config.sh
+          sed \
+            -e 's/^bind 127\.0\.0\.1:53$/bind 127.0.0.1:6053/' \
+            -e 's/^bind-tcp 127\.0\.0\.1:53$/bind-tcp 127.0.0.1:6053/' \
+            /tmp/smartdns.conf > /tmp/smartdns-validation.conf
+          install -d -m 0750 /var/cache/smartdns
+          smartdns -f -x -c /tmp/smartdns-validation.conf \
+            -p /tmp/smartdns-validation.pid > /tmp/smartdns.log 2>&1 &
+          smartdns_pid=$!
+          trap 'kill -TERM "$smartdns_pid" 2>/dev/null || true' EXIT
+          sleep 2
+          kill -0 "$smartdns_pid"
+          pgrep -x smartdns >/dev/null
+          ss -H -lun 'sport = :6053' | grep -Fq '127.0.0.1:6053'
+          ss -H -ltn 'sport = :6053' | grep -Fq '127.0.0.1:6053'
+          if grep -Eiq \
+            'unsupported[[:space:]]+config|configuration[[:space:]]+error|parse[[:space:]]+error|load[[:space:]]+config[[:space:]]+failed' \
+            /tmp/smartdns.log; then
+            exit 1
+          fi
+          first_valid_ipv4() {
+            awk '
+              {
+                candidate = $1
+                if (split(candidate, octets, /\./) != 4) {
+                  next
+                }
+                valid = 1
+                for (i = 1; i <= 4; i++) {
+                  if (octets[i] !~ /^[0-9]+$/ ||
+                      octets[i] < 0 || octets[i] > 255) {
+                    valid = 0
+                  }
+                }
+                if (valid) {
+                  print candidate
+                  exit
+                }
+              }
+              END { exit !valid }
+            '
+          }
+          query_with_retry() {
+            local domain=$1
+            local attempt
+            local answer
+            local candidate
+            local query_status
+            for attempt in {1..10}; do
+              if answer=$(dig @127.0.0.1 -p 6053 "$domain" A \
+                +short +time=4 +tries=1 2>&1); then
+                query_status=0
+              else
+                query_status=$?
+              fi
+              candidate=$(first_valid_ipv4 <<<"$answer" || true)
+              if ((query_status == 0)) && [[ -n "$candidate" ]]; then
+                printf '%s resolved to %s on attempt %s\n' \
+                  "$domain" "$candidate" "$attempt"
+                return 0
+              fi
+              if ((attempt < 10)); then
+                sleep 2
+              fi
+            done
+            printf '%s failed after 10 attempts: %.300s\n' \
+              "$domain" "${answer//$'\n'/ }" >&2
+            return 1
+          }
+          query_with_retry cloudflare.com
+          query_with_retry debian.org
+          kill -TERM "$smartdns_pid"
+          wait "$smartdns_pid" || true
+          trap - EXIT
+
+      - name: Run offline mapping and retry tests
+        run: bash tests/smartdns-test.sh

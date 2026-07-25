@@ -19,28 +19,29 @@ jobs:
       - name: Check committed diff
         run: git diff --check HEAD^ HEAD
 
-      - name: Check Bash syntax
+      - name: Check script files
         run: |
-          bash -n 404notfound.sh
-          bash -n domain-check.sh
-          bash -n scripts/update-smartdns.sh
-          bash -n request-cloudflare-certificate.sh
-          bash -n tests/domain-check-test.sh
-
-      - name: Check script files and executable modes
-        run: |
-          for script in \
-            404notfound.sh \
-            domain-check.sh \
-            scripts/update-smartdns.sh \
-            request-cloudflare-certificate.sh \
-            tests/domain-check-test.sh; do
+          scripts=(
+            404notfound.sh
+            domain-check.sh
+            scripts/update-smartdns.sh
+            request-cloudflare-certificate.sh
+            tests/domain-check-test.sh
+            tests/smartdns-test.sh
+          )
+          for script in "${scripts[@]}"; do
             test -s "$script"
-            ! grep -q $'\r' "$script"
+            if grep -q $'\r' "$script"; then
+              echo "$script contains CRLF." >&2
+              exit 1
+            fi
+            bash -n "$script"
           done
           for executable_script in \
             domain-check.sh \
-            tests/domain-check-test.sh; do
+            scripts/update-smartdns.sh \
+            tests/domain-check-test.sh \
+            tests/smartdns-test.sh; do
             test -x "$executable_script"
           done
 
@@ -54,57 +55,34 @@ jobs:
           test -s /tmp/update-cloudflare-ufw
           bash -n /tmp/update-cloudflare-ufw
 
-      - name: Check embedded SmartDNS configuration
+      - name: Check repository invariants
         run: |
           test ! -e configs/smartdns.conf
           test ! -e smartdns.conf
-          awk '
-            index($0, "<<") && index($0, "SMARTDNS_CONFIG") { capture = 1; next }
-            capture && $0 == "SMARTDNS_CONFIG" { exit }
-            capture { print }
-          ' 404notfound.sh > /tmp/installer-smartdns.conf
-          test -s /tmp/installer-smartdns.conf
-          awk '
-            index($0, "<<") && index($0, "SMARTDNS_CONFIG") { capture = 1; next }
-            capture && $0 == "SMARTDNS_CONFIG" { exit }
-            capture { print }
-          ' scripts/update-smartdns.sh > /tmp/update-smartdns.conf
-          test -s /tmp/update-smartdns.conf
-          cmp -s /tmp/installer-smartdns.conf /tmp/update-smartdns.conf
-          ! grep -Eq '^[[:space:]]*#' /tmp/installer-smartdns.conf
-          ! grep -Eqi 'default-group|web.*(user|password)|(^|[[:space:]-])acl([[:space:]-]|$)|^[[:space:]]*(user|password)[[:space:]]' /tmp/installer-smartdns.conf
-          ! grep -Eq '^[[:space:]]*server(-tcp)?[[:space:]]' /tmp/installer-smartdns.conf
-          grep -Fqx 'bind 127.0.0.1:53' /tmp/installer-smartdns.conf
-          grep -Fqx 'bind-tcp 127.0.0.1:53' /tmp/installer-smartdns.conf
-          grep -Fqx 'ca-file /etc/ssl/certs/ca-certificates.crt' /tmp/installer-smartdns.conf
-          grep -Fqx 'server-https https://cloudflare-dns.com/dns-query -host-ip 1.1.1.1' /tmp/installer-smartdns.conf
-          grep -Fqx 'server-https https://dns.google/dns-query -host-ip 8.8.8.8' /tmp/installer-smartdns.conf
-          grep -Fqx 'server-https https://dns10.quad9.net/dns-query -host-ip 9.9.9.10 -fallback' /tmp/installer-smartdns.conf
-          test "$(grep -c '^server-https ' /tmp/installer-smartdns.conf)" -eq 3
-          grep -Fq 'dig +time=5 +tries=1 +noall +answer' 404notfound.sh
-          grep -Fq 'NF >= 5 && $3 == "IN" && $4 == "A"' 404notfound.sh
-          grep -Fq 'journalctl -u smartdns.service -n 50 --no-pager' 404notfound.sh
-          ! grep -Fq 'smartdns -c ' 404notfound.sh
-          grep -Fq 'systemctl stop smartdns.service' 404notfound.sh
-          grep -Fq 'pkill -TERM -x smartdns' 404notfound.sh
-          grep -Fq 'pkill -KILL -x smartdns' 404notfound.sh
-          grep -Fq 'rm -f -- /run/smartdns.pid /var/run/smartdns.pid' 404notfound.sh
-          grep -Fq 'systemctl reset-failed smartdns.service' 404notfound.sh
-          grep -Fq '127\.0\.0\.(53|54)' 404notfound.sh
-          grep -Fq 'systemd-resolve(d)?' 404notfound.sh
-
-      - name: Check domain-check integration and repository layout
-        run: |
           test -s domain-check.sh
-          test ! -e smartdns.conf
           grep -Fq "readonly DOMAIN_CHECK_TARGET='/usr/local/bin/domain-check'" 404notfound.sh
           grep -Fq "404notfound/main/domain-check.sh'" 404notfound.sh
+          # shellcheck disable=SC2016
           grep -Fq 'bash -n "$downloaded_file"' 404notfound.sh
           grep -Fq 'mktemp /usr/local/bin/.domain-check.' 404notfound.sh
           legacy_name="Reality""Checker"
           legacy_command="reality""-checker"
-          ! grep -RniE --exclude-dir=.git \
-            "${legacy_name}|${legacy_command}|V2RaySSR/${legacy_name}" .
+          if grep -RniE --exclude-dir=.git \
+            "${legacy_name}|${legacy_command}|V2RaySSR/${legacy_name}" .; then
+            exit 1
+          fi
+          if grep -Eq '(/lib|/usr/lib)/systemd/system/smartdns\.service' \
+            404notfound.sh scripts/update-smartdns.sh; then
+            exit 1
+          fi
+          if grep -Fq 'https://api.github.com/repos/pymumu/smartdns/releases/latest' \
+            404notfound.sh scripts/update-smartdns.sh; then
+            exit 1
+          fi
+          if grep -Fq 'install -y ca-certificates dnsutils smartdns' \
+            404notfound.sh scripts/update-smartdns.sh; then
+            exit 1
+          fi
 
       - name: Check strict README
         run: |
@@ -121,59 +99,21 @@ jobs:
           sudo apt-get update
           sudo apt-get install --yes shellcheck mawk
 
-      - name: Run domain-check offline tests
+      - name: Run offline tests
         run: |
           mkdir -p "$RUNNER_TEMP/mawk-bin"
           ln -s "$(command -v mawk)" "$RUNNER_TEMP/mawk-bin/awk"
           PATH="$RUNNER_TEMP/mawk-bin:$PATH" awk -W version
           PATH="$RUNNER_TEMP/mawk-bin:$PATH" bash tests/domain-check-test.sh
-
-      - name: Check SmartDNS updater regressions
-        run: |
-          grep -Fq "readonly CONFIG_TARGET='/etc/smartdns/smartdns.conf'" scripts/update-smartdns.sh
-          grep -Fq "readonly RELEASE_API='https://api.github.com/repos/pymumu/smartdns/releases/latest'" scripts/update-smartdns.sh
-          grep -Fq "amd64) ASSET_SUFFIX='x86_64-debian-all.deb'" scripts/update-smartdns.sh
-          grep -Fq "arm64) ASSET_SUFFIX='aarch64-debian-all.deb'" scripts/update-smartdns.sh
-          grep -Fq "armhf) ASSET_SUFFIX='arm-debian-all.deb'" scripts/update-smartdns.sh
-          grep -Fq -- "-o Dpkg::Options::='--force-confold'" scripts/update-smartdns.sh
-          grep -Fq 'systemctl daemon-reload' scripts/update-smartdns.sh
-          grep -Fq 'systemctl enable smartdns' scripts/update-smartdns.sh
-          grep -Fq 'systemctl restart smartdns' scripts/update-smartdns.sh
-          grep -Fq 'status:[[:space:]]*NOERROR' scripts/update-smartdns.sh
-          grep -Fq '允许 ANSWER 为 0' scripts/update-smartdns.sh
-          grep -Fq 'START_TIME="@$(date +%s)"' scripts/update-smartdns.sh
-          ! grep -Fq 'date --iso-8601=seconds' scripts/update-smartdns.sh
-          grep -Fq '/etc/resolv.conf' scripts/update-smartdns.sh
-          grep -Fq 'getent ahostsv4 cloudflare.com' scripts/update-smartdns.sh
-          grep -Fq '系统 DNS：仅 127.0.0.1' scripts/update-smartdns.sh
-          grep -Fq '系统解析：正常' scripts/update-smartdns.sh
-          awk '
-            $0 == "report_system_dns_mismatch() {" { capture = 1 }
-            $0 == "check_debian_system_dns() {" { in_check = 1 }
-            capture { print }
-            capture && in_check && $0 == "}" { exit }
-          ' scripts/update-smartdns.sh > /tmp/check-debian-system-dns
-          test -s /tmp/check-debian-system-dns
-          ! grep -Fq 'fail_with_recovery' /tmp/check-debian-system-dns
-          ! grep -Eq '(resolvectl|systemd-resolved|install .*resolv\.conf|cp .*resolv\.conf|rm .*resolv\.conf|> */etc/resolv\.conf)' /tmp/check-debian-system-dns
-          ! grep -Eq '(resolvectl|systemd-resolved)' scripts/update-smartdns.sh
-          ! grep -Eq 'SCRIPT_DIR|REPO_ROOT|CONFIG_SOURCE|BASH_SOURCE|dirname|pwd -P' scripts/update-smartdns.sh
-          ! grep -Fq 'valid_ipv6_answer' scripts/update-smartdns.sh
-          ! grep -Eq '(/usr/local|ExecStart|reboot|systemctl (restart|reload) (ssh|sshd|networking|systemd-networkd))' scripts/update-smartdns.sh
-
-      - name: Check installer regressions
-        run: |
-          ! grep -Fq 'Include /etc/ssh/sshd_config.d/00-hardening.conf' 404notfound.sh
-          grep -Fq 'smartdns -v' 404notfound.sh
-          ! grep -Fq 'smartdns -V' 404notfound.sh
-          ! grep -Fq 'smartdns --version' 404notfound.sh
-          grep -Fq 'sort -nu' 404notfound.sh
+          PATH="$RUNNER_TEMP/mawk-bin:$PATH" bash tests/smartdns-test.sh
 
       - name: Run ShellCheck
         run: |
-          shellcheck 404notfound.sh
-          shellcheck domain-check.sh
-          shellcheck scripts/update-smartdns.sh
-          shellcheck request-cloudflare-certificate.sh
-          shellcheck tests/domain-check-test.sh
-          shellcheck /tmp/update-cloudflare-ufw
+          shellcheck \
+            404notfound.sh \
+            domain-check.sh \
+            scripts/update-smartdns.sh \
+            request-cloudflare-certificate.sh \
+            tests/domain-check-test.sh \
+            tests/smartdns-test.sh \
+            /tmp/update-cloudflare-ufw
