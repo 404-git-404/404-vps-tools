@@ -117,7 +117,9 @@ jobs:
           cmp -s README.md /tmp/expected-readme
 
       - name: Run domain-check offline tests
-        run: bash tests/domain-check-test.sh
+        run: |
+          awk -W version
+          bash tests/domain-check-test.sh
 
       - name: Check SmartDNS updater regressions
         run: |

@@ -20,6 +20,7 @@ ACTIVE_PID=''
 REASONS=''
 REDIRECT_STATUS='PASS'
 REDIRECT_DETAIL='-'
+REDIRECT_CODE='-'
 HTTP_REQUEST_OK=false
 HTTP_CODE=''
 HTTP_STATUS='-'
@@ -28,6 +29,25 @@ HTTP_5XX_COUNT=0
 HTTP_SHOULD_RETRY=false
 HTTP_RESULT_STATUS='PASS'
 HTTP_RESULT_REASON=''
+BORDER_HORIZONTAL='-'
+BORDER_VERTICAL='|'
+BORDER_TOP_LEFT='+'
+BORDER_TOP_MIDDLE='+'
+BORDER_TOP_RIGHT='+'
+BORDER_MIDDLE_LEFT='+'
+BORDER_MIDDLE_MIDDLE='+'
+BORDER_MIDDLE_RIGHT='+'
+BORDER_BOTTOM_LEFT='+'
+BORDER_BOTTOM_MIDDLE='+'
+BORDER_BOTTOM_RIGHT='+'
+TABLE_TOTAL_WIDTH=0
+declare -a TABLE_WIDTHS=()
+readonly -a TABLE_HEADERS=(
+  'DOMAIN' 'IP' 'TLS1.3' 'X25519' 'H2'
+  'TLS(ms)' 'CERT' 'HTTP' 'REDIRECT' 'RESULT'
+)
+readonly -a TABLE_MIN_WIDTHS=(18 15 6 6 4 7 5 4 8 6)
+readonly -a TABLE_MAX_WIDTHS=(48 39 0 0 0 0 0 0 0 0)
 
 print_usage() {
   printf '%s\n' "$USAGE_TEXT" >&2
@@ -99,6 +119,7 @@ classify_redirect() {
 
   REDIRECT_STATUS='PASS'
   REDIRECT_DETAIL='-'
+  REDIRECT_CODE='-'
   location=$(trim_location "$location")
   [[ -n "$location" ]] || return 0
 
@@ -106,6 +127,7 @@ classify_redirect() {
     "$location" == *$'\t'* ]]; then
     REDIRECT_STATUS='WARN'
     REDIRECT_DETAIL='无法解析'
+    REDIRECT_CODE='INVALID'
     return 0
   fi
 
@@ -114,12 +136,14 @@ classify_redirect() {
   elif [[ ! "$location" =~ ^[Hh][Tt][Tt][Pp][Ss]?:// ]]; then
     REDIRECT_STATUS='WARN'
     REDIRECT_DETAIL='相对路径'
+    REDIRECT_CODE='RELATIVE'
     return 0
   fi
 
   if [[ ! "$location" =~ ^([Hh][Tt][Tt][Pp][Ss]?)://([^/?#]+)(.*)$ ]]; then
     REDIRECT_STATUS='WARN'
     REDIRECT_DETAIL='无法解析'
+    REDIRECT_CODE='INVALID'
     return 0
   fi
   scheme=${BASH_REMATCH[1],,}
@@ -129,12 +153,14 @@ classify_redirect() {
   if [[ "$scheme" == 'http' ]]; then
     REDIRECT_STATUS='FAIL'
     REDIRECT_DETAIL='降级 HTTP'
+    REDIRECT_CODE='HTTP'
     return 0
   fi
   if [[ "$authority" == *[[:space:]]* ||
     "$remainder" == *$'\n'* || "$remainder" == *$'\r'* ]]; then
     REDIRECT_STATUS='WARN'
     REDIRECT_DETAIL='无法解析'
+    REDIRECT_CODE='INVALID'
     return 0
   fi
   if [[ "$authority" == *'@'* ]]; then
@@ -149,6 +175,7 @@ classify_redirect() {
     else
       REDIRECT_STATUS='WARN'
       REDIRECT_DETAIL='无法解析'
+      REDIRECT_CODE='INVALID'
       return 0
     fi
   else
@@ -156,6 +183,7 @@ classify_redirect() {
       [[ "$authority" != *:*:* ]] || {
         REDIRECT_STATUS='WARN'
         REDIRECT_DETAIL='无法解析'
+        REDIRECT_CODE='INVALID'
         return 0
       }
       host=${authority%%:*}
@@ -171,11 +199,13 @@ classify_redirect() {
       (( 10#$port < 1 || 10#$port > 65535 )); }; then
     REDIRECT_STATUS='WARN'
     REDIRECT_DETAIL='无法解析'
+    REDIRECT_CODE='INVALID'
     return 0
   fi
   if [[ -z "$host" || "$host" == *[[:space:]/?#]* ]]; then
     REDIRECT_STATUS='WARN'
     REDIRECT_DETAIL='无法解析'
+    REDIRECT_CODE='INVALID'
     return 0
   fi
 
@@ -186,13 +216,16 @@ classify_redirect() {
     else
       REDIRECT_DETAIL='同主机'
     fi
+    REDIRECT_CODE='SAME'
   elif [[ "$domain" != www.* && "$host" == "www.$domain" ]] ||
     [[ "$domain" == www.* && "$host" == "${domain#www.}" ]]; then
     REDIRECT_STATUS='WARN'
     REDIRECT_DETAIL='www 切换'
+    REDIRECT_CODE='WWW'
   else
     REDIRECT_STATUS='FAIL'
-    REDIRECT_DETAIL="$host"
+    REDIRECT_DETAIL='跨主机'
+    REDIRECT_CODE='CROSS'
   fi
 }
 
@@ -247,12 +280,14 @@ analyze_http_redirect() {
 
   REDIRECT_STATUS='PASS'
   REDIRECT_DETAIL='-'
+  REDIRECT_CODE='-'
   if [[ "$request_ok" == true && -n "$location" ]]; then
     classify_redirect "$domain" "$location"
   elif [[ "$request_ok" == true &&
     "$status" =~ ^(301|302|303|307|308)$ ]]; then
     REDIRECT_STATUS='WARN'
     REDIRECT_DETAIL='缺少 Location'
+    REDIRECT_CODE='NO-LOC'
   fi
 }
 
@@ -333,13 +368,14 @@ worker_signal() {
 
 first_ipv4_from_file() {
   awk '
-    function valid_ipv4(value, parts, count, index) {
+    function valid_ipv4(value, parts, count, octet_number) {
       count = split(value, parts, ".")
       if (count != 4) {
         return 0
       }
-      for (index = 1; index <= 4; index++) {
-        if (parts[index] !~ /^[0-9]+$/ || parts[index] > 255) {
+      for (octet_number = 1; octet_number <= 4; octet_number++) {
+        if (parts[octet_number] !~ /^[0-9]+$/ ||
+          parts[octet_number] > 255) {
           return 0
         }
       }
@@ -350,7 +386,7 @@ first_ipv4_from_file() {
 }
 
 first_ipv6_from_file() {
-  awk '$1 ~ /^[0-9A-Fa-f:]+$/ && index($1, ":") { print $1; exit }' "$1"
+  awk '$1 ~ /^[0-9A-Fa-f:]+$/ && $1 ~ /:/ { print $1; exit }' "$1"
 }
 
 extract_http_code() {
@@ -386,6 +422,7 @@ check_domain() {
   local final_status='PASS'
   local redirect_status='PASS'
   local redirect_detail='-'
+  local redirect_code='-'
   local start_us
   local end_us
   local tls_command_ok=false
@@ -451,7 +488,7 @@ check_domain() {
     tls_command_ok=true
   fi
   end_us=$(epoch_microseconds)
-  handshake_ms="$(( (10#$end_us - 10#$start_us + 500) / 1000 ))ms"
+  handshake_ms="$(( (10#$end_us - 10#$start_us + 500) / 1000 ))"
 
   if grep -Eq 'TLSv1\.3' "$tls_file"; then
     tls_status='PASS'
@@ -522,6 +559,7 @@ check_domain() {
   analyze_http_redirect "$domain" "$http_request_ok" "$http_status" "$location"
   redirect_status=$REDIRECT_STATUS
   redirect_detail=$REDIRECT_DETAIL
+  redirect_code=$REDIRECT_CODE
 
   if [[ "$dns_status" == 'FAIL' || "$tcp_status" == 'FAIL' ||
     "$tls_status" == 'FAIL' || "$x25519_status" == 'FAIL' ||
@@ -550,7 +588,7 @@ check_domain() {
   [[ -n "$REASONS" ]] || REASONS='-'
   printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
     "$domain" "$ip" "$tls_status" "$x25519_status" "$h2_status" \
-    "$handshake_ms" "$certificate_status" "$http_status" "$redirect_detail" \
+    "$handshake_ms" "$certificate_status" "$http_status" "$redirect_code" \
     "$final_status" "$REASONS" >"$result_file"
 }
 
@@ -627,29 +665,174 @@ check_dependencies() {
 }
 
 initialize_colors() {
+  COLOR_ENABLED=false
   if [[ -t 1 && -t 2 && -z ${NO_COLOR+x} ]]; then
     COLOR_ENABLED=true
   fi
 }
 
-print_colored_status() {
-  local status=$1
-  local color=''
-  if [[ "$COLOR_ENABLED" == true ]]; then
-    case "$status" in
-      PASS) color='32' ;;
-      WARN) color='33' ;;
-      FAIL) color='31' ;;
-    esac
-  fi
-  if [[ -n "$color" ]]; then
-    printf '\033[%sm%s\033[0m' "$color" "$status"
-  else
-    printf '%s' "$status"
+locale_supports_utf8() {
+  local effective_locale=${LC_ALL:-${LC_CTYPE:-${LANG:-}}}
+  effective_locale=${effective_locale,,}
+  [[ "$effective_locale" == *utf-8* || "$effective_locale" == *utf8* ]]
+}
+
+initialize_borders() {
+  BORDER_HORIZONTAL='-'
+  BORDER_VERTICAL='|'
+  BORDER_TOP_LEFT='+'
+  BORDER_TOP_MIDDLE='+'
+  BORDER_TOP_RIGHT='+'
+  BORDER_MIDDLE_LEFT='+'
+  BORDER_MIDDLE_MIDDLE='+'
+  BORDER_MIDDLE_RIGHT='+'
+  BORDER_BOTTOM_LEFT='+'
+  BORDER_BOTTOM_MIDDLE='+'
+  BORDER_BOTTOM_RIGHT='+'
+
+  if [[ -t 1 && -t 2 ]] && locale_supports_utf8; then
+    BORDER_HORIZONTAL='─'
+    BORDER_VERTICAL='│'
+    BORDER_TOP_LEFT='┌'
+    BORDER_TOP_MIDDLE='┬'
+    BORDER_TOP_RIGHT='┐'
+    BORDER_MIDDLE_LEFT='├'
+    BORDER_MIDDLE_MIDDLE='┼'
+    BORDER_MIDDLE_RIGHT='┤'
+    BORDER_BOTTOM_LEFT='└'
+    BORDER_BOTTOM_MIDDLE='┴'
+    BORDER_BOTTOM_RIGHT='┘'
   fi
 }
 
-print_results() {
+initialize_output_style() {
+  initialize_colors
+  initialize_borders
+}
+
+plain_cell_width() {
+  printf '%d' "${#1}"
+}
+
+truncate_ascii() {
+  local value=$1
+  local maximum_width=$2
+  local prefix_width
+  if (( ${#value} <= maximum_width )); then
+    printf '%s' "$value"
+  else
+    prefix_width=$(( maximum_width - 3 ))
+    printf '%s...' "${value:0:prefix_width}"
+  fi
+}
+
+repeat_character() {
+  local character=$1
+  local count=$2
+  local character_number
+  for (( character_number = 0; character_number < count; character_number++ )); do
+    printf '%s' "$character"
+  done
+}
+
+color_for_status() {
+  case "$1" in
+    PASS) printf '32' ;;
+    WARN) printf '33' ;;
+    FAIL) printf '31' ;;
+    -) printf '90' ;;
+    *) printf '' ;;
+  esac
+}
+
+color_for_http() {
+  case "$1" in
+    2??) printf '32' ;;
+    3??) printf '36' ;;
+    4??) printf '33' ;;
+    5??) printf '31' ;;
+    -) printf '90' ;;
+    *) printf '' ;;
+  esac
+}
+
+color_for_redirect() {
+  case "$1" in
+    -) printf '90' ;;
+    SAME|WWW|RELATIVE|NO-LOC|INVALID) printf '33' ;;
+    CROSS|HTTP) printf '31' ;;
+    *) printf '' ;;
+  esac
+}
+
+color_for_latency() {
+  if [[ "$1" == '-' ]]; then
+    printf '90'
+  else
+    printf '36'
+  fi
+}
+
+print_plain_cell() {
+  local value=$1
+  local width=$2
+  printf ' %-*s ' "$width" "$value"
+}
+
+print_colored_text() {
+  local value=$1
+  local color=$2
+  if [[ "$COLOR_ENABLED" == true && -n "$color" ]]; then
+    printf '\033[%sm%s\033[0m' "$color" "$value"
+  else
+    printf '%s' "$value"
+  fi
+}
+
+print_colored_cell() {
+  local value=$1
+  local width=$2
+  local color=$3
+  local padding=$(( width - ${#value} ))
+
+  printf ' '
+  print_colored_text "$value" "$color"
+  printf '%*s ' "$padding" ''
+}
+
+frame_color_begin() {
+  [[ "$COLOR_ENABLED" == true ]] && printf '\033[90m'
+  return 0
+}
+
+frame_color_end() {
+  [[ "$COLOR_ENABLED" == true ]] && printf '\033[0m'
+  return 0
+}
+
+print_frame_piece() {
+  frame_color_begin
+  printf '%s' "$1"
+  frame_color_end
+}
+
+update_column_width() {
+  local column_number=$1
+  local value=$2
+  local maximum_width=${TABLE_MAX_WIDTHS[$column_number]}
+  local value_width
+
+  value_width=$(plain_cell_width "$value")
+  if (( value_width > TABLE_WIDTHS[column_number] )); then
+    TABLE_WIDTHS[column_number]=$value_width
+  fi
+  if (( maximum_width > 0 &&
+    TABLE_WIDTHS[column_number] > maximum_width )); then
+    TABLE_WIDTHS[column_number]=$maximum_width
+  fi
+}
+
+calculate_table_widths() {
   local index
   local domain
   local ip
@@ -659,31 +842,235 @@ print_results() {
   local handshake_ms
   local certificate_status
   local http_status
-  local redirect_detail
+  local redirect_code
+  local final_status
+  local reasons
+  local domain_display
+  local column_number
+  local width
+  local -a values=()
+
+  TABLE_WIDTHS=("${TABLE_MIN_WIDTHS[@]}")
+  for column_number in "${!TABLE_HEADERS[@]}"; do
+    update_column_width "$column_number" "${TABLE_HEADERS[$column_number]}"
+  done
+
+  for index in "${!DOMAIN_INPUTS[@]}"; do
+    IFS=$'\t' read -r domain ip tls_status x25519_status h2_status \
+      handshake_ms certificate_status http_status redirect_code final_status \
+      reasons <"$TEMP_DIR/result-$index"
+    domain_display=$(truncate_ascii "$domain" 48)
+    values=(
+      "$domain_display" "$ip" "$tls_status" "$x25519_status" "$h2_status"
+      "$handshake_ms" "$certificate_status" "$http_status" "$redirect_code"
+      "$final_status"
+    )
+    for column_number in "${!values[@]}"; do
+      update_column_width "$column_number" "${values[$column_number]}"
+    done
+  done
+
+  TABLE_TOTAL_WIDTH=1
+  for width in "${TABLE_WIDTHS[@]}"; do
+    (( TABLE_TOTAL_WIDTH += width + 3 ))
+  done
+}
+
+print_border_line() {
+  local left_character=$1
+  local middle_character=$2
+  local right_character=$3
+  local column_number
+
+  frame_color_begin
+  printf '%s' "$left_character"
+  for column_number in "${!TABLE_WIDTHS[@]}"; do
+    repeat_character "$BORDER_HORIZONTAL" \
+      "$(( TABLE_WIDTHS[column_number] + 2 ))"
+    if (( column_number + 1 == ${#TABLE_WIDTHS[@]} )); then
+      printf '%s' "$right_character"
+    else
+      printf '%s' "$middle_character"
+    fi
+  done
+  frame_color_end
+  printf '\n'
+}
+
+print_top_border() {
+  print_border_line \
+    "$BORDER_TOP_LEFT" "$BORDER_TOP_MIDDLE" "$BORDER_TOP_RIGHT"
+}
+
+print_header_separator() {
+  print_border_line \
+    "$BORDER_MIDDLE_LEFT" "$BORDER_MIDDLE_MIDDLE" "$BORDER_MIDDLE_RIGHT"
+}
+
+print_bottom_border() {
+  print_border_line \
+    "$BORDER_BOTTOM_LEFT" "$BORDER_BOTTOM_MIDDLE" "$BORDER_BOTTOM_RIGHT"
+}
+
+print_header_row() {
+  local column_number
+  print_frame_piece "$BORDER_VERTICAL"
+  for column_number in "${!TABLE_HEADERS[@]}"; do
+    print_plain_cell \
+      "${TABLE_HEADERS[$column_number]}" "${TABLE_WIDTHS[$column_number]}"
+    print_frame_piece "$BORDER_VERTICAL"
+  done
+  printf '\n'
+}
+
+print_data_row() {
+  local domain
+  domain=$(truncate_ascii "$1" 48)
+  local ip=$2
+  local tls_status=$3
+  local x25519_status=$4
+  local h2_status=$5
+  local handshake_ms=$6
+  local certificate_status=$7
+  local http_status=$8
+  local redirect_code=$9
+  local final_status=${10}
+
+  print_frame_piece "$BORDER_VERTICAL"
+  print_colored_cell "$domain" "${TABLE_WIDTHS[0]}" '96'
+  print_frame_piece "$BORDER_VERTICAL"
+  print_plain_cell "$ip" "${TABLE_WIDTHS[1]}"
+  print_frame_piece "$BORDER_VERTICAL"
+  print_colored_cell \
+    "$tls_status" "${TABLE_WIDTHS[2]}" "$(color_for_status "$tls_status")"
+  print_frame_piece "$BORDER_VERTICAL"
+  print_colored_cell \
+    "$x25519_status" "${TABLE_WIDTHS[3]}" "$(color_for_status "$x25519_status")"
+  print_frame_piece "$BORDER_VERTICAL"
+  print_colored_cell \
+    "$h2_status" "${TABLE_WIDTHS[4]}" "$(color_for_status "$h2_status")"
+  print_frame_piece "$BORDER_VERTICAL"
+  print_colored_cell \
+    "$handshake_ms" "${TABLE_WIDTHS[5]}" "$(color_for_latency "$handshake_ms")"
+  print_frame_piece "$BORDER_VERTICAL"
+  print_colored_cell "$certificate_status" "${TABLE_WIDTHS[6]}" \
+    "$(color_for_status "$certificate_status")"
+  print_frame_piece "$BORDER_VERTICAL"
+  print_colored_cell \
+    "$http_status" "${TABLE_WIDTHS[7]}" "$(color_for_http "$http_status")"
+  print_frame_piece "$BORDER_VERTICAL"
+  print_colored_cell "$redirect_code" "${TABLE_WIDTHS[8]}" \
+    "$(color_for_redirect "$redirect_code")"
+  print_frame_piece "$BORDER_VERTICAL"
+  print_colored_cell \
+    "$final_status" "${TABLE_WIDTHS[9]}" "$(color_for_status "$final_status")"
+  print_frame_piece "$BORDER_VERTICAL"
+  printf '\n'
+}
+
+table_has_details() {
+  local index
+  local reasons
+  for index in "${!DOMAIN_INPUTS[@]}"; do
+    IFS=$'\t' read -r _ _ _ _ _ _ _ _ _ _ reasons \
+      <"$TEMP_DIR/result-$index"
+    [[ "$reasons" == '-' ]] || return 0
+  done
+  return 1
+}
+
+print_details_header() {
+  local fill_count=$(( TABLE_TOTAL_WIDTH - 12 ))
+  frame_color_begin
+  printf '%s%s DETAILS ' "$BORDER_MIDDLE_LEFT" "$BORDER_HORIZONTAL"
+  repeat_character "$BORDER_HORIZONTAL" "$fill_count"
+  printf '%s' "$BORDER_MIDDLE_RIGHT"
+  frame_color_end
+  printf '\n'
+}
+
+print_details_bottom() {
+  frame_color_begin
+  printf '%s' "$BORDER_BOTTOM_LEFT"
+  repeat_character "$BORDER_HORIZONTAL" "$(( TABLE_TOTAL_WIDTH - 2 ))"
+  printf '%s' "$BORDER_BOTTOM_RIGHT"
+  frame_color_end
+  printf '\n'
+}
+
+print_details() {
+  local index
+  local domain
+  local reasons
+  local domain_display
+  local reason_part
+  local first_reason
+  local -a reason_parts=()
+
+  print_details_header
+  for index in "${!DOMAIN_INPUTS[@]}"; do
+    IFS=$'\t' read -r domain _ _ _ _ _ _ _ _ _ \
+      reasons <"$TEMP_DIR/result-$index"
+    if [[ "$reasons" != '-' ]]; then
+      domain_display=$(truncate_ascii "$domain" 48)
+      IFS=';' read -r -a reason_parts <<<"$reasons"
+      first_reason=true
+      for reason_part in "${reason_parts[@]}"; do
+        reason_part=${reason_part#"${reason_part%%[![:space:]]*}"}
+        print_frame_piece "$BORDER_VERTICAL"
+        printf ' '
+        if [[ "$first_reason" == true ]]; then
+          print_colored_text "$domain_display" '96'
+          printf ': %s\n' "$reason_part"
+          first_reason=false
+        else
+          printf '  %s\n' "$reason_part"
+        fi
+      done
+    fi
+  done
+  print_details_bottom
+}
+
+print_table() {
+  local index
+  local domain
+  local ip
+  local tls_status
+  local x25519_status
+  local h2_status
+  local handshake_ms
+  local certificate_status
+  local http_status
+  local redirect_code
   local final_status
   local reasons
 
-  printf '域名 | IP | TLS1.3 | X25519 | H2 | 握手 | 证书 | HTTP | 跳转 | 结果\n'
+  RESULT_STATUSES=()
+  print_top_border
+  print_header_row
+  print_header_separator
   for index in "${!DOMAIN_INPUTS[@]}"; do
     IFS=$'\t' read -r domain ip tls_status x25519_status h2_status \
-      handshake_ms certificate_status http_status redirect_detail final_status \
+      handshake_ms certificate_status http_status redirect_code final_status \
       reasons <"$TEMP_DIR/result-$index"
     RESULT_STATUSES+=("$final_status")
-    printf '%s | %s | %s | %s | %s | %s | %s | %s | %s | ' \
+    print_data_row \
       "$domain" "$ip" "$tls_status" "$x25519_status" "$h2_status" \
-      "$handshake_ms" "$certificate_status" "$http_status" "$redirect_detail"
-    print_colored_status "$final_status"
-    printf '\n'
+      "$handshake_ms" "$certificate_status" "$http_status" "$redirect_code" \
+      "$final_status"
   done
 
-  for index in "${!DOMAIN_INPUTS[@]}"; do
-    IFS=$'\t' read -r domain ip tls_status x25519_status h2_status \
-      handshake_ms certificate_status http_status redirect_detail final_status \
-      reasons <"$TEMP_DIR/result-$index"
-    if [[ "$reasons" != '-' ]]; then
-      printf -- '- %s: %s\n' "$domain" "$reasons"
-    fi
-  done
+  if table_has_details; then
+    print_details
+  else
+    print_bottom_border
+  fi
+}
+
+print_results() {
+  calculate_table_widths
+  print_table
 }
 
 main() {
@@ -695,7 +1082,7 @@ main() {
     exit 2
   fi
   check_dependencies
-  initialize_colors
+  initialize_output_style
 
   if ! TEMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/domain-check.XXXXXXXX"); then
     printf '%s: unable to create temporary directory.\n' "$PROGRAM_NAME" >&2
