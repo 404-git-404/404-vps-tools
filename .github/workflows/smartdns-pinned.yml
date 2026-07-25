@@ -29,7 +29,7 @@ jobs:
           jq -e '
             .tag_name == "smartdns-debian-pinned-2026-07" and
             .draft == false and
-            .prerelease == false and
+            .prerelease == true and
             (.assets | length == 12) and
             ([.assets[].name] | unique | length == 12) and
             ([.assets[].state] | all(. == "uploaded"))
@@ -61,12 +61,20 @@ jobs:
 
       - name: Confirm Release is not latest
         run: |
-          curl --fail --location --silent --show-error \
+          http_code=$(curl --location --silent --show-error \
+            --header 'Cache-Control: no-cache' \
             --connect-timeout 10 --max-time 120 --retry 3 --retry-delay 2 \
             --retry-connrefused \
             https://api.github.com/repos/404-git-404/404notfound/releases/latest \
-            -o /tmp/latest.json
-          test "$(jq -r .tag_name /tmp/latest.json)" != "$RELEASE_TAG"
+            --output /tmp/latest.json --write-out '%{http_code}')
+          case "$http_code" in
+            200) test "$(jq -r .tag_name /tmp/latest.json)" != "$RELEASE_TAG" ;;
+            404) ;;
+            *)
+              echo "Unexpected latest Release API status: $http_code" >&2
+              exit 1
+              ;;
+          esac
 
       - name: Download through API-returned anonymous URLs
         run: |
@@ -133,6 +141,9 @@ jobs:
     name: Debian ${{ matrix.debian }} ${{ matrix.variant }} integration
     runs-on: ubuntu-latest
     container: debian:${{ matrix.debian }}
+    defaults:
+      run:
+        shell: bash
     strategy:
       fail-fast: false
       matrix:
