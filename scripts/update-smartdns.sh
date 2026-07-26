@@ -285,11 +285,16 @@ capture_existing_state() {
   SMARTDNS_WAS_HELD=false
   SMARTDNS_WAS_ENABLED=false
   SMARTDNS_WAS_ACTIVE=false
-  apt-mark showhold | grep -Fxq smartdns && SMARTDNS_WAS_HELD=true
-  systemctl is-enabled --quiet smartdns.service 2>/dev/null &&
+  if apt-mark showhold | grep -Fxq smartdns; then
+    SMARTDNS_WAS_HELD=true
+  fi
+  if systemctl is-enabled --quiet smartdns.service 2>/dev/null; then
     SMARTDNS_WAS_ENABLED=true
-  systemctl is-active --quiet smartdns.service 2>/dev/null &&
+  fi
+  if systemctl is-active --quiet smartdns.service 2>/dev/null; then
     SMARTDNS_WAS_ACTIVE=true
+  fi
+  return 0
 }
 
 create_backup() {
@@ -390,10 +395,10 @@ package_is_already_installed() {
   local installed_status
   local installed_version
 
-  installed_status=$(dpkg-query -W -f='${db:Status-Abbrev}' smartdns 2>/dev/null || true)
+  installed_status=$(dpkg-query -W -f='${Status}' smartdns 2>/dev/null || true)
   installed_version=$(dpkg-query -W -f='${Version}' smartdns 2>/dev/null || true)
   installed_architecture=$(dpkg-query -W -f='${Architecture}' smartdns 2>/dev/null || true)
-  [[ "$installed_status" == ii* &&
+  [[ "$installed_status" == *' ok installed' &&
     "$installed_version" == "$EXPECTED_VERSION" &&
     "$installed_architecture" == "$ARCH" ]]
 }
@@ -436,11 +441,11 @@ verify_installed_package() {
   [[ "$SMARTDNS_VERSION_TEXT" == "smartdns $EXPECTED_VERSION" ]] ||
     fail_with_recovery "smartdns -v 与预期版本 $EXPECTED_VERSION 不一致：$SMARTDNS_VERSION_TEXT。"
 
-  package_status=$(dpkg-query -W -f='${db:Status-Abbrev}' smartdns)
+  package_status=$(dpkg-query -W -f='${Status}' smartdns)
   installed_package=$(dpkg-query -W -f='${Package}' smartdns)
   PACKAGE_VERSION=$(dpkg-query -W -f='${Version}' smartdns)
   installed_architecture=$(dpkg-query -W -f='${Architecture}' smartdns)
-  [[ "$package_status" == ii* ]] ||
+  [[ "$package_status" == *' ok installed' ]] ||
     fail_with_recovery "SmartDNS Debian 软件包状态异常：$package_status。"
   [[ "$installed_package" == 'smartdns' ]] ||
     fail_with_recovery "已安装 Debian 软件包名称不是 smartdns：$installed_package。"
@@ -465,8 +470,10 @@ stop_and_clean_smartdns() {
     pkill -KILL -x smartdns 2>/dev/null || true
   fi
   rm -f -- /run/smartdns.pid /var/run/smartdns.pid
-  pgrep -x smartdns >/dev/null 2>&1 &&
+  if pgrep -x smartdns >/dev/null 2>&1; then
     fail_with_recovery '清理后仍检测到 SmartDNS 残留进程。'
+  fi
+  return 0
 }
 
 find_validation_port() {
