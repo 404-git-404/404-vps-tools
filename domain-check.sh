@@ -6,7 +6,6 @@ readonly PROGRAM_NAME='domain-check'
 readonly USAGE_TEXT='Usage: domain-check domain1.com/domain2.com/domain3.com'
 readonly MAX_CONCURRENCY=8
 readonly DNS_TIMEOUT=6
-readonly TCP_TIMEOUT=6
 readonly TLS_TIMEOUT=10
 readonly HTTP_TIMEOUT=10
 readonly HTTP_USER_AGENT='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0 Safari/537.36'
@@ -26,9 +25,17 @@ HTTP_CODE=''
 HTTP_STATUS='-'
 HTTP_LOCATION=''
 HTTP_5XX_COUNT=0
-HTTP_SHOULD_RETRY=false
+HTTP_FINALIZED=false
+HTTP_HEADER_FILE=''
 HTTP_RESULT_STATUS='PASS'
 HTTP_RESULT_REASON=''
+HANDSHAKE_MS='-'
+HANDSHAKE_SAMPLE_COUNT=0
+CDN_STATUS='-'
+CDN_DETAIL=''
+CERTIFICATE_EXPIRY_STATUS='PASS'
+CERTIFICATE_DAYS='-'
+CERTIFICATE_WARNING=''
 BORDER_HORIZONTAL='-'
 BORDER_VERTICAL='|'
 BORDER_TOP_LEFT='+'
@@ -44,10 +51,10 @@ TABLE_TOTAL_WIDTH=0
 declare -a TABLE_WIDTHS=()
 readonly -a TABLE_HEADERS=(
   'DOMAIN' 'IP' 'TLS1.3' 'X25519' 'H2'
-  'TLS(ms)' 'CERT' 'HTTP' 'REDIRECT' 'RESULT'
+  'HS(ms)' 'CERT(d)' 'CDN' 'HTTP' 'REDIRECT' 'RESULT'
 )
-readonly -a TABLE_MIN_WIDTHS=(18 15 6 6 4 7 5 4 8 6)
-readonly -a TABLE_MAX_WIDTHS=(48 39 0 0 0 0 0 0 0 0)
+readonly -a TABLE_MIN_WIDTHS=(18 15 6 6 4 6 7 4 4 8 6)
+readonly -a TABLE_MAX_WIDTHS=(48 39 0 0 0 0 0 0 0 0 0)
 
 print_usage() {
   printf '%s\n' "$USAGE_TEXT" >&2
@@ -151,7 +158,7 @@ classify_redirect() {
   remainder=${BASH_REMATCH[3]}
 
   if [[ "$scheme" == 'http' ]]; then
-    REDIRECT_STATUS='FAIL'
+    REDIRECT_STATUS='WARN'
     REDIRECT_DETAIL='降级 HTTP'
     REDIRECT_CODE='HTTP'
     return 0
@@ -223,7 +230,7 @@ classify_redirect() {
     REDIRECT_DETAIL='www 切换'
     REDIRECT_CODE='WWW'
   else
-    REDIRECT_STATUS='FAIL'
+    REDIRECT_STATUS='WARN'
     REDIRECT_DETAIL='跨主机'
     REDIRECT_CODE='CROSS'
   fi
@@ -243,7 +250,8 @@ reset_http_retry_state() {
   HTTP_STATUS='-'
   HTTP_LOCATION=''
   HTTP_5XX_COUNT=0
-  HTTP_SHOULD_RETRY=false
+  HTTP_FINALIZED=false
+  HTTP_HEADER_FILE=''
 }
 
 record_http_attempt() {
@@ -251,12 +259,16 @@ record_http_attempt() {
   local request_ok=$2
   local status=$3
   local location=$4
+  local header_file=${5:-}
 
+  if [[ "$HTTP_FINALIZED" == true ]]; then
+    return 0
+  fi
   HTTP_REQUEST_OK=false
   HTTP_CODE=''
   HTTP_STATUS='-'
   HTTP_LOCATION=''
-  HTTP_SHOULD_RETRY=false
+  HTTP_HEADER_FILE=''
 
   if [[ "$request_ok" == true && "$status" =~ ^[0-9]{3}$ &&
     "$status" != '000' ]]; then
@@ -264,10 +276,17 @@ record_http_attempt() {
     HTTP_CODE=$status
     HTTP_STATUS=$status
     HTTP_LOCATION=$location
+    HTTP_HEADER_FILE=$header_file
     if [[ "$status" =~ ^5[0-9][0-9]$ ]]; then
       (( HTTP_5XX_COUNT += 1 ))
-      (( attempt < 3 )) && HTTP_SHOULD_RETRY=true
+      if (( attempt >= 3 )); then
+        HTTP_FINALIZED=true
+      fi
+    else
+      HTTP_FINALIZED=true
     fi
+  elif (( attempt >= 3 )); then
+    HTTP_FINALIZED=true
   fi
   return 0
 }
@@ -335,10 +354,6 @@ append_reason() {
   fi
 }
 
-epoch_microseconds() {
-  printf '%s' "${EPOCHREALTIME/./}"
-}
-
 run_network_command() {
   local output_file=$1
   local timeout_seconds=$2
@@ -390,7 +405,11 @@ first_ipv6_from_file() {
 }
 
 extract_http_code() {
-  awk '/^[0-9][0-9][0-9]$/ { code = $0 } END { print code }' "$1"
+  awk -F '\t' '
+    $1 == "DOMAIN_CHECK_METRICS" { code = $2 }
+    /^[0-9][0-9][0-9]$/ { code = $0 }
+    END { print code }
+  ' "$1"
 }
 
 extract_location() {
@@ -404,12 +423,277 @@ extract_location() {
   ' "$1"
 }
 
+extract_curl_metric() {
+  local output_file=$1
+  local field_number=$2
+  awk -F '\t' -v field_number="$field_number" '
+    $1 == "DOMAIN_CHECK_METRICS" { value = $field_number }
+    END { print value }
+  ' "$output_file"
+}
+
+seconds_to_milliseconds() {
+  awk -v seconds="$1" '
+    BEGIN {
+      if (seconds !~ /^([0-9]+([.][0-9]*)?|[.][0-9]+)$/) {
+        exit 1
+      }
+      printf "%.0f\n", seconds * 1000
+    }
+  '
+}
+
+positive_seconds() {
+  awk -v seconds="$1" '
+    BEGIN {
+      exit !(seconds ~ /^([0-9]+([.][0-9]*)?|[.][0-9]+)$/ && seconds > 0)
+    }
+  '
+}
+
+aggregate_handshake_samples() {
+  local -a valid_samples=()
+  local sample
+
+  for sample in "$@"; do
+    [[ "$sample" =~ ^[0-9]+$ ]] && valid_samples+=("$sample")
+  done
+
+  HANDSHAKE_SAMPLE_COUNT=${#valid_samples[@]}
+  case "$HANDSHAKE_SAMPLE_COUNT" in
+    0)
+      HANDSHAKE_MS='-'
+      ;;
+    1)
+      HANDSHAKE_MS=${valid_samples[0]}
+      ;;
+    2)
+      HANDSHAKE_MS=$(awk -v first="${valid_samples[0]}" \
+        -v second="${valid_samples[1]}" \
+        'BEGIN { printf "%.0f\n", (first + second) / 2 }')
+      ;;
+    3)
+      HANDSHAKE_MS=$(awk -v first="${valid_samples[0]}" \
+        -v second="${valid_samples[1]}" -v third="${valid_samples[2]}" '
+          BEGIN {
+            if (first > second) {
+              temporary = first
+              first = second
+              second = temporary
+            }
+            if (second > third) {
+              temporary = second
+              second = third
+              third = temporary
+            }
+            if (first > second) {
+              second = first
+            }
+            printf "%.0f\n", second
+          }
+        ')
+      ;;
+  esac
+}
+
+openssl_target_for_ip() {
+  local ip=$1
+  if [[ "$ip" == *:* ]]; then
+    printf '[%s]:443' "$ip"
+  else
+    printf '%s:443' "$ip"
+  fi
+}
+
+curl_resolve_for_ip() {
+  local domain=$1
+  local ip=$2
+  if [[ "$ip" == *:* ]]; then
+    printf '%s:443:[%s]' "$domain" "$ip"
+  else
+    printf '%s:443:%s' "$domain" "$ip"
+  fi
+}
+
+tls13_evidence_present() {
+  grep -Eqi '(^|[[:space:]])(Protocol[[:space:]]*:[[:space:]]*)?TLSv1\.3([[:space:]]|$)' \
+    "$1"
+}
+
+h2_evidence_present() {
+  grep -Eqi '^ALPN protocol:[[:space:]]*h2\r?$' "$1"
+}
+
+certificate_verified_evidence_present() {
+  grep -Eqi '^Verify return code:[[:space:]]*0[[:space:]]+\(ok\)\r?$' "$1"
+}
+
+x25519_evidence_present() {
+  tls13_evidence_present "$1" &&
+    grep -Eqi '(Peer|Server) (Temp Key|temporary key):[[:space:]]*X25519|X25519,[[:space:]]*[0-9]+ bits' \
+      "$1"
+}
+
+extract_leaf_certificate() {
+  local input_file=$1
+  local certificate_file=$2
+  awk '
+    /-----BEGIN CERTIFICATE-----/ && !copying {
+      copying = 1
+    }
+    copying {
+      print
+    }
+    /-----END CERTIFICATE-----/ && copying {
+      complete = 1
+      exit
+    }
+    END {
+      if (!complete) {
+        exit 1
+      }
+    }
+  ' "$input_file" >"$certificate_file"
+}
+
+evaluate_certificate_expiry() {
+  local expiry_epoch=${1:-}
+  local current_epoch=${2:-}
+
+  CERTIFICATE_EXPIRY_STATUS='PASS'
+  CERTIFICATE_DAYS='-'
+  CERTIFICATE_WARNING=''
+  if [[ ! "$expiry_epoch" =~ ^[0-9]+$ ||
+    ! "$current_epoch" =~ ^[0-9]+$ ]]; then
+    CERTIFICATE_WARNING='证书已验证，但无法提取到期日'
+  elif (( expiry_epoch < current_epoch )); then
+    CERTIFICATE_EXPIRY_STATUS='FAIL'
+    CERTIFICATE_DAYS='FAIL'
+    CERTIFICATE_WARNING='证书已过期'
+  else
+    CERTIFICATE_DAYS=$(( (expiry_epoch - current_epoch) / 86400 ))
+    if (( CERTIFICATE_DAYS <= 7 )); then
+      CERTIFICATE_WARNING="证书仅剩 ${CERTIFICATE_DAYS} 个完整日"
+    fi
+  fi
+}
+
+first_cname_from_file() {
+  awk '
+    $1 ~ /^[A-Za-z0-9._-]+[.]?$/ {
+      value = tolower($1)
+      sub(/[.]$/, "", value)
+      if (!first_value) {
+        first_value = value
+      }
+      if (value ~ /[.](cloudflare[.]net|cloudfront[.]net|akamai[.]net|akamaiedge[.]net|akamaitechnologies[.]com|edgekey[.]net|edgesuite[.]net|azurefd[.]net|fastly[.]net|fastlylb[.]net|b-cdn[.]net|gcdn[.]co)$/) {
+        print value
+        found = 1
+        exit
+      }
+    }
+    END {
+      if (!found) {
+        print first_value
+      }
+    }
+  ' "$1"
+}
+
+detect_cdn() {
+  local cname=${1,,}
+  local header_file=$2
+  local has_via=false
+  local has_x_cache=false
+  local has_fastly_served_by=false
+
+  CDN_STATUS='-'
+  CDN_DETAIL=''
+
+  case "$cname" in
+    *.cloudflare.net)
+      CDN_STATUS='HIGH'
+      CDN_DETAIL="Cloudflare（CNAME: $cname）"
+      return 0
+      ;;
+    *.cloudfront.net)
+      CDN_STATUS='HIGH'
+      CDN_DETAIL="CloudFront（CNAME: $cname）"
+      return 0
+      ;;
+    *.akamai.net|*.akamaiedge.net|*.akamaitechnologies.com|*.edgekey.net|*.edgesuite.net)
+      CDN_STATUS='HIGH'
+      CDN_DETAIL="Akamai（CNAME: $cname）"
+      return 0
+      ;;
+    *.azurefd.net)
+      CDN_STATUS='HIGH'
+      CDN_DETAIL="Azure Front Door（CNAME: $cname）"
+      return 0
+      ;;
+    *.fastly.net|*.fastlylb.net)
+      CDN_STATUS='HIGH'
+      CDN_DETAIL="Fastly（CNAME: $cname）"
+      return 0
+      ;;
+    *.b-cdn.net)
+      CDN_STATUS='HIGH'
+      CDN_DETAIL="Bunny CDN（CNAME: $cname）"
+      return 0
+      ;;
+    *.gcdn.co)
+      CDN_STATUS='HIGH'
+      CDN_DETAIL="Gcore（CNAME: $cname）"
+      return 0
+      ;;
+  esac
+
+  [[ -s "$header_file" ]] || return 0
+  if grep -Eqi '^cf-ray:' "$header_file"; then
+    CDN_STATUS='HIGH'
+    CDN_DETAIL='Cloudflare（CF-Ray）'
+  elif grep -Eqi '^cf-cache-status:' "$header_file"; then
+    CDN_STATUS='HIGH'
+    CDN_DETAIL='Cloudflare（CF-Cache-Status）'
+  elif grep -Eqi '^x-amz-cf-id:' "$header_file"; then
+    CDN_STATUS='HIGH'
+    CDN_DETAIL='CloudFront（X-Amz-Cf-Id）'
+  elif grep -Eqi '^x-amz-cf-pop:' "$header_file"; then
+    CDN_STATUS='HIGH'
+    CDN_DETAIL='CloudFront（X-Amz-Cf-Pop）'
+  elif grep -Eqi '^x-akamai-transformed:' "$header_file"; then
+    CDN_STATUS='HIGH'
+    CDN_DETAIL='Akamai（X-Akamai-Transformed）'
+  elif grep -Eqi '^akamai-grn:' "$header_file"; then
+    CDN_STATUS='HIGH'
+    CDN_DETAIL='Akamai（Akamai-GRN）'
+  elif grep -Eqi '^x-azure-ref:' "$header_file"; then
+    CDN_STATUS='HIGH'
+    CDN_DETAIL='Azure Front Door（X-Azure-Ref）'
+  else
+    grep -Eqi '^via:' "$header_file" && has_via=true
+    grep -Eqi '^x-cache:' "$header_file" && has_x_cache=true
+    grep -Eqi '^x-served-by:' "$header_file" && has_fastly_served_by=true
+    if [[ "$has_fastly_served_by" == true && "$has_x_cache" == true ]]; then
+      CDN_STATUS='HIGH'
+      CDN_DETAIL='Fastly（x-served-by + x-cache）'
+    elif [[ "$has_fastly_served_by" == true ]]; then
+      CDN_STATUS='MED'
+      CDN_DETAIL='Fastly（单一弱特征响应头）'
+    elif [[ "$has_via" == true && "$has_x_cache" == true ]]; then
+      CDN_STATUS='MED'
+      CDN_DETAIL='缓存代理（Via + X-Cache）'
+    fi
+  fi
+}
+
 check_domain() {
   local index=$1
   local domain=$2
   local result_file="$TEMP_DIR/result-$index"
   local ipv4=''
   local ipv6=''
+  local cname=''
   local ip='-'
   local dns_status='FAIL'
   local tcp_status='FAIL'
@@ -417,30 +701,44 @@ check_domain() {
   local x25519_status='FAIL'
   local h2_status='FAIL'
   local certificate_status='FAIL'
+  local certificate_days='FAIL'
+  local certificate_warning=''
   local handshake_ms='-'
+  local handshake_sample_count=0
+  local cdn_status='-'
+  local cdn_detail=''
   local http_status='-'
   local final_status='PASS'
   local redirect_status='PASS'
   local redirect_detail='-'
   local redirect_code='-'
-  local start_us
-  local end_us
-  local tls_command_ok=false
-  local x25519_command_ok=false
   local http_request_ok=false
   local http_code=''
   local location=''
   local http_5xx_count=0
+  local tcp_evidence=false
+  local curl_command_ok=false
+  local openssl_target=''
+  local curl_resolve=''
   local attempt
   local attempt_request_ok
   local attempt_http_code
   local attempt_http_status
   local attempt_location
+  local attempt_time_connect
+  local attempt_time_appconnect
+  local attempt_handshake_ms
+  local final_header_file=''
+  local certificate_enddate=''
+  local expiry_epoch=''
+  local current_epoch=''
+  local -a handshake_samples=()
   local dns_a_file="$TEMP_DIR/dns-a-$index"
   local dns_aaaa_file="$TEMP_DIR/dns-aaaa-$index"
-  local tcp_file="$TEMP_DIR/tcp-$index"
+  local dns_cname_file="$TEMP_DIR/dns-cname-$index"
   local tls_file="$TEMP_DIR/tls-$index"
   local x25519_file="$TEMP_DIR/x25519-$index"
+  local leaf_certificate_file="$TEMP_DIR/leaf-certificate-$index"
   local http_output_file
   local http_header_file
 
@@ -453,14 +751,18 @@ check_domain() {
       dig +time=5 +tries=1 +short A "$domain" || :
     run_network_command "$dns_aaaa_file" "$DNS_TIMEOUT" \
       dig +time=5 +tries=1 +short AAAA "$domain" || :
+    run_network_command "$dns_cname_file" "$DNS_TIMEOUT" \
+      dig +time=5 +tries=1 +short CNAME "$domain" || :
   else
     run_network_command "$dns_a_file" "$DNS_TIMEOUT" \
       getent ahostsv4 "$domain" || :
     run_network_command "$dns_aaaa_file" "$DNS_TIMEOUT" \
       getent ahostsv6 "$domain" || :
+    printf '' >"$dns_cname_file"
   fi
   ipv4=$(first_ipv4_from_file "$dns_a_file")
   ipv6=$(first_ipv6_from_file "$dns_aaaa_file")
+  cname=$(first_cname_from_file "$dns_cname_file")
   if [[ -n "$ipv4" ]]; then
     ip=$ipv4
     dns_status='PASS'
@@ -471,84 +773,121 @@ check_domain() {
     append_reason 'DNS 无法解析'
   fi
 
-  # The child Bash, not this shell, expands its positional parameter.
-  # shellcheck disable=SC2016
-  if run_network_command "$tcp_file" "$TCP_TIMEOUT" \
-    bash -c 'exec 3<>"/dev/tcp/$1/443"' bash "$domain"; then
-    tcp_status='PASS'
-  else
-    append_reason 'TCP 443 不可达'
-  fi
+  if [[ "$dns_status" == 'PASS' ]]; then
+    openssl_target=$(openssl_target_for_ip "$ip")
+    curl_resolve=$(curl_resolve_for_ip "$domain" "$ip")
 
-  start_us=$(epoch_microseconds)
-  if run_network_command "$tls_file" "$TLS_TIMEOUT" \
-    openssl s_client -connect "$domain:443" -servername "$domain" \
-      -tls1_3 -alpn h2 -verify_hostname "$domain" -verify_return_error \
-      -showcerts; then
-    tls_command_ok=true
-  fi
-  end_us=$(epoch_microseconds)
-  handshake_ms="$(( (10#$end_us - 10#$start_us + 500) / 1000 ))"
+    run_network_command "$tls_file" "$TLS_TIMEOUT" \
+      openssl s_client -connect "$openssl_target" -servername "$domain" \
+        -tls1_3 -alpn h2 -verify_hostname "$domain" -verify_return_error \
+        -showcerts || :
+    run_network_command "$x25519_file" "$TLS_TIMEOUT" \
+      openssl s_client -connect "$openssl_target" -servername "$domain" \
+        -tls1_3 -groups X25519 || :
 
-  if grep -Eq 'TLSv1\.3' "$tls_file"; then
-    tls_status='PASS'
-  else
-    append_reason 'TLS 1.3 握手失败'
-  fi
-  if grep -Eq '^ALPN protocol: h2\r?$' "$tls_file"; then
-    h2_status='PASS'
-  else
-    append_reason 'ALPN 未协商 h2'
-  fi
-  if [[ "$tls_command_ok" == true ]] &&
-    grep -Eq '^Verify return code: 0 \(ok\)\r?$' "$tls_file"; then
-    certificate_status='PASS'
-  else
-    append_reason '证书链、有效期或主机名验证失败'
-  fi
+    reset_http_retry_state
+    for attempt in 1 2 3; do
+      attempt_request_ok=false
+      attempt_http_code=''
+      attempt_http_status='-'
+      attempt_location=''
+      attempt_time_connect=''
+      attempt_time_appconnect=''
+      curl_command_ok=false
+      http_output_file="$TEMP_DIR/http-output-$index-$attempt"
+      http_header_file="$TEMP_DIR/http-header-$index-$attempt"
+      if run_network_command "$http_output_file" "$HTTP_TIMEOUT" \
+        curl --silent --show-error --output /dev/null \
+          --dump-header "$http_header_file" \
+          --write-out 'DOMAIN_CHECK_METRICS\t%{http_code}\t%{time_connect}\t%{time_appconnect}\n' \
+          --connect-timeout 5 --max-time 9 --no-keepalive \
+          --header 'Connection: close' --noproxy '*' --proto '=https' \
+          --tlsv1.3 --tls-max 1.3 --resolve "$curl_resolve" \
+          --user-agent "$HTTP_USER_AGENT" "https://$domain/"; then
+        curl_command_ok=true
+      fi
 
-  if run_network_command "$x25519_file" "$TLS_TIMEOUT" \
-    openssl s_client -connect "$domain:443" -servername "$domain" \
-      -tls1_3 -groups X25519; then
-    x25519_command_ok=true
-  fi
-  if [[ "$x25519_command_ok" == true ]] &&
-    grep -Eq 'TLSv1\.3' "$x25519_file" &&
-    grep -Eqi '(Peer|Server) (Temp Key|temporary key): X25519|X25519, [0-9]+ bits' \
-      "$x25519_file"; then
-    x25519_status='PASS'
-  else
-    append_reason '强制 X25519 握手失败'
-  fi
-
-  reset_http_retry_state
-  for attempt in 1 2 3; do
-    attempt_request_ok=false
-    attempt_http_code=''
-    attempt_http_status='-'
-    attempt_location=''
-    http_output_file="$TEMP_DIR/http-output-$index-$attempt"
-    http_header_file="$TEMP_DIR/http-header-$index-$attempt"
-    if run_network_command "$http_output_file" "$HTTP_TIMEOUT" \
-      curl --silent --output /dev/null --dump-header "$http_header_file" \
-        --write-out '%{http_code}\n' --connect-timeout 5 --max-time 9 \
-        --noproxy '*' --proto '=https' --user-agent "$HTTP_USER_AGENT" \
-        "https://$domain/"; then
       attempt_http_code=$(extract_http_code "$http_output_file")
-      if [[ "$attempt_http_code" =~ ^[0-9]{3}$ &&
+      attempt_time_connect=$(extract_curl_metric "$http_output_file" 3)
+      attempt_time_appconnect=$(extract_curl_metric "$http_output_file" 4)
+      if positive_seconds "$attempt_time_connect"; then
+        tcp_evidence=true
+      fi
+      if positive_seconds "$attempt_time_appconnect" &&
+        attempt_handshake_ms=$(seconds_to_milliseconds \
+          "$attempt_time_appconnect"); then
+        handshake_samples+=("$attempt_handshake_ms")
+      fi
+      if [[ "$curl_command_ok" == true &&
+        "$attempt_http_code" =~ ^[0-9]{3}$ &&
         "$attempt_http_code" != '000' ]]; then
         attempt_request_ok=true
         attempt_http_status=$attempt_http_code
         attempt_location=$(extract_location "$http_header_file")
       fi
+      record_http_attempt "$attempt" "$attempt_request_ok" \
+        "$attempt_http_status" "$attempt_location" "$http_header_file"
+    done
+
+    if tls13_evidence_present "$tls_file"; then
+      tls_status='PASS'
+      tcp_evidence=true
     fi
-    record_http_attempt "$attempt" "$attempt_request_ok" \
-      "$attempt_http_status" "$attempt_location"
-    if [[ "$HTTP_SHOULD_RETRY" == true ]]; then
-      continue
+    if h2_evidence_present "$tls_file"; then
+      h2_status='PASS'
     fi
-    break
-  done
+    if x25519_evidence_present "$x25519_file"; then
+      x25519_status='PASS'
+      tcp_evidence=true
+    fi
+    if certificate_verified_evidence_present "$tls_file"; then
+      certificate_status='PASS'
+      if extract_leaf_certificate "$tls_file" "$leaf_certificate_file" &&
+        certificate_enddate=$(openssl x509 -noout -enddate \
+          -in "$leaf_certificate_file" 2>/dev/null) &&
+        [[ "$certificate_enddate" == notAfter=* ]] &&
+        expiry_epoch=$(date -u -d "${certificate_enddate#notAfter=}" +%s \
+          2>/dev/null) &&
+        current_epoch=$(date -u +%s); then
+        evaluate_certificate_expiry "$expiry_epoch" "$current_epoch"
+      else
+        evaluate_certificate_expiry
+      fi
+      certificate_status=$CERTIFICATE_EXPIRY_STATUS
+      certificate_days=$CERTIFICATE_DAYS
+      certificate_warning=$CERTIFICATE_WARNING
+    fi
+
+    aggregate_handshake_samples "${handshake_samples[@]}"
+    handshake_ms=$HANDSHAKE_MS
+    handshake_sample_count=$HANDSHAKE_SAMPLE_COUNT
+    final_header_file=$HTTP_HEADER_FILE
+    detect_cdn "$cname" "$final_header_file"
+    cdn_status=$CDN_STATUS
+    cdn_detail=$CDN_DETAIL
+  else
+    reset_http_retry_state
+    aggregate_handshake_samples
+  fi
+
+  if [[ "$tcp_evidence" == true ]]; then
+    tcp_status='PASS'
+  elif [[ "$dns_status" == 'PASS' ]]; then
+    append_reason 'TCP 443 不可达'
+  fi
+  if [[ "$dns_status" == 'PASS' && "$tcp_status" == 'PASS' ]]; then
+    [[ "$tls_status" == 'PASS' ]] || append_reason 'TLS 1.3 握手失败'
+    [[ "$x25519_status" == 'PASS' ]] || append_reason '强制 X25519 握手失败'
+    [[ "$h2_status" == 'PASS' ]] || append_reason 'ALPN 未协商 h2'
+    if [[ "$certificate_status" == 'FAIL' ]]; then
+      if [[ "$certificate_warning" == '证书已过期' ]]; then
+        append_reason "$certificate_warning"
+      else
+        append_reason '证书链、有效期或主机名验证失败'
+      fi
+    fi
+  fi
+
   http_request_ok=$HTTP_REQUEST_OK
   http_code=$HTTP_CODE
   http_status=$HTTP_STATUS
@@ -563,33 +902,38 @@ check_domain() {
 
   if [[ "$dns_status" == 'FAIL' || "$tcp_status" == 'FAIL' ||
     "$tls_status" == 'FAIL' || "$x25519_status" == 'FAIL' ||
-    "$h2_status" == 'FAIL' || "$certificate_status" == 'FAIL' ||
-    "$redirect_status" == 'FAIL' ]]; then
+    "$h2_status" == 'FAIL' || "$certificate_status" == 'FAIL' ]]; then
     final_status='FAIL'
   fi
 
   if [[ "$redirect_status" == 'WARN' ]]; then
     append_reason "跳转：$redirect_detail"
     [[ "$final_status" == 'FAIL' ]] || final_status='WARN'
-  elif [[ "$redirect_status" == 'FAIL' ]]; then
-    append_reason "不允许的跳转：$redirect_detail"
   fi
 
   classify_http_result "$http_request_ok" "$http_status" "$http_5xx_count"
   if [[ "$HTTP_RESULT_STATUS" == 'WARN' ]]; then
-    if [[ "$http_request_ok" == true ]] ||
-      [[ "$tls_status" == 'PASS' && "$x25519_status" == 'PASS' &&
-        "$h2_status" == 'PASS' && "$certificate_status" == 'PASS' ]]; then
-      append_reason "$HTTP_RESULT_REASON"
-      [[ "$final_status" == 'FAIL' ]] || final_status='WARN'
-    fi
+    append_reason "$HTTP_RESULT_REASON"
+    [[ "$final_status" == 'FAIL' ]] || final_status='WARN'
+  fi
+  if (( handshake_sample_count < 3 )); then
+    append_reason "TLS 握手计时样本不足（${handshake_sample_count}/3）"
+    [[ "$final_status" == 'FAIL' ]] || final_status='WARN'
+  fi
+  if [[ "$certificate_status" == 'PASS' &&
+    -n "$certificate_warning" ]]; then
+    append_reason "$certificate_warning"
+    [[ "$final_status" == 'FAIL' ]] || final_status='WARN'
+  fi
+  if [[ -n "$cdn_detail" ]]; then
+    append_reason "CDN $cdn_status: $cdn_detail"
   fi
 
   [[ -n "$REASONS" ]] || REASONS='-'
-  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
     "$domain" "$ip" "$tls_status" "$x25519_status" "$h2_status" \
-    "$handshake_ms" "$certificate_status" "$http_status" "$redirect_code" \
-    "$final_status" "$REASONS" >"$result_file"
+    "$handshake_ms" "$certificate_days" "$cdn_status" "$http_status" \
+    "$redirect_code" "$final_status" "$REASONS" >"$result_file"
 }
 
 remove_worker_pid() {
@@ -651,7 +995,7 @@ check_dependencies() {
   local command_name
   local -a missing=()
   local -a required=(
-    bash openssl curl timeout awk sed grep mktemp getent
+    bash openssl curl timeout awk sed grep mktemp getent date
   )
 
   for command_name in "${required[@]}"; do
@@ -759,8 +1103,7 @@ color_for_http() {
 color_for_redirect() {
   case "$1" in
     -) printf '90' ;;
-    SAME|WWW|RELATIVE|NO-LOC|INVALID) printf '33' ;;
-    CROSS|HTTP) printf '31' ;;
+    SAME|WWW|RELATIVE|NO-LOC|INVALID|CROSS|HTTP) printf '33' ;;
     *) printf '' ;;
   esac
 }
@@ -771,6 +1114,30 @@ color_for_latency() {
   else
     printf '36'
   fi
+}
+
+color_for_certificate_days() {
+  local value=$1
+  if [[ "$value" == '-' ]]; then
+    printf '90'
+  elif [[ "$value" == 'FAIL' ]]; then
+    printf '31'
+  elif (( value <= 7 )); then
+    printf '31'
+  elif (( value <= 30 )); then
+    printf '33'
+  else
+    printf '32'
+  fi
+}
+
+color_for_cdn() {
+  case "$1" in
+    HIGH) printf '36' ;;
+    MED) printf '33' ;;
+    -) printf '90' ;;
+    *) printf '' ;;
+  esac
 }
 
 print_plain_cell() {
@@ -840,7 +1207,8 @@ calculate_table_widths() {
   local x25519_status
   local h2_status
   local handshake_ms
-  local certificate_status
+  local certificate_days
+  local cdn_status
   local http_status
   local redirect_code
   local final_status
@@ -857,13 +1225,13 @@ calculate_table_widths() {
 
   for index in "${!DOMAIN_INPUTS[@]}"; do
     IFS=$'\t' read -r domain ip tls_status x25519_status h2_status \
-      handshake_ms certificate_status http_status redirect_code final_status \
-      reasons <"$TEMP_DIR/result-$index"
+      handshake_ms certificate_days cdn_status http_status redirect_code \
+      final_status reasons <"$TEMP_DIR/result-$index"
     domain_display=$(truncate_ascii "$domain" 48)
     values=(
       "$domain_display" "$ip" "$tls_status" "$x25519_status" "$h2_status"
-      "$handshake_ms" "$certificate_status" "$http_status" "$redirect_code"
-      "$final_status"
+      "$handshake_ms" "$certificate_days" "$cdn_status" "$http_status"
+      "$redirect_code" "$final_status"
     )
     for column_number in "${!values[@]}"; do
       update_column_width "$column_number" "${values[$column_number]}"
@@ -931,10 +1299,11 @@ print_data_row() {
   local x25519_status=$4
   local h2_status=$5
   local handshake_ms=$6
-  local certificate_status=$7
-  local http_status=$8
-  local redirect_code=$9
-  local final_status=${10}
+  local certificate_days=$7
+  local cdn_status=$8
+  local http_status=$9
+  local redirect_code=${10}
+  local final_status=${11}
 
   print_frame_piece "$BORDER_VERTICAL"
   print_colored_cell "$domain" "${TABLE_WIDTHS[0]}" '96'
@@ -953,17 +1322,20 @@ print_data_row() {
   print_colored_cell \
     "$handshake_ms" "${TABLE_WIDTHS[5]}" "$(color_for_latency "$handshake_ms")"
   print_frame_piece "$BORDER_VERTICAL"
-  print_colored_cell "$certificate_status" "${TABLE_WIDTHS[6]}" \
-    "$(color_for_status "$certificate_status")"
+  print_colored_cell "$certificate_days" "${TABLE_WIDTHS[6]}" \
+    "$(color_for_certificate_days "$certificate_days")"
   print_frame_piece "$BORDER_VERTICAL"
   print_colored_cell \
-    "$http_status" "${TABLE_WIDTHS[7]}" "$(color_for_http "$http_status")"
+    "$cdn_status" "${TABLE_WIDTHS[7]}" "$(color_for_cdn "$cdn_status")"
   print_frame_piece "$BORDER_VERTICAL"
-  print_colored_cell "$redirect_code" "${TABLE_WIDTHS[8]}" \
+  print_colored_cell \
+    "$http_status" "${TABLE_WIDTHS[8]}" "$(color_for_http "$http_status")"
+  print_frame_piece "$BORDER_VERTICAL"
+  print_colored_cell "$redirect_code" "${TABLE_WIDTHS[9]}" \
     "$(color_for_redirect "$redirect_code")"
   print_frame_piece "$BORDER_VERTICAL"
   print_colored_cell \
-    "$final_status" "${TABLE_WIDTHS[9]}" "$(color_for_status "$final_status")"
+    "$final_status" "${TABLE_WIDTHS[10]}" "$(color_for_status "$final_status")"
   print_frame_piece "$BORDER_VERTICAL"
   printf '\n'
 }
@@ -972,7 +1344,7 @@ table_has_details() {
   local index
   local reasons
   for index in "${!DOMAIN_INPUTS[@]}"; do
-    IFS=$'\t' read -r _ _ _ _ _ _ _ _ _ _ reasons \
+    IFS=$'\t' read -r _ _ _ _ _ _ _ _ _ _ _ reasons \
       <"$TEMP_DIR/result-$index"
     [[ "$reasons" == '-' ]] || return 0
   done
@@ -1009,7 +1381,7 @@ print_details() {
 
   print_details_header
   for index in "${!DOMAIN_INPUTS[@]}"; do
-    IFS=$'\t' read -r domain _ _ _ _ _ _ _ _ _ \
+    IFS=$'\t' read -r domain _ _ _ _ _ _ _ _ _ _ \
       reasons <"$TEMP_DIR/result-$index"
     if [[ "$reasons" != '-' ]]; then
       domain_display=$(truncate_ascii "$domain" 48)
@@ -1040,7 +1412,8 @@ print_table() {
   local x25519_status
   local h2_status
   local handshake_ms
-  local certificate_status
+  local certificate_days
+  local cdn_status
   local http_status
   local redirect_code
   local final_status
@@ -1052,13 +1425,13 @@ print_table() {
   print_header_separator
   for index in "${!DOMAIN_INPUTS[@]}"; do
     IFS=$'\t' read -r domain ip tls_status x25519_status h2_status \
-      handshake_ms certificate_status http_status redirect_code final_status \
-      reasons <"$TEMP_DIR/result-$index"
+      handshake_ms certificate_days cdn_status http_status redirect_code \
+      final_status reasons <"$TEMP_DIR/result-$index"
     RESULT_STATUSES+=("$final_status")
     print_data_row \
       "$domain" "$ip" "$tls_status" "$x25519_status" "$h2_status" \
-      "$handshake_ms" "$certificate_status" "$http_status" "$redirect_code" \
-      "$final_status"
+      "$handshake_ms" "$certificate_days" "$cdn_status" "$http_status" \
+      "$redirect_code" "$final_status"
   done
 
   if table_has_details; then
