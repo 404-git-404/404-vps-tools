@@ -365,23 +365,43 @@ assert_equal '-' "$CERTIFICATE_DAYS" \
 assert_contains '无法提取到期日' "$CERTIFICATE_WARNING" \
   'verified certificate without expiry warns'
 
+assert_extractor first_cname_from_file \
+  $'origin.example.net.\nasset.b-cdn.net.\n' \
+  'asset.b-cdn.net' \
+  'CNAME extractor recognizes and preserves the Bunny CDN suffix'
+assert_extractor first_cname_from_file \
+  $'origin.example.net.\n123456.gcdn.co.\n' \
+  '123456.gcdn.co' \
+  'CNAME extractor recognizes and preserves the Gcore suffix'
+
 cdn_header_file="$TEST_TEMP_DIR/cdn-headers"
 printf 'CF-Ray: abc-SIN\r\n' >"$cdn_header_file"
 detect_cdn '' "$cdn_header_file"
 assert_equal 'HIGH' "$CDN_STATUS" 'CF-Ray is high-confidence Cloudflare'
 assert_contains 'Cloudflare' "$CDN_DETAIL" 'Cloudflare evidence is explained'
+printf 'CF-Cache-Status: HIT\r\n' >"$cdn_header_file"
+detect_cdn '' "$cdn_header_file"
+assert_equal 'HIGH' "$CDN_STATUS" \
+  'CF-Cache-Status remains high-confidence Cloudflare evidence'
+assert_equal 'Cloudflare（CF-Cache-Status）' "$CDN_DETAIL" \
+  'Cloudflare cache-status evidence is explicit'
 printf 'x-amz-cf-pop: SIN2-P1\r\n' >"$cdn_header_file"
 detect_cdn '' "$cdn_header_file"
 assert_equal 'HIGH' "$CDN_STATUS" 'CloudFront header is high confidence'
+assert_contains 'CloudFront' "$CDN_DETAIL" 'CloudFront fixture names its provider'
 printf 'x-akamai-transformed: 9 0 pmb=mRUM,2\r\n' >"$cdn_header_file"
 detect_cdn '' "$cdn_header_file"
 assert_equal 'HIGH' "$CDN_STATUS" 'Akamai header is high confidence'
+assert_contains 'Akamai' "$CDN_DETAIL" 'Akamai fixture names its provider'
 printf 'x-azure-ref: ref\r\n' >"$cdn_header_file"
 detect_cdn '' "$cdn_header_file"
 assert_equal 'HIGH' "$CDN_STATUS" 'Azure header is high confidence'
+assert_contains 'Azure Front Door' "$CDN_DETAIL" \
+  'Azure Front Door fixture names its provider'
 printf 'x-served-by: cache-sin\r\nx-cache: HIT\r\n' >"$cdn_header_file"
 detect_cdn '' "$cdn_header_file"
 assert_equal 'HIGH' "$CDN_STATUS" 'Fastly header combination is high confidence'
+assert_contains 'Fastly' "$CDN_DETAIL" 'Fastly fixture names its provider'
 printf 'x-served-by: cache-sin\r\n' >"$cdn_header_file"
 detect_cdn '' "$cdn_header_file"
 assert_equal 'MED' "$CDN_STATUS" 'single Fastly-specific header is medium confidence'
@@ -397,6 +417,18 @@ assert_equal '-' "$CDN_STATUS" 'single X-Cache header is not CDN evidence'
 printf 'Server: nginx\r\n' >"$cdn_header_file"
 detect_cdn '' "$cdn_header_file"
 assert_equal '-' "$CDN_STATUS" 'generic Server header is not CDN evidence'
+printf 'Server: cloudflare\r\n' >"$cdn_header_file"
+detect_cdn '' "$cdn_header_file"
+assert_equal '-' "$CDN_STATUS" \
+  'Server cloudflare alone is not CDN evidence'
+assert_equal '' "$CDN_DETAIL" \
+  'Server cloudflare alone does not claim a provider'
+printf 'Server: cloudflare\r\nCF-Ray: combined-SIN\r\n' >"$cdn_header_file"
+detect_cdn '' "$cdn_header_file"
+assert_equal 'HIGH' "$CDN_STATUS" \
+  'Server cloudflare plus CF-Ray is high-confidence Cloudflare'
+assert_equal 'Cloudflare（CF-Ray）' "$CDN_DETAIL" \
+  'combined Cloudflare fixture derives evidence from CF-Ray'
 printf '%s\r\n' \
   'NS: ns1.cloudflare.com' \
   "Issuer: Let's Encrypt" \
@@ -408,6 +440,14 @@ detect_cdn 'asset.cloudfront.net' "$cdn_header_file"
 assert_equal 'HIGH' "$CDN_STATUS" 'CloudFront CNAME is high confidence'
 detect_cdn 'edge.fastly.net' "$cdn_header_file"
 assert_equal 'HIGH' "$CDN_STATUS" 'Fastly CNAME is high confidence'
+detect_cdn 'asset.b-cdn.net' "$cdn_header_file"
+assert_equal 'HIGH' "$CDN_STATUS" 'Bunny CDN CNAME is high confidence'
+assert_contains 'Bunny CDN' "$CDN_DETAIL" \
+  'Bunny CDN CNAME fixture names its provider'
+detect_cdn '123456.gcdn.co' "$cdn_header_file"
+assert_equal 'HIGH' "$CDN_STATUS" 'Gcore CNAME is high confidence'
+assert_contains 'Gcore' "$CDN_DETAIL" \
+  'Gcore CNAME fixture names its provider'
 
 assert_file_contains "--noproxy '*'" "$DOMAIN_CHECK_SCRIPT" \
   'curl explicitly bypasses environment proxies'

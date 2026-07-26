@@ -586,7 +586,7 @@ first_cname_from_file() {
       if (!first_value) {
         first_value = value
       }
-      if (value ~ /[.](cloudflare[.]net|cloudfront[.]net|akamai[.]net|akamaiedge[.]net|akamaitechnologies[.]com|edgekey[.]net|edgesuite[.]net|azurefd[.]net|fastly[.]net|fastlylb[.]net)$/) {
+      if (value ~ /[.](cloudflare[.]net|cloudfront[.]net|akamai[.]net|akamaiedge[.]net|akamaitechnologies[.]com|edgekey[.]net|edgesuite[.]net|azurefd[.]net|fastly[.]net|fastlylb[.]net|b-cdn[.]net|gcdn[.]co)$/) {
         print value
         found = 1
         exit
@@ -636,6 +636,16 @@ detect_cdn() {
       CDN_DETAIL="Fastly（CNAME: $cname）"
       return 0
       ;;
+    *.b-cdn.net)
+      CDN_STATUS='HIGH'
+      CDN_DETAIL="Bunny CDN（CNAME: $cname）"
+      return 0
+      ;;
+    *.gcdn.co)
+      CDN_STATUS='HIGH'
+      CDN_DETAIL="Gcore（CNAME: $cname）"
+      return 0
+      ;;
   esac
 
   [[ -s "$header_file" ]] || return 0
@@ -645,10 +655,6 @@ detect_cdn() {
   elif grep -Eqi '^cf-cache-status:' "$header_file"; then
     CDN_STATUS='HIGH'
     CDN_DETAIL='Cloudflare（CF-Cache-Status）'
-  elif grep -Eqi '^server:[[:space:]]*cloudflare([[:space:]]|\r?$)' \
-    "$header_file"; then
-    CDN_STATUS='HIGH'
-    CDN_DETAIL='Cloudflare（Server: cloudflare）'
   elif grep -Eqi '^x-amz-cf-id:' "$header_file"; then
     CDN_STATUS='HIGH'
     CDN_DETAIL='CloudFront（X-Amz-Cf-Id）'
