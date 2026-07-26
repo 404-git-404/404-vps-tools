@@ -283,3 +283,132 @@ jobs:
 
       - name: Run offline mapping and retry tests
         run: bash tests/smartdns-test.sh
+
+  updater-regression:
+    name: Debian 12 amd64 full updater regression
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Start official Debian 12 systemd container
+        run: |
+          cat > "$RUNNER_TEMP/Dockerfile.debian12-systemd" <<'EOF'
+          FROM debian:12
+          ENV container=docker
+          RUN apt-get update && \
+              DEBIAN_FRONTEND=noninteractive apt-get install --yes \
+                ca-certificates curl dnsutils iproute2 procps systemd systemd-sysv && \
+              apt-get clean && \
+              rm -rf /var/lib/apt/lists/*
+          STOPSIGNAL SIGRTMIN+3
+          CMD ["/sbin/init"]
+          EOF
+          docker build \
+            --file "$RUNNER_TEMP/Dockerfile.debian12-systemd" \
+            --tag smartdns-debian12-systemd \
+            "$RUNNER_TEMP"
+          docker run --detach --privileged --cgroupns=host \
+            --name smartdns-debian12 \
+            --tmpfs /run --tmpfs /run/lock \
+            --volume /sys/fs/cgroup:/sys/fs/cgroup:rw \
+            smartdns-debian12-systemd
+          for _ in {1..30}; do
+            state=$(docker exec smartdns-debian12 \
+              systemctl is-system-running 2>/dev/null || true)
+            case "$state" in
+              running | degraded) break ;;
+            esac
+            sleep 1
+          done
+          docker exec smartdns-debian12 systemctl is-system-running |
+            grep -Eq '^(running|degraded)$'
+          docker cp . smartdns-debian12:/repo
+
+      - name: Run updater from the installed and held Debian 12 state
+        run: |
+          docker exec \
+            --env RELEASE_BASE="$RELEASE_BASE" \
+            smartdns-debian12 bash -Eeuo pipefail -c '
+              printf "#!/bin/sh\nexit 101\n" > /usr/sbin/policy-rc.d
+              chmod 0755 /usr/sbin/policy-rc.d
+              curl --fail --location --silent --show-error \
+                --connect-timeout 10 --max-time 120 --retry 3 --retry-delay 2 \
+                --retry-connrefused \
+                "$RELEASE_BASE/smartdns_40+dfsg-1_bookworm_amd64.deb" \
+                -o /tmp/smartdns.deb
+              test "$(sha256sum /tmp/smartdns.deb | awk "{print \$1}")" = \
+                8388fb543f870fc77d17dbaa9874277d2ef37d120ad2ab24af730d7032a80bcb
+              apt-get update
+              apt-get install --yes --allow-downgrades /tmp/smartdns.deb
+              rm -f /usr/sbin/policy-rc.d
+
+              {
+                printf "%s\n" "set -Eeuo pipefail"
+                printf "%s\n" \
+                  "die() { printf \"%s\\n\" \"\$*\" >&2; exit 1; }"
+                awk -v signature="write_smartdns_configuration() {" "
+                  \$0 == signature { capture = 1 }
+                  capture { print }
+                  capture && \$0 == \"}\" { exit }
+                " /repo/scripts/update-smartdns.sh
+                printf "%s\n" \
+                  "write_smartdns_configuration /tmp/smartdns.conf v40"
+              } > /tmp/render-config.sh
+              bash /tmp/render-config.sh
+
+              service_user=$(systemctl show smartdns.service -p User --value)
+              service_user=${service_user:-root}
+              install -d -o root -g root -m 0755 /etc/smartdns
+              install -d -o "$service_user" -g "$service_user" -m 0750 \
+                /var/cache/smartdns
+              install -o root -g root -m 0644 \
+                /tmp/smartdns.conf /etc/smartdns/smartdns.conf
+              systemctl daemon-reload
+              systemctl enable --now smartdns.service
+              apt-mark hold smartdns
+              printf "nameserver 127.0.0.1\n" > /etc/resolv.conf
+
+              test "$(dpkg-query -W -f="\${Version}" smartdns)" = 40+dfsg-1
+              test "$(dpkg-query -W -f="\${Architecture}" smartdns)" = amd64
+              test "$(dpkg-query -W -f="\${Status}" smartdns)" = \
+                "hold ok installed"
+              apt-mark showhold | grep -Fxq smartdns
+              test "$(systemctl is-enabled smartdns.service)" = enabled
+              test "$(systemctl is-active smartdns.service)" = active
+              pgrep -x smartdns >/dev/null
+              test "$(awk "\$1 == \"nameserver\" { print \$2 }" \
+                /etc/resolv.conf)" = 127.0.0.1
+              getent ahostsv4 cloudflare.com >/dev/null
+
+              bash /repo/scripts/update-smartdns.sh 2>&1 |
+                tee /tmp/updater-output
+
+              grep -Fq \
+                "已安装精确目标版本 40+dfsg-1；跳过重复安装。" \
+                /tmp/updater-output
+              grep -Fq "SmartDNS v40 配置已通过独立端口" \
+                /tmp/updater-output
+              grep -Fq "127.0.0.1:53 的 TCP 和 UDP 监听验证通过。" \
+                /tmp/updater-output
+              grep -Fq "Debian 系统 DNS 验证通过：仅 127.0.0.1。" \
+                /tmp/updater-output
+              grep -Fq "SmartDNS 更新成功" /tmp/updater-output
+              grep -Fq "开机启动状态：enabled" /tmp/updater-output
+              grep -Fq "当前运行状态：active" /tmp/updater-output
+              grep -Fq "APT hold：smartdns" /tmp/updater-output
+              grep -Fq "系统 DNS：仅 127.0.0.1" /tmp/updater-output
+
+              test "$(dpkg-query -W -f="\${Version}" smartdns)" = 40+dfsg-1
+              apt-mark showhold | grep -Fxq smartdns
+              test "$(systemctl is-enabled smartdns.service)" = enabled
+              test "$(systemctl is-active smartdns.service)" = active
+              pgrep -x smartdns >/dev/null
+              test "$(awk "\$1 == \"nameserver\" { print \$2 }" \
+                /etc/resolv.conf)" = 127.0.0.1
+              getent ahostsv4 cloudflare.com >/dev/null
+            '
+
+      - name: Remove Debian 12 validation container
+        if: always()
+        run: docker rm --force smartdns-debian12 >/dev/null 2>&1 || true
