@@ -29,8 +29,8 @@ HTTP_FINALIZED=false
 HTTP_HEADER_FILE=''
 HTTP_RESULT_STATUS='PASS'
 HTTP_RESULT_REASON=''
-HANDSHAKE_MS='-'
-HANDSHAKE_SAMPLE_COUNT=0
+READY_MS='-'
+READY_SAMPLE_COUNT=0
 CDN_STATUS='-'
 CDN_DETAIL=''
 CERTIFICATE_EXPIRY_STATUS='PASS'
@@ -51,9 +51,9 @@ TABLE_TOTAL_WIDTH=0
 declare -a TABLE_WIDTHS=()
 readonly -a TABLE_HEADERS=(
   'DOMAIN' 'IP' 'TLS1.3' 'X25519' 'H2'
-  'HS(ms)' 'CERT(d)' 'CDN' 'HTTP' 'REDIRECT' 'RESULT'
+  'READY(ms)' 'CERT(d)' 'CDN' 'HTTP' 'REDIRECT' 'RESULT'
 )
-readonly -a TABLE_MIN_WIDTHS=(18 15 6 6 4 6 7 4 4 8 6)
+readonly -a TABLE_MIN_WIDTHS=(18 15 6 6 4 9 7 4 4 8 6)
 readonly -a TABLE_MAX_WIDTHS=(48 39 0 0 0 0 0 0 0 0 0)
 
 print_usage() {
@@ -451,7 +451,7 @@ positive_seconds() {
   '
 }
 
-aggregate_handshake_samples() {
+aggregate_ready_samples() {
   local -a valid_samples=()
   local sample
 
@@ -459,21 +459,21 @@ aggregate_handshake_samples() {
     [[ "$sample" =~ ^[0-9]+$ ]] && valid_samples+=("$sample")
   done
 
-  HANDSHAKE_SAMPLE_COUNT=${#valid_samples[@]}
-  case "$HANDSHAKE_SAMPLE_COUNT" in
+  READY_SAMPLE_COUNT=${#valid_samples[@]}
+  case "$READY_SAMPLE_COUNT" in
     0)
-      HANDSHAKE_MS='-'
+      READY_MS='-'
       ;;
     1)
-      HANDSHAKE_MS=${valid_samples[0]}
+      READY_MS=${valid_samples[0]}
       ;;
     2)
-      HANDSHAKE_MS=$(awk -v first="${valid_samples[0]}" \
+      READY_MS=$(awk -v first="${valid_samples[0]}" \
         -v second="${valid_samples[1]}" \
         'BEGIN { printf "%.0f\n", (first + second) / 2 }')
       ;;
     3)
-      HANDSHAKE_MS=$(awk -v first="${valid_samples[0]}" \
+      READY_MS=$(awk -v first="${valid_samples[0]}" \
         -v second="${valid_samples[1]}" -v third="${valid_samples[2]}" '
           BEGIN {
             if (first > second) {
@@ -516,7 +516,7 @@ curl_resolve_for_ip() {
 }
 
 tls13_evidence_present() {
-  grep -Eqi '(^|[[:space:]])(Protocol[[:space:]]*:[[:space:]]*)?TLSv1\.3([[:space:]]|$)' \
+  grep -Eqi '(^|[^[:alnum:]_.])TLSv1\.3([^[:alnum:]_.]|$)' \
     "$1"
 }
 
@@ -530,7 +530,7 @@ certificate_verified_evidence_present() {
 
 x25519_evidence_present() {
   tls13_evidence_present "$1" &&
-    grep -Eqi '(Peer|Server) (Temp Key|temporary key):[[:space:]]*X25519|X25519,[[:space:]]*[0-9]+ bits' \
+    grep -Eqi '^[[:space:]]*(Peer|Server)[[:space:]]+(Temp Key|temporary key):[[:space:]]*X25519([,[:space:]]|$)' \
       "$1"
 }
 
@@ -703,8 +703,8 @@ check_domain() {
   local certificate_status='FAIL'
   local certificate_days='FAIL'
   local certificate_warning=''
-  local handshake_ms='-'
-  local handshake_sample_count=0
+  local ready_ms='-'
+  local ready_sample_count=0
   local cdn_status='-'
   local cdn_detail=''
   local http_status='-'
@@ -718,6 +718,8 @@ check_domain() {
   local http_5xx_count=0
   local tcp_evidence=false
   local curl_command_ok=false
+  local tls_command_ok=false
+  local x25519_command_ok=false
   local openssl_target=''
   local curl_resolve=''
   local attempt
@@ -727,12 +729,12 @@ check_domain() {
   local attempt_location
   local attempt_time_connect
   local attempt_time_appconnect
-  local attempt_handshake_ms
+  local attempt_ready_ms
   local final_header_file=''
   local certificate_enddate=''
   local expiry_epoch=''
   local current_epoch=''
-  local -a handshake_samples=()
+  local -a ready_samples=()
   local dns_a_file="$TEMP_DIR/dns-a-$index"
   local dns_aaaa_file="$TEMP_DIR/dns-aaaa-$index"
   local dns_cname_file="$TEMP_DIR/dns-cname-$index"
@@ -777,13 +779,17 @@ check_domain() {
     openssl_target=$(openssl_target_for_ip "$ip")
     curl_resolve=$(curl_resolve_for_ip "$domain" "$ip")
 
-    run_network_command "$tls_file" "$TLS_TIMEOUT" \
+    if run_network_command "$tls_file" "$TLS_TIMEOUT" \
       openssl s_client -connect "$openssl_target" -servername "$domain" \
         -tls1_3 -alpn h2 -verify_hostname "$domain" -verify_return_error \
-        -showcerts || :
-    run_network_command "$x25519_file" "$TLS_TIMEOUT" \
+        -showcerts; then
+      tls_command_ok=true
+    fi
+    if run_network_command "$x25519_file" "$TLS_TIMEOUT" \
       openssl s_client -connect "$openssl_target" -servername "$domain" \
-        -tls1_3 -groups X25519 || :
+        -tls1_3 -groups X25519; then
+      x25519_command_ok=true
+    fi
 
     reset_http_retry_state
     for attempt in 1 2 3; do
@@ -814,9 +820,9 @@ check_domain() {
         tcp_evidence=true
       fi
       if positive_seconds "$attempt_time_appconnect" &&
-        attempt_handshake_ms=$(seconds_to_milliseconds \
+        attempt_ready_ms=$(seconds_to_milliseconds \
           "$attempt_time_appconnect"); then
-        handshake_samples+=("$attempt_handshake_ms")
+        ready_samples+=("$attempt_ready_ms")
       fi
       if [[ "$curl_command_ok" == true &&
         "$attempt_http_code" =~ ^[0-9]{3}$ &&
@@ -829,18 +835,22 @@ check_domain() {
         "$attempt_http_status" "$attempt_location" "$http_header_file"
     done
 
-    if tls13_evidence_present "$tls_file"; then
+    if [[ "$tls_command_ok" == true ]] &&
+      tls13_evidence_present "$tls_file"; then
       tls_status='PASS'
       tcp_evidence=true
     fi
-    if h2_evidence_present "$tls_file"; then
+    if [[ "$tls_command_ok" == true ]] &&
+      h2_evidence_present "$tls_file"; then
       h2_status='PASS'
     fi
-    if x25519_evidence_present "$x25519_file"; then
+    if [[ "$x25519_command_ok" == true ]] &&
+      x25519_evidence_present "$x25519_file"; then
       x25519_status='PASS'
       tcp_evidence=true
     fi
-    if certificate_verified_evidence_present "$tls_file"; then
+    if [[ "$tls_command_ok" == true ]] &&
+      certificate_verified_evidence_present "$tls_file"; then
       certificate_status='PASS'
       if extract_leaf_certificate "$tls_file" "$leaf_certificate_file" &&
         certificate_enddate=$(openssl x509 -noout -enddate \
@@ -858,16 +868,16 @@ check_domain() {
       certificate_warning=$CERTIFICATE_WARNING
     fi
 
-    aggregate_handshake_samples "${handshake_samples[@]}"
-    handshake_ms=$HANDSHAKE_MS
-    handshake_sample_count=$HANDSHAKE_SAMPLE_COUNT
+    aggregate_ready_samples "${ready_samples[@]}"
+    ready_ms=$READY_MS
+    ready_sample_count=$READY_SAMPLE_COUNT
     final_header_file=$HTTP_HEADER_FILE
     detect_cdn "$cname" "$final_header_file"
     cdn_status=$CDN_STATUS
     cdn_detail=$CDN_DETAIL
   else
     reset_http_retry_state
-    aggregate_handshake_samples
+    aggregate_ready_samples
   fi
 
   if [[ "$tcp_evidence" == true ]]; then
@@ -916,8 +926,8 @@ check_domain() {
     append_reason "$HTTP_RESULT_REASON"
     [[ "$final_status" == 'FAIL' ]] || final_status='WARN'
   fi
-  if (( handshake_sample_count < 3 )); then
-    append_reason "TLS 握手计时样本不足（${handshake_sample_count}/3）"
+  if (( ready_sample_count < 3 )); then
+    append_reason "连接就绪计时样本不足（${ready_sample_count}/3）"
     [[ "$final_status" == 'FAIL' ]] || final_status='WARN'
   fi
   if [[ "$certificate_status" == 'PASS' &&
@@ -932,7 +942,7 @@ check_domain() {
   [[ -n "$REASONS" ]] || REASONS='-'
   printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
     "$domain" "$ip" "$tls_status" "$x25519_status" "$h2_status" \
-    "$handshake_ms" "$certificate_days" "$cdn_status" "$http_status" \
+    "$ready_ms" "$certificate_days" "$cdn_status" "$http_status" \
     "$redirect_code" "$final_status" "$REASONS" >"$result_file"
 }
 
@@ -1206,7 +1216,7 @@ calculate_table_widths() {
   local tls_status
   local x25519_status
   local h2_status
-  local handshake_ms
+  local ready_ms
   local certificate_days
   local cdn_status
   local http_status
@@ -1225,12 +1235,12 @@ calculate_table_widths() {
 
   for index in "${!DOMAIN_INPUTS[@]}"; do
     IFS=$'\t' read -r domain ip tls_status x25519_status h2_status \
-      handshake_ms certificate_days cdn_status http_status redirect_code \
+      ready_ms certificate_days cdn_status http_status redirect_code \
       final_status reasons <"$TEMP_DIR/result-$index"
     domain_display=$(truncate_ascii "$domain" 48)
     values=(
       "$domain_display" "$ip" "$tls_status" "$x25519_status" "$h2_status"
-      "$handshake_ms" "$certificate_days" "$cdn_status" "$http_status"
+      "$ready_ms" "$certificate_days" "$cdn_status" "$http_status"
       "$redirect_code" "$final_status"
     )
     for column_number in "${!values[@]}"; do
@@ -1298,7 +1308,7 @@ print_data_row() {
   local tls_status=$3
   local x25519_status=$4
   local h2_status=$5
-  local handshake_ms=$6
+  local ready_ms=$6
   local certificate_days=$7
   local cdn_status=$8
   local http_status=$9
@@ -1320,7 +1330,7 @@ print_data_row() {
     "$h2_status" "${TABLE_WIDTHS[4]}" "$(color_for_status "$h2_status")"
   print_frame_piece "$BORDER_VERTICAL"
   print_colored_cell \
-    "$handshake_ms" "${TABLE_WIDTHS[5]}" "$(color_for_latency "$handshake_ms")"
+    "$ready_ms" "${TABLE_WIDTHS[5]}" "$(color_for_latency "$ready_ms")"
   print_frame_piece "$BORDER_VERTICAL"
   print_colored_cell "$certificate_days" "${TABLE_WIDTHS[6]}" \
     "$(color_for_certificate_days "$certificate_days")"
@@ -1411,7 +1421,7 @@ print_table() {
   local tls_status
   local x25519_status
   local h2_status
-  local handshake_ms
+  local ready_ms
   local certificate_days
   local cdn_status
   local http_status
@@ -1425,12 +1435,12 @@ print_table() {
   print_header_separator
   for index in "${!DOMAIN_INPUTS[@]}"; do
     IFS=$'\t' read -r domain ip tls_status x25519_status h2_status \
-      handshake_ms certificate_days cdn_status http_status redirect_code \
+      ready_ms certificate_days cdn_status http_status redirect_code \
       final_status reasons <"$TEMP_DIR/result-$index"
     RESULT_STATUSES+=("$final_status")
     print_data_row \
       "$domain" "$ip" "$tls_status" "$x25519_status" "$h2_status" \
-      "$handshake_ms" "$certificate_days" "$cdn_status" "$http_status" \
+      "$ready_ms" "$certificate_days" "$cdn_status" "$http_status" \
       "$redirect_code" "$final_status"
   done
 
