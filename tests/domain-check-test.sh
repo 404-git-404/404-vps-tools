@@ -94,6 +94,23 @@ assert_extractor() {
   assert_equal "$expected" "$actual" "$description"
 }
 
+assert_evidence() {
+  local predicate=$1
+  local input=$2
+  local expected=$3
+  local description=$4
+  local input_file
+  local actual='FAIL'
+
+  (( EXTRACTOR_TEST_NUMBER += 1 ))
+  input_file="$TEST_TEMP_DIR/evidence-$EXTRACTOR_TEST_NUMBER"
+  printf '%s' "$input" >"$input_file"
+  if "$predicate" "$input_file"; then
+    actual='PASS'
+  fi
+  assert_equal "$expected" "$actual" "$description"
+}
+
 assert_parse() {
   local input=$1
   local expected=$2
@@ -309,18 +326,44 @@ assert_equal '13' "$(seconds_to_milliseconds 0.0126)" \
   'curl seconds are rounded to milliseconds'
 assert_equal '0' "$(seconds_to_milliseconds 0.0004)" \
   'sub-millisecond curl timing rounds to zero'
-aggregate_handshake_samples 10 30 20
-assert_equal '3' "$HANDSHAKE_SAMPLE_COUNT" 'three timing samples are counted'
-assert_equal '20' "$HANDSHAKE_MS" 'three timing samples use the median'
-aggregate_handshake_samples 10 21
-assert_equal '2' "$HANDSHAKE_SAMPLE_COUNT" 'two timing samples are counted'
-assert_equal '16' "$HANDSHAKE_MS" 'two timing samples use the rounded average'
-aggregate_handshake_samples 17
-assert_equal '1' "$HANDSHAKE_SAMPLE_COUNT" 'one timing sample is counted'
-assert_equal '17' "$HANDSHAKE_MS" 'one timing sample is displayed directly'
-aggregate_handshake_samples
-assert_equal '0' "$HANDSHAKE_SAMPLE_COUNT" 'zero timing samples are counted'
-assert_equal '-' "$HANDSHAKE_MS" 'zero timing samples display a dash'
+aggregate_ready_samples 10 30 20
+assert_equal '3' "$READY_SAMPLE_COUNT" 'three READY timing samples are counted'
+assert_equal '20' "$READY_MS" 'three READY timing samples use the median'
+aggregate_ready_samples 10 21
+assert_equal '2' "$READY_SAMPLE_COUNT" 'two READY timing samples are counted'
+assert_equal '16' "$READY_MS" 'two READY timing samples use the rounded average'
+aggregate_ready_samples 17
+assert_equal '1' "$READY_SAMPLE_COUNT" 'one READY timing sample is counted'
+assert_equal '17' "$READY_MS" 'one READY timing sample is displayed directly'
+aggregate_ready_samples
+assert_equal '0' "$READY_SAMPLE_COUNT" 'zero READY timing samples are counted'
+assert_equal '-' "$READY_MS" 'zero READY timing samples display a dash'
+
+assert_evidence tls13_evidence_present $'Protocol  : TLSv1.3\n' PASS \
+  'TLS1.3 evidence accepts the spaced OpenSSL Protocol form'
+assert_evidence tls13_evidence_present $'Protocol: TLSv1.3\n' PASS \
+  'TLS1.3 evidence accepts the compact OpenSSL Protocol form'
+assert_evidence tls13_evidence_present \
+  $'New, TLSv1.3, Cipher is TLS_AES_256_GCM_SHA384\n' PASS \
+  'TLS1.3 evidence accepts the OpenSSL New comma-delimited form'
+assert_evidence tls13_evidence_present $'Protocol  : TLSv1.2\n' FAIL \
+  'TLS1.2 is not accepted as TLS1.3 evidence'
+assert_evidence tls13_evidence_present $'Protocol  : TLSv1.30\n' FAIL \
+  'TLSv1.30 is not accepted as TLSv1.3 evidence'
+assert_evidence tls13_evidence_present $'Protocol  : TLSv1.3x\n' FAIL \
+  'TLSv1.3x is not accepted as TLSv1.3 evidence'
+assert_evidence x25519_evidence_present \
+  $'New, TLSv1.3, Cipher is TLS_AES_256_GCM_SHA384\nPeer Temp Key: X25519, 253 bits\n' \
+  PASS 'TLS1.3 with an explicit X25519 temporary key passes'
+assert_evidence x25519_evidence_present \
+  $'New, TLSv1.3, Cipher is TLS_AES_256_GCM_SHA384\n' FAIL \
+  'TLS1.3 without an X25519 temporary key fails'
+assert_evidence x25519_evidence_present \
+  $'Protocol  : TLSv1.2\ndebug text: X25519, 253 bits\n' FAIL \
+  'unrelated X25519 text without valid TLS1.3 evidence fails'
+assert_evidence x25519_evidence_present \
+  $'Protocol  : TLSv1.3\ndebug text: X25519, 253 bits\n' FAIL \
+  'unrelated X25519 text is not temporary-key evidence'
 
 assert_equal '203.0.113.10:443' \
   "$(openssl_target_for_ip 203.0.113.10)" \
@@ -553,8 +596,10 @@ assert_contains "$truncated_domain" "$table_output" \
   'table displays the truncated long domain'
 assert_contains "$ipv6_address" "$table_output" \
   'table preserves the complete IPv6 address'
-assert_contains 'HS(ms)' "$table_output" \
-  'table uses the curl handshake timing header'
+assert_contains 'READY(ms)' "$table_output" \
+  'NO_COLOR table names the full time_appconnect timing'
+assert_not_contains 'HS(ms)' "$table_output" \
+  'NO_COLOR table removes the ambiguous handshake header'
 assert_contains 'CERT(d)' "$table_output" \
   'table displays certificate remaining days'
 assert_contains 'CDN' "$table_output" \
@@ -565,7 +610,7 @@ assert_not_contains '┌' "$table_output" \
 mapfile -t table_lines <<<"$table_output"
 table_header_order=$(IFS=' '; printf '%s' "${TABLE_HEADERS[*]}")
 assert_equal \
-  'DOMAIN IP TLS1.3 X25519 H2 HS(ms) CERT(d) CDN HTTP REDIRECT RESULT' \
+  'DOMAIN IP TLS1.3 X25519 H2 READY(ms) CERT(d) CDN HTTP REDIRECT RESULT' \
   "$table_header_order" 'table header order is exact'
 assert_equal '6' "${#table_lines[@]}" \
   'two-row table has borders, header, separator, and data rows'
@@ -577,6 +622,14 @@ done
 assert_contains "$truncated_domain" \
   "${table_output%%second.example.com*}" \
   'table preserves input order'
+
+COLOR_ENABLED=true
+colored_table_output=$(print_results)
+COLOR_ENABLED=false
+assert_contains 'READY(ms)' "$colored_table_output" \
+  'colored table names the full time_appconnect timing'
+assert_not_contains 'HS(ms)' "$colored_table_output" \
+  'colored table removes the ambiguous handshake header'
 
 export COLOR_ENABLED=true
 NO_COLOR=1
@@ -700,7 +753,7 @@ printf '\n' >>"$MOCK_LOG_DIR/openssl.log"
 if [[ " $* " == *' -groups X25519 '* ]]; then
   if [[ ${MOCK_X25519_COMPLETE:-1} == 1 ]]; then
     printf '%s\n' \
-      'Protocol  : TLSv1.3' \
+      'New, TLSv1.3, Cipher is TLS_AES_256_GCM_SHA384' \
       'Peer Temp Key: X25519, 253 bits'
   else
     printf '%s\n' 'CONNECTED'
@@ -710,7 +763,7 @@ fi
 
 if [[ ${MOCK_NORMAL_COMPLETE:-1} == 1 ]]; then
   printf '%s\n' \
-    'Protocol  : TLSv1.3' \
+    'New, TLSv1.3, Cipher is TLS_AES_256_GCM_SHA384' \
     'ALPN protocol: h2' \
     '-----BEGIN CERTIFICATE-----' \
     'offline-fixture' \
@@ -748,6 +801,8 @@ run_mocked_domain_check() {
   local dns_fail=${9:-0}
   local expiry_epoch=${10:-2000000000}
   local current_epoch=${11:-1900000000}
+  local normal_exit=${12:-0}
+  local x25519_exit=${13:-0}
 
   mkdir -p "$TEST_TEMP_DIR/worker-tmp"
   printf '0\n' >"$MOCK_LOG_DIR/curl.count"
@@ -768,8 +823,8 @@ run_mocked_domain_check() {
       MOCK_NORMAL_COMPLETE="$normal_complete" \
       MOCK_X25519_COMPLETE="$x25519_complete" \
       MOCK_DNS_FAIL="$dns_fail" \
-      MOCK_NORMAL_EXIT=1 \
-      MOCK_X25519_EXIT=1 \
+      MOCK_NORMAL_EXIT="$normal_exit" \
+      MOCK_X25519_EXIT="$x25519_exit" \
       MOCK_RESPONSE_HEADER="$response_header" \
       MOCK_EXPIRY_EPOCH="$expiry_epoch" \
       MOCK_CURRENT_EPOCH="$current_epoch" \
@@ -783,19 +838,24 @@ run_mocked_domain_check() {
 
 run_mocked_domain_check \
   '500|200|503' \
-  '0.010|0.030|0.020' \
+  '0.111|0.333|0.222' \
   '0|0|0' \
   'https://other.example/||https://later.example/' \
   1 \
-  'CF-Ray: offline-SIN'
+  'CF-Ray: offline-SIN' \
+  '0.100|0.200|0.050'
 assert_equal '0' "$MOCK_RUN_STATUS" \
-  'complete parsed OpenSSL evidence succeeds despite nonzero command exits'
+  'successful OpenSSL commands with complete parsed evidence pass'
 assert_equal '3' "$(<"$MOCK_LOG_DIR/curl.count")" \
   'worker always completes exactly three curl connections'
-assert_contains 'HS(ms)' "$MOCK_RUN_OUTPUT" \
-  'high-fidelity worker output uses the handshake header'
-assert_contains '20' "$MOCK_RUN_OUTPUT" \
-  'worker displays the median of three curl TLS timings'
+assert_contains 'READY(ms)' "$MOCK_RUN_OUTPUT" \
+  'high-fidelity worker output uses the connection-ready header'
+assert_not_contains 'HS(ms)' "$MOCK_RUN_OUTPUT" \
+  'high-fidelity worker output removes the ambiguous handshake header'
+assert_contains '| 222       |' "$MOCK_RUN_OUTPUT" \
+  'worker displays the median of three complete time_appconnect samples'
+assert_not_contains '| 133       |' "$MOCK_RUN_OUTPUT" \
+  'worker does not subtract time_connect from time_appconnect'
 assert_contains '200' "$MOCK_RUN_OUTPUT" \
   'first non-5xx HTTP response remains final'
 assert_not_contains 'CROSS' "$MOCK_RUN_OUTPUT" \
@@ -853,6 +913,48 @@ run_mocked_domain_check \
   '0.010|0.020|0.030' \
   '0|0|0' \
   '||' \
+  1 \
+  '' \
+  '0.005|0.006|0.007' \
+  1 \
+  0 \
+  2000000000 \
+  1900000000 \
+  1 \
+  0
+assert_equal '1' "$MOCK_RUN_STATUS" \
+  'failed normal OpenSSL command remains a hard failure despite TLS1.3 text'
+assert_contains 'TLS 1.3 握手失败' "$MOCK_RUN_OUTPUT" \
+  'failed normal OpenSSL command cannot promote parsed TLS1.3 evidence'
+assert_contains 'ALPN 未协商 h2' "$MOCK_RUN_OUTPUT" \
+  'failed normal OpenSSL command cannot promote parsed ALPN evidence'
+assert_contains '证书链、有效期或主机名验证失败' "$MOCK_RUN_OUTPUT" \
+  'failed normal OpenSSL command cannot promote certificate evidence'
+
+run_mocked_domain_check \
+  '200|200|200' \
+  '0.010|0.020|0.030' \
+  '0|0|0' \
+  '||' \
+  1 \
+  '' \
+  '0.005|0.006|0.007' \
+  1 \
+  0 \
+  2000000000 \
+  1900000000 \
+  0 \
+  1
+assert_equal '1' "$MOCK_RUN_STATUS" \
+  'failed X25519 OpenSSL command remains a hard failure despite key text'
+assert_contains '强制 X25519 握手失败' "$MOCK_RUN_OUTPUT" \
+  'failed X25519 command cannot promote parsed temporary-key evidence'
+
+run_mocked_domain_check \
+  '200|200|200' \
+  '0.010|0.020|0.030' \
+  '0|0|0' \
+  '||' \
   0
 assert_equal '1' "$MOCK_RUN_STATUS" \
   'incomplete OpenSSL evidence produces a hard failure'
@@ -871,8 +973,8 @@ run_mocked_domain_check \
   1
 assert_equal '0' "$MOCK_RUN_STATUS" \
   'timing sample insufficiency is warning-only'
-assert_contains 'TLS 握手计时样本不足（1/3）' "$MOCK_RUN_OUTPUT" \
-  'one valid timing sample produces an explicit warning'
+assert_contains '连接就绪计时样本不足（1/3）' "$MOCK_RUN_OUTPUT" \
+  'one valid READY timing sample produces an explicit warning'
 assert_contains 'WARN' "$MOCK_RUN_OUTPUT" \
   'timing insufficiency changes the row to WARN'
 
@@ -922,6 +1024,10 @@ assert_contains 'HTTP' "$MOCK_RUN_OUTPUT" \
   'HTTP downgrade retains its redirect code'
 assert_contains 'WARN' "$MOCK_RUN_OUTPUT" \
   'HTTP downgrade produces a warning result'
+assert_contains 'READY(ms)' "$MOCK_RUN_OUTPUT" \
+  'redirect output retains the connection-ready timing header'
+assert_not_contains 'HS(ms)' "$MOCK_RUN_OUTPUT" \
+  'redirect output does not restore the old handshake header'
 
 run_mocked_domain_check \
   '200|200|200' \
