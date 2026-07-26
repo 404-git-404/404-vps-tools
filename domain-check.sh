@@ -4,7 +4,7 @@ set -Eeuo pipefail
 
 readonly PROGRAM_NAME='domain-check'
 readonly USAGE_TEXT='Usage: domain-check domain1.com/domain2.com/domain3.com'
-readonly MAX_CONCURRENCY=8
+readonly MAX_CONCURRENCY=1
 readonly DNS_TIMEOUT=6
 readonly TLS_TIMEOUT=10
 readonly HTTP_TIMEOUT=10

@@ -60,6 +60,21 @@ assert_not_contains() {
     fail "$description: unexpectedly contained [$unexpected]"
 }
 
+assert_in_order() {
+  local actual=$1
+  local description=$2
+  shift 2
+  local expected
+  local remaining=$actual
+
+  (( TEST_COUNT += 1 ))
+  for expected in "$@"; do
+    [[ "$remaining" == *"$expected"* ]] ||
+      fail "$description: missing or out of order [$expected]"
+    remaining=${remaining#*"$expected"}
+  done
+}
+
 assert_file_contains() {
   local expected=$1
   local file=$2
@@ -508,11 +523,89 @@ assert_file_not_contains 'DOMAIN_CHECK_SAMPLE' "$DOMAIN_CHECK_SCRIPT" \
   'there is no environment variable for changing sample count'
 assert_file_not_contains 'TLS_SAMPLES' "$DOMAIN_CHECK_SCRIPT" \
   'there is no alternate TLS sample-count control'
-assert_equal '8' "$MAX_CONCURRENCY" 'worker concurrency remains capped at eight'
+assert_equal '1' "$MAX_CONCURRENCY" \
+  'domain workers are restricted to strict serial execution'
 assert_file_contains 'trap handle_interrupt INT TERM' "$DOMAIN_CHECK_SCRIPT" \
   'worker signal cleanup path remains installed'
 assert_file_contains 'terminate_workers' "$DOMAIN_CHECK_SCRIPT" \
   'worker termination cleanup remains available'
+
+serial_driver="$TEST_TEMP_DIR/serial-scheduler-driver.sh"
+serial_events="$TEST_TEMP_DIR/serial-scheduler-events"
+serial_lock="$TEST_TEMP_DIR/serial-scheduler-active"
+{
+  printf '%s\n' '#!/usr/bin/env bash' 'set -Eeuo pipefail'
+  printf '%s\n' 'export DOMAIN_CHECK_SOURCE_ONLY=1'
+  printf 'source %q\n' "$DOMAIN_CHECK_SCRIPT"
+  printf 'readonly SERIAL_EVENT_FILE=%q\n' "$serial_events"
+  printf 'readonly SERIAL_LOCK_DIR=%q\n' "$serial_lock"
+  cat <<'SERIAL_DRIVER'
+parse_domain_argument() {
+  DOMAIN_INPUTS=(
+    first.example.com
+    second.example.com
+    third.example.com
+  )
+}
+
+check_dependencies() {
+  :
+}
+
+initialize_output_style() {
+  COLOR_ENABLED=false
+}
+
+check_domain() {
+  local index=$1
+  local domain=$2
+  local acquired_lock=false
+
+  printf 'start:%s\n' "$domain" >>"$SERIAL_EVENT_FILE"
+  if mkdir "$SERIAL_LOCK_DIR" 2>/dev/null; then
+    acquired_lock=true
+  else
+    printf 'overlap:%s\n' "$domain" >>"$SERIAL_EVENT_FILE"
+  fi
+  sleep 0.2
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$domain" 203.0.113.10 PASS PASS PASS 20 30 - 200 - PASS - \
+    >"$TEMP_DIR/result-$index"
+  if [[ "$acquired_lock" == true ]]; then
+    rmdir "$SERIAL_LOCK_DIR"
+  fi
+  printf 'end:%s\n' "$domain" >>"$SERIAL_EVENT_FILE"
+}
+
+print_results() {
+  RESULT_STATUSES=(PASS PASS PASS)
+}
+
+main first.example.com/second.example.com/third.example.com
+SERIAL_DRIVER
+} >"$serial_driver"
+: >"$serial_events"
+bash "$serial_driver"
+serial_event_output=$(<"$serial_events")
+assert_not_contains 'overlap:' "$serial_event_output" \
+  'high-fidelity scheduler never overlaps domain workers'
+assert_equal \
+  $'start:first.example.com\nend:first.example.com\nstart:second.example.com\nend:second.example.com\nstart:third.example.com\nend:third.example.com' \
+  "$serial_event_output" \
+  'each domain starts only after the previous worker fully ends'
+
+sleep 30 &
+cleanup_worker_pid=$!
+WORKER_PIDS=("$cleanup_worker_pid")
+terminate_workers
+assert_equal '0' "${#WORKER_PIDS[@]}" \
+  'worker cleanup empties the tracked PID list'
+set +e
+kill -0 "$cleanup_worker_pid" 2>/dev/null
+cleanup_worker_status=$?
+set -e
+assert_equal '1' "$cleanup_worker_status" \
+  'worker cleanup terminates and reaps the active worker'
 
 # The sed range intentionally matches the literal shell variable syntax.
 # shellcheck disable=SC2016
@@ -803,6 +896,7 @@ run_mocked_domain_check() {
   local current_epoch=${11:-1900000000}
   local normal_exit=${12:-0}
   local x25519_exit=${13:-0}
+  local domain_argument=${14:-example.com}
 
   mkdir -p "$TEST_TEMP_DIR/worker-tmp"
   printf '0\n' >"$MOCK_LOG_DIR/curl.count"
@@ -830,7 +924,7 @@ run_mocked_domain_check() {
       MOCK_CURRENT_EPOCH="$current_epoch" \
       TMPDIR="$TEST_TEMP_DIR/worker-tmp" \
       DOMAIN_CHECK_SOURCE_ONLY=0 \
-      bash "$DOMAIN_CHECK_SCRIPT" example.com 2>&1
+      bash "$DOMAIN_CHECK_SCRIPT" "$domain_argument" 2>&1
   )
   MOCK_RUN_STATUS=$?
   set -e
@@ -907,6 +1001,47 @@ assert_contains '<AAAA><example.com>' "$(<"$MOCK_LOG_DIR/dig.log")" \
   'worker performs the mocked IPv6 lookup'
 assert_contains '<-u><-d>' "$(<"$MOCK_LOG_DIR/date.log")" \
   'worker parses certificate expiry with the mocked GNU date path'
+
+run_mocked_domain_check \
+  '200|200|200|200|200|200|200|200|200' \
+  '0.111|0.333|0.222|0.444|0.666|0.555|0.777|0.999|0.888' \
+  '0|0|0|0|0|0|0|0|0' \
+  '||||||||' \
+  1 \
+  'CF-Ray: serial-SIN' \
+  '0.100|0.200|0.050|0.300|0.400|0.250|0.500|0.600|0.450' \
+  1 \
+  0 \
+  2000000000 \
+  1900000000 \
+  0 \
+  0 \
+  'first.example.com/second.example.com/third.example.com'
+assert_equal '0' "$MOCK_RUN_STATUS" \
+  'three-domain high-fidelity serial run succeeds'
+assert_equal '9' "$(<"$MOCK_LOG_DIR/curl.count")" \
+  'three domains still perform exactly three curl samples each'
+for serial_domain in \
+  first.example.com second.example.com third.example.com; do
+  assert_equal '3' \
+    "$(grep -Fc "<https://$serial_domain/>" "$MOCK_LOG_DIR/curl.log")" \
+    "$serial_domain performs three independent curl samples"
+done
+assert_in_order "$MOCK_RUN_OUTPUT" \
+  'three-domain output preserves input order' \
+  first.example.com second.example.com third.example.com
+assert_contains '| 222       |' "$MOCK_RUN_OUTPUT" \
+  'first domain READY is the median of its full time_appconnect samples'
+assert_contains '| 555       |' "$MOCK_RUN_OUTPUT" \
+  'second domain READY is the median of its full time_appconnect samples'
+assert_contains '| 888       |' "$MOCK_RUN_OUTPUT" \
+  'third domain READY is the median of its full time_appconnect samples'
+for serial_ready in 222 555 888; do
+  assert_contains \
+    "| PASS   | PASS   | PASS | $serial_ready       | 1157    | HIGH | 200  | -        | PASS   |" \
+    "$MOCK_RUN_OUTPUT" \
+    "READY $serial_ready row preserves TLS, X25519, H2, certificate, CDN, HTTP, redirect, and result"
+done
 
 run_mocked_domain_check \
   '200|200|200' \
