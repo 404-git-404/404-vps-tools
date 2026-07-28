@@ -1,0 +1,91 @@
+{
+  "log": {
+    "level": "选择",
+    "timestamp": true
+  },
+
+  "inbounds": [
+    {
+      "type": "shadowsocks",
+      "tag": "ss2022-in",
+
+      "listen": "0.0.0.0",
+      "listen_port": 32123,
+
+      "method": "2022-blake3-aes-128-gcm",
+      "password": "填入"
+    },
+{
+  "type": "hysteria2",
+  "tag": "hy2-in",
+
+  "listen": "::",
+  "listen_port": 32124,
+
+  "users": [
+    {
+      "name": "main",
+      "password": "填入"
+    }
+  ],
+
+  "tls": {
+    "enabled": true,
+    "certificate_path": "/etc/ssl/填入/fullchain.pem",
+    "key_path": "/etc/ssl/填入/privkey.pem",
+    "min_version": "1.3"
+  }
+},
+
+{
+    "type": "vless",
+    "tag": "cf-tunnel-in",
+    "listen": "127.0.0.1",
+    "listen_port": 33333,
+    "users": [
+      {
+        "name": "cf-user",
+        "uuid": "填入"
+      }
+    ],
+    "transport": {
+      "type": "ws",
+      "path": ""
+    }
+  },
+
+  {
+  "type": "vless",
+  "tag": "vless-cf-ws-in",
+  "listen": "0.0.0.0",
+  "listen_port": 8443,
+  "users": [
+    {
+      "name": "cf-ws",
+      "uuid": "填入"
+    }
+  ],
+  "tls": {
+    "enabled": true,
+    "certificate_path": "/etc/ssl/填入/fullchain.pem",
+    "key_path": "/etc/ssl/填入/privkey.pem"
+  },
+  "transport": {
+    "type": "ws",
+    "path": "/填入"
+  }
+}
+  ],
+
+
+
+  "route": {
+
+    "rules": [
+      {
+        "ip_is_private": true,
+        "action": "reject"
+      }
+    ]
+  }
+}
