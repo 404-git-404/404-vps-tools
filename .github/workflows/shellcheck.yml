@@ -24,9 +24,11 @@ jobs:
           scripts=(
             404notfound.sh
             domain-check.sh
+            node-config-wizard.sh
             scripts/update-smartdns.sh
             request-cloudflare-certificate.sh
             tests/domain-check-test.sh
+            tests/node-config-wizard-test.sh
             tests/smartdns-test.sh
           )
           for script in "${scripts[@]}"; do
@@ -39,8 +41,10 @@ jobs:
           done
           for executable_script in \
             domain-check.sh \
+            node-config-wizard.sh \
             scripts/update-smartdns.sh \
             tests/domain-check-test.sh \
+            tests/node-config-wizard-test.sh \
             tests/smartdns-test.sh; do
             test -x "$executable_script"
           done
@@ -96,10 +100,10 @@ jobs:
           EOF
           cmp -s README.md /tmp/expected-readme
 
-      - name: Install ShellCheck and mawk
+      - name: Install ShellCheck, jq, and mawk
         run: |
           sudo apt-get update
-          sudo apt-get install --yes shellcheck mawk
+          sudo apt-get install --yes shellcheck jq mawk
 
       - name: Run offline tests
         run: |
@@ -107,6 +111,7 @@ jobs:
           ln -s "$(command -v mawk)" "$RUNNER_TEMP/mawk-bin/awk"
           PATH="$RUNNER_TEMP/mawk-bin:$PATH" awk -W version
           PATH="$RUNNER_TEMP/mawk-bin:$PATH" bash tests/domain-check-test.sh
+          PATH="$RUNNER_TEMP/mawk-bin:$PATH" bash tests/node-config-wizard-test.sh
           PATH="$RUNNER_TEMP/mawk-bin:$PATH" bash tests/smartdns-test.sh
 
       - name: Run ShellCheck
@@ -114,8 +119,10 @@ jobs:
           shellcheck \
             404notfound.sh \
             domain-check.sh \
+            node-config-wizard.sh \
             scripts/update-smartdns.sh \
             request-cloudflare-certificate.sh \
             tests/domain-check-test.sh \
+            tests/node-config-wizard-test.sh \
             tests/smartdns-test.sh \
             /tmp/update-cloudflare-ufw

@@ -10,6 +10,7 @@ INBOUNDS_JSON='[]'
 OUTBOUNDS_JSON='[]'
 ROUTE_JSON='{}'
 BUILT_ITEM=''
+WORKING_CONFIG_JSON=''
 OUTBOUND_TAGS=()
 
 RED=''
@@ -256,7 +257,7 @@ prompt_outbound_tag() {
         elif [[ "$candidate" == 'direct' ]]; then
             error 'outbound tag 不得等于 direct。'
         elif tag_exists "$candidate"; then
-            error "outbound tag“${candidate}”已存在，请重新输入 tag。"
+            error "outbound tag '${candidate}' 已存在，请重新输入 tag。"
         else
             printf -v "$target_name" '%s' "$candidate"
             return
@@ -280,12 +281,220 @@ reset_generation_state() {
     OUTBOUNDS_JSON='[]'
     ROUTE_JSON='{}'
     BUILT_ITEM=''
+    WORKING_CONFIG_JSON=''
     OUTBOUND_TAGS=()
 
     if [[ -n "$TEMP_CONFIG" && -f "$TEMP_CONFIG" ]]; then
         rm -f -- "$TEMP_CONFIG"
     fi
     TEMP_CONFIG=''
+}
+
+discard_existing_changes() {
+    reset_generation_state
+}
+
+load_existing_config_file() {
+    local config_path="$1"
+
+    if [[ ! -e "$config_path" ]]; then
+        error "现有配置不存在：${config_path}"
+        return 1
+    fi
+    if [[ ! -r "$config_path" ]]; then
+        error "现有配置不可读：${config_path}"
+        return 1
+    fi
+    if ! jq empty "$config_path" >/dev/null 2>&1; then
+        error "现有配置不是合法 JSON：${config_path}"
+        return 1
+    fi
+    if ! jq -e 'type == "object"' "$config_path" >/dev/null 2>&1; then
+        error '现有配置的 JSON 顶层必须是对象。'
+        return 1
+    fi
+
+    WORKING_CONFIG_JSON="$(jq -c '.' "$config_path")"
+}
+
+working_field_type() {
+    local field="$1"
+
+    jq -r --arg field "$field" \
+        'if has($field) then (.[$field] | type) else "missing" end' \
+        <<<"$WORKING_CONFIG_JSON"
+}
+
+ensure_working_array() {
+    local field="$1"
+    local field_type=''
+
+    field_type="$(working_field_type "$field")"
+    case "$field_type" in
+        missing|array)
+            return 0
+            ;;
+        *)
+            error "现有配置的 .${field} 必须是数组，本轮修改已停止。"
+            return 1
+            ;;
+    esac
+}
+
+ensure_working_route_object() {
+    local field_type=''
+
+    field_type="$(working_field_type 'route')"
+    case "$field_type" in
+        missing|object)
+            return 0
+            ;;
+        *)
+            error '现有配置的 .route 必须是对象，本轮修改已停止。'
+            return 1
+            ;;
+    esac
+}
+
+working_tag_exists() {
+    local field="$1"
+    local tag="$2"
+
+    jq -e --arg field "$field" --arg tag "$tag" \
+        'any(.[$field][]?; (.tag? | type == "string") and .tag == $tag)' \
+        <<<"$WORKING_CONFIG_JSON" >/dev/null
+}
+
+append_working_inbound() {
+    local item="$1"
+    local tag=''
+
+    ensure_working_array 'inbounds' || return 1
+    tag="$(jq -r '.tag // empty' <<<"$item")"
+    if [[ -z "$tag" ]]; then
+        error '新 inbound 缺少 tag，无法追加。'
+        return 1
+    fi
+    if working_tag_exists 'inbounds' "$tag"; then
+        error "inbound tag '${tag}' 已经存在，不允许重复追加。"
+        return 1
+    fi
+
+    WORKING_CONFIG_JSON="$(jq -c --argjson item "$item" \
+        '.inbounds = ((.inbounds // []) + [$item])' \
+        <<<"$WORKING_CONFIG_JSON")"
+}
+
+refresh_outbound_tags_from_working() {
+    local tag=''
+    local existing=''
+    local duplicate='false'
+
+    ensure_working_array 'outbounds' || return 1
+    OUTBOUND_TAGS=()
+    while IFS= read -r tag; do
+        [[ -n "$tag" ]] || continue
+        duplicate='false'
+        for existing in "${OUTBOUND_TAGS[@]}"; do
+            if [[ "$existing" == "$tag" ]]; then
+                duplicate='true'
+                break
+            fi
+        done
+        if [[ "$duplicate" == 'false' ]]; then
+            OUTBOUND_TAGS+=("$tag")
+        fi
+    done < <(jq -r '
+        .outbounds[]?
+        | .tag?
+        | select(type == "string" and length > 0)
+    ' <<<"$WORKING_CONFIG_JSON")
+}
+
+append_working_outbound() {
+    local item="$1"
+    local tag=''
+
+    ensure_working_array 'outbounds' || return 1
+    tag="$(jq -r '.tag // empty' <<<"$item")"
+    if [[ -z "$tag" ]]; then
+        error '新 outbound 的 tag 不能为空。'
+        return 1
+    fi
+    if [[ "$tag" =~ [[:space:]] ]]; then
+        error '新 outbound 的 tag 不得包含空格。'
+        return 1
+    fi
+    if [[ "$tag" == 'direct' ]]; then
+        error '追加模式暂不提供 direct outbound。'
+        return 1
+    fi
+    if working_tag_exists 'outbounds' "$tag"; then
+        error "outbound tag '${tag}' 已经存在，不允许重复追加。"
+        return 1
+    fi
+
+    WORKING_CONFIG_JSON="$(jq -c --argjson item "$item" \
+        '.outbounds = ((.outbounds // []) + [$item])' \
+        <<<"$WORKING_CONFIG_JSON")"
+    refresh_outbound_tags_from_working
+}
+
+set_working_route_final() {
+    local final_tag="$1"
+
+    ensure_working_array 'outbounds' || return 1
+    ensure_working_route_object || return 1
+    if ! working_tag_exists 'outbounds' "$final_tag"; then
+        error "outbound tag '${final_tag}' 不存在，不能设为 route.final。"
+        return 1
+    fi
+
+    WORKING_CONFIG_JSON="$(jq -c --arg final "$final_tag" \
+        '.route = (.route // {}) | .route.final = $final' \
+        <<<"$WORKING_CONFIG_JSON")"
+}
+
+write_working_config_temp() {
+    if [[ -n "$TEMP_CONFIG" && -f "$TEMP_CONFIG" ]]; then
+        rm -f -- "$TEMP_CONFIG"
+    fi
+    TEMP_CONFIG=''
+    create_temp_config
+    jq . <<<"$WORKING_CONFIG_JSON" >"$TEMP_CONFIG"
+}
+
+display_working_tags() {
+    local field="$1"
+    local label="$2"
+    local field_type=''
+    local tag=''
+    local count=0
+
+    field_type="$(working_field_type "$field")"
+    printf '\n当前已有的 %s tag：\n' "$label"
+    if [[ "$field_type" == 'missing' ]]; then
+        printf '（无）\n'
+        return
+    fi
+    if [[ "$field_type" != 'array' ]]; then
+        printf '（.%s 不是数组）\n' "$field"
+        return
+    fi
+
+    while IFS= read -r tag; do
+        [[ -n "$tag" ]] || continue
+        printf -- '- %s\n' "$tag"
+        ((count += 1))
+    done < <(jq -r --arg field "$field" '
+        .[$field][]?
+        | .tag?
+        | select(type == "string" and length > 0)
+    ' <<<"$WORKING_CONFIG_JSON")
+
+    if (( count == 0 )); then
+        printf '（无）\n'
+    fi
 }
 
 configure_log() {
@@ -309,8 +518,7 @@ configure_log() {
 build_reality_inbound() {
     local listen_port=''
     local uuid=''
-    local server_name=''
-    local handshake_server=''
+    local disguise_domain=''
     local handshake_port=''
     local private_key=''
     local short_id=''
@@ -318,8 +526,7 @@ build_reality_inbound() {
     info '配置 VLESS Reality inbound'
     prompt_port listen_port '请输入监听端口' 443
     prompt_required uuid '请输入 UUID' true
-    prompt_required server_name '请输入 TLS server_name' false
-    prompt_required handshake_server '请输入 Reality handshake.server' false
+    prompt_required disguise_domain '请输入 Reality 伪装域名' false
     prompt_port handshake_port '请输入 Reality handshake.server_port' 443
     prompt_required private_key '请输入 Reality private_key' true
     prompt_required short_id '请输入 Reality short_id' true
@@ -327,8 +534,7 @@ build_reality_inbound() {
     BUILT_ITEM="$(jq -cn \
         --argjson listen_port "$listen_port" \
         --arg uuid "$uuid" \
-        --arg server_name "$server_name" \
-        --arg handshake_server "$handshake_server" \
+        --arg disguise_domain "$disguise_domain" \
         --argjson handshake_port "$handshake_port" \
         --arg private_key "$private_key" \
         --arg short_id "$short_id" \
@@ -344,11 +550,11 @@ build_reality_inbound() {
             }],
             tls: {
                 enabled: true,
-                server_name: $server_name,
+                server_name: $disguise_domain,
                 reality: {
                     enabled: true,
                     handshake: {
-                        server: $handshake_server,
+                        server: $disguise_domain,
                         server_port: $handshake_port
                     },
                     private_key: $private_key,
@@ -806,6 +1012,256 @@ generate_exit_config() {
         }' >"$TEMP_CONFIG"
 }
 
+add_inbound_to_working_config() {
+    local config_kind=''
+    local inbound_choice=''
+    local target_tag=''
+
+    ensure_working_array 'inbounds' || return 1
+
+    printf '\n现有配置属于：\n\n'
+    printf '1. 中转配置\n'
+    printf '2. 落地配置\n'
+    printf '3. 返回\n'
+    prompt_numbered_choice config_kind 1 3
+    if [[ "$config_kind" == '3' ]]; then
+        return 0
+    fi
+
+    printf '\n请选择要添加的 inbound：\n\n'
+    if [[ "$config_kind" == '1' ]]; then
+        printf '1. VLESS Reality inbound\n'
+        printf '2. Hysteria2 inbound\n'
+        printf '3. CF Tunnel inbound\n'
+        printf '4. CF WebSocket inbound\n'
+        printf '5. 返回\n'
+        prompt_numbered_choice inbound_choice 1 5
+        case "$inbound_choice" in
+            1) target_tag='vless-reality-in' ;;
+            2) target_tag='hy2-in' ;;
+            3) target_tag='cf-tunnel-in' ;;
+            4) target_tag='vless-cf-ws-in' ;;
+            5) return 0 ;;
+        esac
+    else
+        printf '1. SS2022 inbound\n'
+        printf '2. Hysteria2 inbound\n'
+        printf '3. CF Tunnel inbound\n'
+        printf '4. CF WebSocket inbound\n'
+        printf '5. 返回\n'
+        prompt_numbered_choice inbound_choice 1 5
+        case "$inbound_choice" in
+            1) target_tag='ss2022-in' ;;
+            2) target_tag='hy2-in' ;;
+            3) target_tag='cf-tunnel-in' ;;
+            4) target_tag='vless-cf-ws-in' ;;
+            5) return 0 ;;
+        esac
+    fi
+
+    if working_tag_exists 'inbounds' "$target_tag"; then
+        error "inbound tag '${target_tag}' 已经存在，不允许重复追加。"
+        return 0
+    fi
+
+    if [[ "$config_kind" == '1' ]]; then
+        case "$inbound_choice" in
+            1) build_reality_inbound ;;
+            2) build_transit_hysteria2_inbound ;;
+            3) build_cf_tunnel_inbound ;;
+            4) build_cf_websocket_inbound ;;
+        esac
+    else
+        case "$inbound_choice" in
+            1) build_exit_shadowsocks_inbound ;;
+            2) build_exit_hysteria2_inbound ;;
+            3) build_cf_tunnel_inbound ;;
+            4) build_cf_websocket_inbound ;;
+        esac
+    fi
+
+    if append_working_inbound "$BUILT_ITEM"; then
+        success "已追加 inbound：${target_tag}"
+    fi
+}
+
+add_outbounds_to_working_config() {
+    local outbound_choice=''
+
+    ensure_working_array 'outbounds' || return 1
+    refresh_outbound_tags_from_working || return 1
+
+    while true; do
+        printf '\n请选择要添加的 outbound：\n\n'
+        printf '1. SS2022 outbound\n'
+        printf '2. Hysteria2 outbound\n'
+        printf '3. 完成并返回\n'
+        prompt_numbered_choice outbound_choice 1 3
+
+        case "$outbound_choice" in
+            1) build_shadowsocks_outbound ;;
+            2) build_hysteria2_outbound ;;
+            3) return 0 ;;
+        esac
+
+        if append_working_outbound "$BUILT_ITEM"; then
+            success "已追加 outbound：${OUTBOUND_TAGS[$((${#OUTBOUND_TAGS[@]} - 1))]}"
+        fi
+    done
+}
+
+modify_working_route_final() {
+    local current_final=''
+    local action_choice=''
+    local final_choice=''
+    local index=0
+
+    ensure_working_array 'outbounds' || return 1
+    ensure_working_route_object || return 1
+    refresh_outbound_tags_from_working || return 1
+
+    current_final="$(jq -r '
+        if ((.route // {}) | has("final")) then
+            if .route.final == null then
+                "未设置"
+            elif (.route.final | type) == "string" then
+                .route.final
+            else
+                (.route.final | tojson)
+            end
+        else
+            "未设置"
+        end
+    ' <<<"$WORKING_CONFIG_JSON")"
+
+    printf '\n当前 route.final：%s\n' "$current_final"
+    printf '\n请选择操作：\n\n'
+    printf '1. 保持当前值\n'
+    printf '2. 从现有 outbound tag 中选择新值\n'
+    prompt_numbered_choice action_choice 1 2
+    if [[ "$action_choice" == '1' ]]; then
+        return 0
+    fi
+
+    if (( ${#OUTBOUND_TAGS[@]} == 0 )); then
+        error '当前没有可选择的 outbound tag。'
+        return 0
+    fi
+
+    printf '\n请选择新的 route.final：\n\n'
+    for index in "${!OUTBOUND_TAGS[@]}"; do
+        printf '%d. %s\n' "$((index + 1))" "${OUTBOUND_TAGS[$index]}"
+    done
+    prompt_numbered_choice final_choice 1 "${#OUTBOUND_TAGS[@]}"
+
+    if set_working_route_final "${OUTBOUND_TAGS[$((final_choice - 1))]}"; then
+        success "route.final 已设置为：${OUTBOUND_TAGS[$((final_choice - 1))]}"
+    fi
+}
+
+existing_config_preview_menu() {
+    local choice=''
+    local apply_status=0
+
+    while true; do
+        printf '请选择下一步：\n\n'
+        printf '1. 确认应用配置\n'
+        printf '2. 返回继续添加\n'
+        printf '3. 放弃全部修改并返回主菜单\n'
+        printf '4. 退出，不作修改\n'
+        prompt_numbered_choice choice 1 4
+
+        case "$choice" in
+            1)
+                if apply_config; then
+                    return 0
+                else
+                    apply_status=$?
+                fi
+                if (( apply_status == 1 )); then
+                    printf '\n'
+                    continue
+                fi
+                return 4
+                ;;
+            2)
+                if [[ -n "$TEMP_CONFIG" && -f "$TEMP_CONFIG" ]]; then
+                    rm -f -- "$TEMP_CONFIG"
+                fi
+                TEMP_CONFIG=''
+                return 1
+                ;;
+            3)
+                discard_existing_changes
+                return 2
+                ;;
+            4)
+                discard_existing_changes
+                return 3
+                ;;
+        esac
+    done
+}
+
+edit_existing_config() {
+    local menu_choice=''
+    local preview_status=0
+
+    if ! load_existing_config_file "$CONFIG_PATH"; then
+        return 1
+    fi
+
+    while true; do
+        display_working_tags 'inbounds' 'inbound'
+        display_working_tags 'outbounds' 'outbound'
+
+        printf '\n请选择操作：\n\n'
+        printf '1. 添加 inbound\n'
+        printf '2. 添加 outbound\n'
+        printf '3. 修改 route.final\n'
+        printf '4. 完成并预览\n'
+        printf '5. 放弃并返回主菜单\n'
+        prompt_numbered_choice menu_choice 1 5
+
+        case "$menu_choice" in
+            1)
+                if ! add_inbound_to_working_config; then
+                    continue
+                fi
+                ;;
+            2)
+                if ! add_outbounds_to_working_config; then
+                    continue
+                fi
+                ;;
+            3)
+                if ! modify_working_route_final; then
+                    continue
+                fi
+                ;;
+            4)
+                write_working_config_temp
+                show_preview
+                if existing_config_preview_menu; then
+                    return 0
+                else
+                    preview_status=$?
+                fi
+                case "$preview_status" in
+                    1) continue ;;
+                    2) return 1 ;;
+                    3) return 2 ;;
+                    4) return 3 ;;
+                esac
+                ;;
+            5)
+                discard_existing_changes
+                return 1
+                ;;
+        esac
+    done
+}
+
 show_preview() {
     printf '\n%s完整配置预览：%s\n\n' "$CYAN" "$RESET"
     jq . "$TEMP_CONFIG"
@@ -830,7 +1286,9 @@ show_service_failure() {
     fi
 }
 
-apply_config() {
+apply_config_to_path() {
+    local target_config="$1"
+    local target_dir="$2"
     local sing_box_bin=''
     local backup_path=''
     local service_status=''
@@ -855,19 +1313,19 @@ apply_config() {
         return 1
     fi
 
-    install -d -m 0755 "$CONFIG_DIR"
+    install -d -m 0755 "$target_dir"
 
-    if [[ -e "$CONFIG_PATH" ]]; then
-        backup_path="${CONFIG_PATH}.bak-$(date '+%Y%m%d-%H%M%S')"
+    if [[ -e "$target_config" ]]; then
+        backup_path="${target_config}.bak-$(date '+%Y%m%d-%H%M%S')"
         if [[ -e "$backup_path" ]]; then
             error "备份目标已存在：${backup_path}；正式配置未修改。"
             return 1
         fi
-        cp -a -- "$CONFIG_PATH" "$backup_path"
+        cp -a -- "$target_config" "$backup_path"
     fi
 
-    install -m 0600 -- "$TEMP_CONFIG" "$CONFIG_PATH"
-    success "配置已写入：${CONFIG_PATH}"
+    install -m 0600 -- "$TEMP_CONFIG" "$target_config"
+    success "配置已写入：${target_config}"
     if [[ -n "$backup_path" ]]; then
         success "旧配置备份路径：${backup_path}"
     else
@@ -888,15 +1346,20 @@ apply_config() {
     return 2
 }
 
+apply_config() {
+    apply_config_to_path "$CONFIG_PATH" "$CONFIG_DIR"
+}
+
 choose_config_type() {
     local target_name="$1"
     local choice=''
 
     printf '\n请选择配置类型：\n\n'
-    printf '1. 中转小鸡\n'
-    printf '2. 落地小鸡\n'
-    printf '3. 退出\n'
-    prompt_numbered_choice choice 1 3
+    printf '1. 新建中转小鸡配置\n'
+    printf '2. 新建落地小鸡配置\n'
+    printf '3. 添加到现有配置\n'
+    printf '4. 退出\n'
+    prompt_numbered_choice choice 1 4
     printf -v "$target_name" '%s' "$choice"
 }
 
@@ -939,6 +1402,7 @@ final_menu() {
 main() {
     local config_type=''
     local menu_status=0
+    local edit_status=0
 
     init_colors
     check_environment
@@ -951,6 +1415,29 @@ main() {
             1) generate_transit_config ;;
             2) generate_exit_config ;;
             3)
+                if edit_existing_config; then
+                    return 0
+                else
+                    edit_status=$?
+                fi
+
+                case "$edit_status" in
+                    1)
+                        reset_generation_state
+                        continue
+                        ;;
+                    2)
+                        return 0
+                        ;;
+                    3)
+                        return 1
+                        ;;
+                    *)
+                        die "添加到现有配置流程返回了未知状态：${edit_status}"
+                        ;;
+                esac
+                ;;
+            4)
                 info '已退出，未作任何修改。'
                 return 0
                 ;;
