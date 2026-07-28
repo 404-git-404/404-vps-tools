@@ -257,7 +257,7 @@ prompt_outbound_tag() {
         elif [[ "$candidate" == 'direct' ]]; then
             error 'outbound tag 不得等于 direct。'
         elif tag_exists "$candidate"; then
-            error "outbound tag“${candidate}”已存在，请重新输入 tag。"
+            error "outbound tag '${candidate}' 已存在，请重新输入 tag。"
         else
             printf -v "$target_name" '%s' "$candidate"
             return
@@ -376,7 +376,7 @@ append_working_inbound() {
         return 1
     fi
     if working_tag_exists 'inbounds' "$tag"; then
-        error "inbound tag“${tag}”已经存在，不允许重复追加。"
+        error "inbound tag '${tag}' 已经存在，不允许重复追加。"
         return 1
     fi
 
@@ -430,7 +430,7 @@ append_working_outbound() {
         return 1
     fi
     if working_tag_exists 'outbounds' "$tag"; then
-        error "outbound tag“${tag}”已经存在，不允许重复追加。"
+        error "outbound tag '${tag}' 已经存在，不允许重复追加。"
         return 1
     fi
 
@@ -446,7 +446,7 @@ set_working_route_final() {
     ensure_working_array 'outbounds' || return 1
     ensure_working_route_object || return 1
     if ! working_tag_exists 'outbounds' "$final_tag"; then
-        error "outbound tag“${final_tag}”不存在，不能设为 route.final。"
+        error "outbound tag '${final_tag}' 不存在，不能设为 route.final。"
         return 1
     fi
 
@@ -1060,7 +1060,7 @@ add_inbound_to_working_config() {
     fi
 
     if working_tag_exists 'inbounds' "$target_tag"; then
-        error "inbound tag“${target_tag}”已经存在，不允许重复追加。"
+        error "inbound tag '${target_tag}' 已经存在，不允许重复追加。"
         return 0
     fi
 
