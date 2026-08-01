@@ -533,8 +533,15 @@ assert_file_contains "$literal_curl_resolve" "$DOMAIN_CHECK_SCRIPT" \
   'curl pins every connection to the selected address'
 assert_file_contains "$literal_openssl_target" "$DOMAIN_CHECK_SCRIPT" \
   'OpenSSL connects to the selected address'
-assert_file_not_contains '/dev/tcp' "$DOMAIN_CHECK_SCRIPT" \
-  'the separate Bash TCP probe was removed'
+# This is the literal positional parameter evaluated by the child Bash.
+# shellcheck disable=SC2016
+literal_tcp_path='/dev/tcp/$1/443'
+assert_file_contains '/dev/tcp/' "$DOMAIN_CHECK_SCRIPT" \
+  'TCP 443 reachability uses the Bash built-in socket path'
+assert_file_not_contains 'netcat' "$DOMAIN_CHECK_SCRIPT" \
+  'independent TCP probing does not add a netcat dependency'
+assert_file_not_contains 'tcp_evidence' "$DOMAIN_CHECK_SCRIPT" \
+  'TCP reachability evidence uses the final TCP status directly'
 assert_file_not_contains 'EPOCHREALTIME' "$DOMAIN_CHECK_SCRIPT" \
   'OpenSSL wall-clock timing was removed'
 assert_file_not_contains 'DOMAIN_CHECK_SAMPLE' "$DOMAIN_CHECK_SCRIPT" \
@@ -816,6 +823,10 @@ done
 [[ ${1:-} =~ ^[0-9]+$ ]] && shift
 printf '<%s>' "$@" >>"$MOCK_LOG_DIR/timeout.log"
 printf '\n' >>"$MOCK_LOG_DIR/timeout.log"
+if [[ ${1:-} == bash && ${2:-} == -c &&
+  ${3:-} == *'/dev/tcp/'* ]]; then
+  exit "${MOCK_TCP_EXIT:-0}"
+fi
 "$@"
 EOF
 
@@ -961,6 +972,7 @@ run_mocked_domain_check() {
   local normal_exit=${12:-0}
   local x25519_exit=${13:-0}
   local domain_argument=${14:-example.com}
+  local tcp_exit=${15:-0}
 
   mkdir -p "$TEST_TEMP_DIR/worker-tmp"
   printf '0\n' >"$MOCK_LOG_DIR/curl.count"
@@ -984,6 +996,7 @@ run_mocked_domain_check() {
       MOCK_DNS_FAIL="$dns_fail" \
       MOCK_NORMAL_EXIT="$normal_exit" \
       MOCK_X25519_EXIT="$x25519_exit" \
+      MOCK_TCP_EXIT="$tcp_exit" \
       MOCK_RESPONSE_HEADER="$response_header" \
       MOCK_EXPIRY_EPOCH="$expiry_epoch" \
       MOCK_CURRENT_EPOCH="$current_epoch" \
@@ -1031,6 +1044,8 @@ assert_contains '203.0.113.10' "$MOCK_RUN_OUTPUT" \
   'table IP matches the address used by every network command'
 assert_contains 'PASS' "$MOCK_RUN_OUTPUT" \
   'CDN HIGH does not change an otherwise passing result'
+assert_not_contains 'TCP 443 不可达' "$MOCK_RUN_OUTPUT" \
+  'successful TCP and TLS1.3 probes do not report a TCP failure'
 
 openssl_log=$(<"$MOCK_LOG_DIR/openssl.log")
 timeout_log=$(<"$MOCK_LOG_DIR/timeout.log")
@@ -1060,6 +1075,14 @@ assert_contains '<curl>' "$timeout_log" \
   'high-fidelity worker runs curl commands through timeout'
 assert_contains '<openssl>' "$timeout_log" \
   'high-fidelity worker runs OpenSSL commands through timeout'
+assert_equal '1' \
+  "$(grep -Fc "$literal_tcp_path" "$MOCK_LOG_DIR/timeout.log")" \
+  'resolved domain performs exactly one independent TCP 443 probe'
+assert_contains '<bash><203.0.113.10>' "$timeout_log" \
+  'independent TCP probe uses the same selected IPv4 address'
+assert_in_order "$timeout_log" \
+  'independent TCP probe completes before TLS and HTTP checks start' \
+  "$literal_tcp_path" '<openssl>' '<curl>'
 assert_contains '<A><example.com>' "$(<"$MOCK_LOG_DIR/dig.log")" \
   'worker performs the mocked IPv4 lookup'
 assert_contains '<AAAA><example.com>' "$(<"$MOCK_LOG_DIR/dig.log")" \
@@ -1174,6 +1197,9 @@ set -Eeuo pipefail
 if [[ " $* " == *' hard-timeout.example.com '* ]]; then
   printf '%s\n' "$$" >"$BATCH_BLOCK_PID_DIR/hard-timeout.pid"
   exec sleep 300
+fi
+if [[ " $* " == *'/dev/tcp/'* ]]; then
+  exit 0
 fi
 exec "$REAL_TIMEOUT" "$@"
 EOF
@@ -1450,7 +1476,40 @@ assert_contains 'TLS 1.3 握手失败' "$MOCK_RUN_OUTPUT" \
 assert_contains 'FAIL    | -' "$MOCK_RUN_OUTPUT" \
   'certificate verification failure displays FAIL in CERT(d)'
 assert_not_contains 'TCP 443 不可达' "$MOCK_RUN_OUTPUT" \
-  'successful curl TCP evidence is not mislabeled as a TCP failure'
+  'successful independent TCP probe survives incomplete TLS evidence'
+
+run_mocked_domain_check \
+  '000|000|000' \
+  '0|0|0' \
+  '35|35|35' \
+  '||' \
+  0 \
+  '' \
+  '0|0|0' \
+  0 \
+  0 \
+  2000000000 \
+  1900000000 \
+  1 \
+  1 \
+  example.com \
+  0
+assert_equal '1' "$MOCK_RUN_STATUS" \
+  'TCP-reachable TLS1.2-only fixture fails all forced TLS1.3 probes'
+assert_contains 'TLS 1.3 握手失败' "$MOCK_RUN_OUTPUT" \
+  'TLS1.2-only fixture reports the TLS1.3 failure'
+assert_contains '强制 X25519 握手失败' "$MOCK_RUN_OUTPUT" \
+  'TLS1.2-only fixture reports the X25519 failure'
+assert_contains 'ALPN 未协商 h2' "$MOCK_RUN_OUTPUT" \
+  'TLS1.2-only fixture reports the missing h2 negotiation'
+assert_contains '证书链、有效期或主机名验证失败' "$MOCK_RUN_OUTPUT" \
+  'TLS1.2-only fixture reports unavailable forced-handshake certificate evidence'
+assert_contains 'HTTP 请求失败' "$MOCK_RUN_OUTPUT" \
+  'TLS1.2-only fixture reports forced TLS1.3 curl failure'
+assert_contains '连接就绪计时样本不足（0/3）' "$MOCK_RUN_OUTPUT" \
+  'TLS1.2-only fixture reports zero TLS1.3 READY samples'
+assert_not_contains 'TCP 443 不可达' "$MOCK_RUN_OUTPUT" \
+  'TLS1.3 failure cannot overwrite a successful TCP probe'
 
 run_mocked_domain_check \
   '200|200|200' \
@@ -1466,6 +1525,29 @@ assert_contains 'WARN' "$MOCK_RUN_OUTPUT" \
   'timing insufficiency changes the row to WARN'
 
 run_mocked_domain_check \
+  '200|200|200' \
+  '0.010|0.020|0.030' \
+  '0|0|0' \
+  '||' \
+  1 \
+  '' \
+  '0.005|0.006|0.007' \
+  1 \
+  0 \
+  2000000000 \
+  1900000000 \
+  0 \
+  0 \
+  example.com \
+  1
+assert_equal '0' "$MOCK_RUN_STATUS" \
+  'independent TCP probe failure is recoverable after successful TLS and HTTP'
+assert_not_contains 'TCP 443 不可达' "$MOCK_RUN_OUTPUT" \
+  'successful TLS and HTTP evidence confirms TCP after a transient probe failure'
+assert_not_contains 'DNS 无法解析' "$MOCK_RUN_OUTPUT" \
+  'resolved address is not mislabeled as DNS failure'
+
+run_mocked_domain_check \
   '000|000|000' \
   '0|0|0' \
   '7|7|7' \
@@ -1473,13 +1555,20 @@ run_mocked_domain_check \
   0 \
   '' \
   '0|0|0' \
-  0
+  0 \
+  0 \
+  2000000000 \
+  1900000000 \
+  1 \
+  1 \
+  example.com \
+  1
 assert_equal '1' "$MOCK_RUN_STATUS" \
-  'TCP 443 failure is a hard failure'
+  'TCP 443 remains a hard failure when every connection attempt fails'
 assert_contains 'TCP 443 不可达' "$MOCK_RUN_OUTPUT" \
-  'TCP 443 failure has a distinct reason'
-assert_not_contains 'DNS 无法解析' "$MOCK_RUN_OUTPUT" \
-  'resolved address is not mislabeled as DNS failure'
+  'TCP failure is reported only after all connection evidence is exhausted'
+assert_contains 'HTTP 请求失败' "$MOCK_RUN_OUTPUT" \
+  'true TCP failure retains the HTTP request failure detail'
 
 run_mocked_domain_check \
   '000|000|000' \
