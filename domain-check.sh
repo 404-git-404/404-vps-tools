@@ -8,6 +8,7 @@ readonly MAX_CONCURRENCY=8
 readonly DOMAIN_HARD_TIMEOUT=90
 readonly DOMAIN_TERMINATE_GRACE=2
 readonly DNS_TIMEOUT=6
+readonly TCP_TIMEOUT=6
 readonly TLS_TIMEOUT=10
 readonly HTTP_TIMEOUT=10
 readonly HTTP_USER_AGENT='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0 Safari/537.36'
@@ -777,7 +778,6 @@ check_domain() {
   local http_code=''
   local location=''
   local http_5xx_count=0
-  local tcp_evidence=false
   local curl_command_ok=false
   local tls_command_ok=false
   local x25519_command_ok=false
@@ -799,6 +799,7 @@ check_domain() {
   local dns_a_file="$TEMP_DIR/dns-a-$index"
   local dns_aaaa_file="$TEMP_DIR/dns-aaaa-$index"
   local dns_cname_file="$TEMP_DIR/dns-cname-$index"
+  local tcp_file="$TEMP_DIR/tcp-$index"
   local tls_file="$TEMP_DIR/tls-$index"
   local x25519_file="$TEMP_DIR/x25519-$index"
   local leaf_certificate_file="$TEMP_DIR/leaf-certificate-$index"
@@ -842,6 +843,12 @@ check_domain() {
     openssl_target=$(openssl_target_for_ip "$ip")
     curl_resolve=$(curl_resolve_for_ip "$domain" "$ip")
 
+    if run_network_command "$tcp_file" "$TCP_TIMEOUT" \
+      bash -c "exec 3<>\"/dev/tcp/\$1/443\"; exec 3<&-; exec 3>&-" \
+        bash "$ip"; then
+      tcp_status='PASS'
+    fi
+
     if run_network_command "$tls_file" "$TLS_TIMEOUT" \
       openssl s_client -connect "$openssl_target" -servername "$domain" \
         -tls1_3 -alpn h2 -verify_hostname "$domain" -verify_return_error \
@@ -881,7 +888,7 @@ check_domain() {
       attempt_time_connect=$(extract_curl_metric "$http_output_file" 3)
       attempt_time_appconnect=$(extract_curl_metric "$http_output_file" 4)
       if positive_seconds "$attempt_time_connect"; then
-        tcp_evidence=true
+        tcp_status='PASS'
       fi
       if positive_seconds "$attempt_time_appconnect" &&
         attempt_ready_ms=$(seconds_to_milliseconds \
@@ -892,6 +899,7 @@ check_domain() {
         "$attempt_http_code" =~ ^[0-9]{3}$ &&
         "$attempt_http_code" != '000' ]]; then
         attempt_request_ok=true
+        tcp_status='PASS'
         attempt_http_status=$attempt_http_code
         attempt_location=$(extract_location "$http_header_file")
       fi
@@ -903,7 +911,7 @@ check_domain() {
     if [[ "$tls_command_ok" == true ]] &&
       tls13_evidence_present "$tls_file"; then
       tls_status='PASS'
-      tcp_evidence=true
+      tcp_status='PASS'
     fi
     if [[ "$tls_command_ok" == true ]] &&
       h2_evidence_present "$tls_file"; then
@@ -912,7 +920,7 @@ check_domain() {
     if [[ "$x25519_command_ok" == true ]] &&
       x25519_evidence_present "$x25519_file"; then
       x25519_status='PASS'
-      tcp_evidence=true
+      tcp_status='PASS'
     fi
     if [[ "$tls_command_ok" == true ]] &&
       certificate_verified_evidence_present "$tls_file"; then
@@ -945,9 +953,7 @@ check_domain() {
     aggregate_ready_samples
   fi
 
-  if [[ "$tcp_evidence" == true ]]; then
-    tcp_status='PASS'
-  elif [[ "$dns_status" == 'PASS' ]]; then
+  if [[ "$dns_status" == 'PASS' && "$tcp_status" == 'FAIL' ]]; then
     append_reason 'TCP 443 不可达'
   fi
   if [[ "$dns_status" == 'PASS' && "$tcp_status" == 'PASS' ]]; then
