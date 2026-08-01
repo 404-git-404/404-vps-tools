@@ -60,6 +60,24 @@ assert_not_contains() {
     fail "$description: unexpectedly contained [$unexpected]"
 }
 
+assert_less_or_equal() {
+  local maximum=$1
+  local actual=$2
+  local description=$3
+  (( TEST_COUNT += 1 ))
+  (( actual <= maximum )) ||
+    fail "$description: expected at most [$maximum], got [$actual]"
+}
+
+assert_greater_or_equal() {
+  local minimum=$1
+  local actual=$2
+  local description=$3
+  (( TEST_COUNT += 1 ))
+  (( actual >= minimum )) ||
+    fail "$description: expected at least [$minimum], got [$actual]"
+}
+
 assert_in_order() {
   local actual=$1
   local description=$2
@@ -523,29 +541,34 @@ assert_file_not_contains 'DOMAIN_CHECK_SAMPLE' "$DOMAIN_CHECK_SCRIPT" \
   'there is no environment variable for changing sample count'
 assert_file_not_contains 'TLS_SAMPLES' "$DOMAIN_CHECK_SCRIPT" \
   'there is no alternate TLS sample-count control'
-assert_equal '1' "$MAX_CONCURRENCY" \
-  'domain workers are restricted to strict serial execution'
+assert_equal '8' "$MAX_CONCURRENCY" \
+  'domain workers use the fixed eight-worker limit'
 assert_file_contains 'trap handle_interrupt INT TERM' "$DOMAIN_CHECK_SCRIPT" \
   'worker signal cleanup path remains installed'
 assert_file_contains 'terminate_workers' "$DOMAIN_CHECK_SCRIPT" \
   'worker termination cleanup remains available'
 
-serial_driver="$TEST_TEMP_DIR/serial-scheduler-driver.sh"
-serial_events="$TEST_TEMP_DIR/serial-scheduler-events"
-serial_lock="$TEST_TEMP_DIR/serial-scheduler-active"
+scheduler_driver="$TEST_TEMP_DIR/concurrent-scheduler-driver.sh"
+scheduler_progress="$TEST_TEMP_DIR/concurrent-scheduler-progress"
+scheduler_lock="$TEST_TEMP_DIR/concurrent-scheduler-lock"
+scheduler_active="$TEST_TEMP_DIR/concurrent-scheduler-active"
+scheduler_max="$TEST_TEMP_DIR/concurrent-scheduler-max"
 {
   printf '%s\n' '#!/usr/bin/env bash' 'set -Eeuo pipefail'
   printf '%s\n' 'export DOMAIN_CHECK_SOURCE_ONLY=1'
   printf 'source %q\n' "$DOMAIN_CHECK_SCRIPT"
-  printf 'readonly SERIAL_EVENT_FILE=%q\n' "$serial_events"
-  printf 'readonly SERIAL_LOCK_DIR=%q\n' "$serial_lock"
-  cat <<'SERIAL_DRIVER'
+  printf 'readonly SCHEDULER_LOCK_DIR=%q\n' "$scheduler_lock"
+  printf 'readonly SCHEDULER_ACTIVE_FILE=%q\n' "$scheduler_active"
+  printf 'readonly SCHEDULER_MAX_FILE=%q\n' "$scheduler_max"
+  cat <<'SCHEDULER_DRIVER'
 parse_domain_argument() {
-  DOMAIN_INPUTS=(
-    first.example.com
-    second.example.com
-    third.example.com
-  )
+  local domain
+  local number
+  DOMAIN_INPUTS=()
+  for (( number = 1; number <= 45; number += 1 )); do
+    printf -v domain 'd%02d.example.com' "$number"
+    DOMAIN_INPUTS+=("$domain")
+  done
 }
 
 check_dependencies() {
@@ -559,40 +582,68 @@ initialize_output_style() {
 check_domain() {
   local index=$1
   local domain=$2
-  local acquired_lock=false
+  local active_count
+  local maximum_count
 
-  printf 'start:%s\n' "$domain" >>"$SERIAL_EVENT_FILE"
-  if mkdir "$SERIAL_LOCK_DIR" 2>/dev/null; then
-    acquired_lock=true
-  else
-    printf 'overlap:%s\n' "$domain" >>"$SERIAL_EVENT_FILE"
+  while ! mkdir "$SCHEDULER_LOCK_DIR" 2>/dev/null; do
+    sleep 0.01
+  done
+  active_count=$(<"$SCHEDULER_ACTIVE_FILE")
+  maximum_count=$(<"$SCHEDULER_MAX_FILE")
+  (( active_count += 1 ))
+  printf '%s\n' "$active_count" >"$SCHEDULER_ACTIVE_FILE"
+  if (( active_count > maximum_count )); then
+    printf '%s\n' "$active_count" >"$SCHEDULER_MAX_FILE"
   fi
-  sleep 0.2
+  rmdir "$SCHEDULER_LOCK_DIR"
+
+  sleep 0.12
   printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
     "$domain" 203.0.113.10 PASS PASS PASS 20 30 - 200 - PASS - \
     >"$TEMP_DIR/result-$index"
-  if [[ "$acquired_lock" == true ]]; then
-    rmdir "$SERIAL_LOCK_DIR"
-  fi
-  printf 'end:%s\n' "$domain" >>"$SERIAL_EVENT_FILE"
+
+  while ! mkdir "$SCHEDULER_LOCK_DIR" 2>/dev/null; do
+    sleep 0.01
+  done
+  active_count=$(<"$SCHEDULER_ACTIVE_FILE")
+  (( active_count -= 1 ))
+  printf '%s\n' "$active_count" >"$SCHEDULER_ACTIVE_FILE"
+  rmdir "$SCHEDULER_LOCK_DIR"
 }
 
 print_results() {
-  RESULT_STATUSES=(PASS PASS PASS)
+  local index
+  local domain
+  RESULT_STATUSES=()
+  for index in "${!DOMAIN_INPUTS[@]}"; do
+    IFS=$'\t' read -r domain _ <"$TEMP_DIR/result-$index"
+    printf '%s\n' "$domain"
+    RESULT_STATUSES+=(PASS)
+  done
 }
 
-main first.example.com/second.example.com/third.example.com
-SERIAL_DRIVER
-} >"$serial_driver"
-: >"$serial_events"
-bash "$serial_driver"
-serial_event_output=$(<"$serial_events")
-assert_not_contains 'overlap:' "$serial_event_output" \
-  'high-fidelity scheduler never overlaps domain workers'
-assert_equal \
-  $'start:first.example.com\nend:first.example.com\nstart:second.example.com\nend:second.example.com\nstart:third.example.com\nend:third.example.com' \
-  "$serial_event_output" \
-  'each domain starts only after the previous worker fully ends'
+main ignored.example.com
+SCHEDULER_DRIVER
+} >"$scheduler_driver"
+printf '0\n' >"$scheduler_active"
+printf '0\n' >"$scheduler_max"
+scheduler_output=$(bash "$scheduler_driver" 2>"$scheduler_progress")
+assert_less_or_equal '8' "$(<"$scheduler_max")" \
+  '45-domain scheduler never exceeds eight concurrent workers'
+assert_greater_or_equal '2' "$(<"$scheduler_max")" \
+  '45-domain scheduler actually runs domain workers concurrently'
+assert_equal '45' \
+  "$(grep -Ec '^\[[0-9]+/45\] d[0-9]{2}[.]example[.]com$' \
+    "$scheduler_progress")" \
+  'parent reports one completion progress line for every domain'
+scheduler_expected_domains=()
+for (( scheduler_number = 1; scheduler_number <= 45; scheduler_number += 1 )); do
+  printf -v scheduler_domain 'd%02d.example.com' "$scheduler_number"
+  scheduler_expected_domains+=("$scheduler_domain")
+done
+assert_in_order "$scheduler_output" \
+  '45-domain final output preserves input order' \
+  "${scheduler_expected_domains[@]}"
 
 sleep 30 &
 cleanup_worker_pid=$!
@@ -792,23 +843,36 @@ EOF
 cat >"$MOCK_BIN/curl" <<'EOF'
 #!/usr/bin/env bash
 set -Eeuo pipefail
-counter_file="$MOCK_LOG_DIR/curl.count"
-counter=$(<"$counter_file")
-counter=$(( counter + 1 ))
-printf '%s\n' "$counter" >"$counter_file"
+global_counter_file="$MOCK_LOG_DIR/curl.count"
+global_counter=$(<"$global_counter_file")
+global_counter=$(( global_counter + 1 ))
+printf '%s\n' "$global_counter" >"$global_counter_file"
 printf '<%s>' "$@" >>"$MOCK_LOG_DIR/curl.log"
 printf '\n' >>"$MOCK_LOG_DIR/curl.log"
 
 header_file=''
+request_url=''
 while (( $# > 0 )); do
   case "$1" in
     --dump-header)
       shift
       header_file=$1
       ;;
+    https://*)
+      request_url=$1
+      ;;
   esac
   shift
 done
+
+request_domain=${request_url#https://}
+request_domain=${request_domain%/}
+safe_domain=${request_domain//[^a-zA-Z0-9]/_}
+counter_file="$MOCK_LOG_DIR/curl-domain-$safe_domain.count"
+counter=0
+[[ ! -r "$counter_file" ]] || counter=$(<"$counter_file")
+counter=$(( counter + 1 ))
+printf '%s\n' "$counter" >"$counter_file"
 
 IFS='|' read -r -a codes <<<"$MOCK_HTTP_CODES"
 IFS='|' read -r -a connect_times <<<"$MOCK_CONNECT_TIMES"
@@ -900,6 +964,7 @@ run_mocked_domain_check() {
 
   mkdir -p "$TEST_TEMP_DIR/worker-tmp"
   printf '0\n' >"$MOCK_LOG_DIR/curl.count"
+  rm -f -- "$MOCK_LOG_DIR"/curl-domain-*.count
   : >"$MOCK_LOG_DIR/curl.log"
   : >"$MOCK_LOG_DIR/openssl.log"
   : >"$MOCK_LOG_DIR/timeout.log"
@@ -1008,7 +1073,7 @@ run_mocked_domain_check \
   '0|0|0|0|0|0|0|0|0' \
   '||||||||' \
   1 \
-  'CF-Ray: serial-SIN' \
+  'CF-Ray: concurrent-SIN' \
   '0.100|0.200|0.050|0.300|0.400|0.250|0.500|0.600|0.450' \
   1 \
   0 \
@@ -1018,30 +1083,317 @@ run_mocked_domain_check \
   0 \
   'first.example.com/second.example.com/third.example.com'
 assert_equal '0' "$MOCK_RUN_STATUS" \
-  'three-domain high-fidelity serial run succeeds'
+  'three-domain high-fidelity concurrent run succeeds'
 assert_equal '9' "$(<"$MOCK_LOG_DIR/curl.count")" \
   'three domains still perform exactly three curl samples each'
-for serial_domain in \
+for concurrent_domain in \
   first.example.com second.example.com third.example.com; do
   assert_equal '3' \
-    "$(grep -Fc "<https://$serial_domain/>" "$MOCK_LOG_DIR/curl.log")" \
-    "$serial_domain performs three independent curl samples"
+    "$(grep -Fc "<https://$concurrent_domain/>" "$MOCK_LOG_DIR/curl.log")" \
+    "$concurrent_domain performs three independent curl samples"
 done
 assert_in_order "$MOCK_RUN_OUTPUT" \
   'three-domain output preserves input order' \
   first.example.com second.example.com third.example.com
 assert_contains '| 222       |' "$MOCK_RUN_OUTPUT" \
   'first domain READY is the median of its full time_appconnect samples'
-assert_contains '| 555       |' "$MOCK_RUN_OUTPUT" \
-  'second domain READY is the median of its full time_appconnect samples'
-assert_contains '| 888       |' "$MOCK_RUN_OUTPUT" \
-  'third domain READY is the median of its full time_appconnect samples'
-for serial_ready in 222 555 888; do
-  assert_contains \
-    "| PASS   | PASS   | PASS | $serial_ready       | 1157    | HIGH | 200  | -        | PASS   |" \
-    "$MOCK_RUN_OUTPUT" \
-    "READY $serial_ready row preserves TLS, X25519, H2, certificate, CDN, HTTP, redirect, and result"
+assert_equal '3' \
+  "$(grep -Fc '| 222       |' <<<"$MOCK_RUN_OUTPUT")" \
+  'every concurrent domain keeps the median of its own three samples'
+assert_equal '3' \
+  "$(grep -Fc \
+    '| PASS   | PASS   | PASS | 222       | 1157    | HIGH | 200  | -        | PASS   |' \
+    <<<"$MOCK_RUN_OUTPUT")" \
+  'concurrent rows preserve TLS, X25519, H2, certificate, CDN, HTTP, redirect, and result'
+
+BATCH_SCRIPT="$TEST_TEMP_DIR/domain-check-batch-timeout.sh"
+BATCH_DRIVER="$TEST_TEMP_DIR/domain-check-batch-driver.sh"
+BATCH_BIN="$TEST_TEMP_DIR/batch-mock-bin"
+BATCH_LOG_DIR="$TEST_TEMP_DIR/batch-mock-log"
+BATCH_BLOCK_PID_DIR="$BATCH_LOG_DIR/block-pids"
+BATCH_COUNTER_LOCK="$BATCH_LOG_DIR/curl-counter-lock"
+BATCH_CURL_ACTIVE="$BATCH_LOG_DIR/curl-active"
+BATCH_CURL_MAX="$BATCH_LOG_DIR/curl-max"
+BATCH_STDOUT="$TEST_TEMP_DIR/batch-stdout"
+BATCH_STDERR="$TEST_TEMP_DIR/batch-stderr"
+mkdir -p "$BATCH_BIN" "$BATCH_BLOCK_PID_DIR" \
+  "$TEST_TEMP_DIR/batch-worker-tmp"
+sed \
+  -e 's/^readonly DOMAIN_HARD_TIMEOUT=90$/readonly DOMAIN_HARD_TIMEOUT=4/' \
+  -e 's/^readonly DOMAIN_TERMINATE_GRACE=2$/readonly DOMAIN_TERMINATE_GRACE=1/' \
+  -e 's/^readonly DNS_TIMEOUT=6$/readonly DNS_TIMEOUT=1/' \
+  -e 's/^readonly TLS_TIMEOUT=10$/readonly TLS_TIMEOUT=1/' \
+  -e 's/^readonly HTTP_TIMEOUT=10$/readonly HTTP_TIMEOUT=1/' \
+  "$DOMAIN_CHECK_SCRIPT" >"$BATCH_SCRIPT"
+chmod +x "$BATCH_SCRIPT"
+
+{
+  printf '%s\n' '#!/usr/bin/env bash' 'set -Eeuo pipefail'
+  printf '%s\n' 'export DOMAIN_CHECK_SOURCE_ONLY=1'
+  printf 'source %q\n' "$BATCH_SCRIPT"
+  cat <<'EOF'
+eval "$(declare -f check_domain |
+  sed '1s/^check_domain /original_check_domain /')"
+check_domain() {
+  local index=$1
+  local domain=$2
+  case "$domain" in
+    dig-block.example.com|openssl-block.example.com|curl-block.example.com|hard-timeout.example.com)
+      original_check_domain "$index" "$domain"
+      ;;
+    d0[5-8].example.com)
+      ACTIVE_PID_FILE="$TEMP_DIR/active-pid-$index"
+      READY_SAMPLE_LOCK_HELD=false
+      acquire_ready_sample_lock
+      for sample_number in 1 2 3; do
+        run_network_command "$TEMP_DIR/sample-$index-$sample_number" \
+          "$HTTP_TIMEOUT" curl --dump-header \
+          "$TEMP_DIR/header-$index-$sample_number" \
+          "https://$domain/" || :
+      done
+      release_ready_sample_lock
+      printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "$domain" 203.0.113.45 PASS PASS PASS 20 30 - 200 - PASS - \
+        >"$TEMP_DIR/result-$index"
+      ;;
+    *)
+      printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "$domain" 203.0.113.45 PASS PASS PASS 20 30 - 200 - PASS - \
+        >"$TEMP_DIR/result-$index"
+      ;;
+  esac
+}
+main "$@"
+EOF
+} >"$BATCH_DRIVER"
+chmod +x "$BATCH_DRIVER"
+
+cat >"$BATCH_BIN/timeout" <<'EOF'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+if [[ " $* " == *' hard-timeout.example.com '* ]]; then
+  printf '%s\n' "$$" >"$BATCH_BLOCK_PID_DIR/hard-timeout.pid"
+  exec sleep 300
+fi
+exec "$REAL_TIMEOUT" "$@"
+EOF
+
+cat >"$BATCH_BIN/dig" <<'EOF'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+domain=${*: -1}
+if [[ "$domain" == dig-block.example.com ]]; then
+  printf '%s\n' "$$" >"$BATCH_BLOCK_PID_DIR/dig.pid"
+  exec sleep 300
+fi
+if [[ "$domain" =~ ^d(0[9]|[1-3][0-9]|4[0-5])[.]example[.]com$ ]]; then
+  exit 0
+fi
+case " $* " in
+  *' A '*) printf '%s\n' '203.0.113.45' ;;
+esac
+EOF
+
+cat >"$BATCH_BIN/getent" <<'EOF'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+exit 1
+EOF
+
+cat >"$BATCH_BIN/openssl" <<'EOF'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+if [[ ${1:-} == x509 ]]; then
+  printf 'notAfter=Aug 30 00:00:00 2026 GMT\n'
+  exit 0
+fi
+if [[ " $* " == *' openssl-block.example.com '* ]]; then
+  printf '%s\n' "$$" >"$BATCH_BLOCK_PID_DIR/openssl.pid"
+  exec sleep 300
+fi
+if [[ " $* " == *' -groups X25519 '* ]]; then
+  printf '%s\n' \
+    'New, TLSv1.3, Cipher is TLS_AES_256_GCM_SHA384' \
+    'Peer Temp Key: X25519, 253 bits'
+else
+  printf '%s\n' \
+    'New, TLSv1.3, Cipher is TLS_AES_256_GCM_SHA384' \
+    'ALPN protocol: h2' \
+    '-----BEGIN CERTIFICATE-----' \
+    'offline-fixture' \
+    '-----END CERTIFICATE-----' \
+    'Verify return code: 0 (ok)'
+fi
+EOF
+
+cat >"$BATCH_BIN/curl" <<'EOF'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+header_file=''
+request_url=''
+while (( $# > 0 )); do
+  case "$1" in
+    --dump-header)
+      shift
+      header_file=$1
+      ;;
+    https://*)
+      request_url=$1
+      ;;
+  esac
+  shift
 done
+
+if [[ "$request_url" == 'https://curl-block.example.com/' ]]; then
+  printf '%s\n' "$$" >"$BATCH_BLOCK_PID_DIR/curl.pid"
+  exec sleep 300
+fi
+
+while ! mkdir "$BATCH_COUNTER_LOCK" 2>/dev/null; do
+  sleep 0.01
+done
+active=$(<"$BATCH_CURL_ACTIVE")
+maximum=$(<"$BATCH_CURL_MAX")
+(( active += 1 ))
+printf '%s\n' "$active" >"$BATCH_CURL_ACTIVE"
+if (( active > maximum )); then
+  printf '%s\n' "$active" >"$BATCH_CURL_MAX"
+fi
+rmdir "$BATCH_COUNTER_LOCK"
+
+sleep 0.02
+: >"$header_file"
+printf 'HTTP/1.1 200 Mock\r\n\r\n' >"$header_file"
+printf 'DOMAIN_CHECK_METRICS\t200\t0.005\t0.020\n'
+
+while ! mkdir "$BATCH_COUNTER_LOCK" 2>/dev/null; do
+  sleep 0.01
+done
+active=$(<"$BATCH_CURL_ACTIVE")
+(( active -= 1 ))
+printf '%s\n' "$active" >"$BATCH_CURL_ACTIVE"
+rmdir "$BATCH_COUNTER_LOCK"
+EOF
+
+cat >"$BATCH_BIN/date" <<'EOF'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+if [[ " $* " == *' -d '* ]]; then
+  printf '%s\n' '2000000000'
+else
+  printf '%s\n' '1900000000'
+fi
+EOF
+
+chmod +x "$BATCH_BIN"/*
+printf '0\n' >"$BATCH_CURL_ACTIVE"
+printf '0\n' >"$BATCH_CURL_MAX"
+batch_domains=(
+  dig-block.example.com
+  openssl-block.example.com
+  curl-block.example.com
+  hard-timeout.example.com
+)
+for (( batch_number = 5; batch_number <= 45; batch_number += 1 )); do
+  printf -v batch_domain 'd%02d.example.com' "$batch_number"
+  batch_domains+=("$batch_domain")
+done
+printf -v batch_argument '%s/' "${batch_domains[@]}"
+batch_argument=${batch_argument%/}
+real_timeout=$(command -v timeout)
+batch_started=$SECONDS
+set +e
+PATH="$BATCH_BIN:$PATH" \
+  REAL_TIMEOUT="$real_timeout" \
+  BATCH_BLOCK_PID_DIR="$BATCH_BLOCK_PID_DIR" \
+  BATCH_COUNTER_LOCK="$BATCH_COUNTER_LOCK" \
+  BATCH_CURL_ACTIVE="$BATCH_CURL_ACTIVE" \
+  BATCH_CURL_MAX="$BATCH_CURL_MAX" \
+  TMPDIR="$TEST_TEMP_DIR/batch-worker-tmp" \
+  DOMAIN_CHECK_SOURCE_ONLY=0 \
+  "$real_timeout" 20 bash "$BATCH_DRIVER" "$batch_argument" \
+  >"$BATCH_STDOUT" 2>"$BATCH_STDERR"
+batch_status=$?
+set -e
+batch_elapsed=$(( SECONDS - batch_started ))
+batch_output=$(<"$BATCH_STDOUT")
+batch_progress=$(<"$BATCH_STDERR")
+
+assert_equal '1' "$batch_status" \
+  '45-domain blocked-command run finishes with domain failures, not a batch timeout'
+assert_less_or_equal '19' "$batch_elapsed" \
+  '45-domain blocked-command run completes within the deterministic outer limit'
+assert_equal '1' "$(<"$BATCH_CURL_MAX")" \
+  'only the three READY curl samples are serialized across domain workers'
+assert_equal '45' \
+  "$(grep -Ec '^\[[0-9]+/45\] ' "$BATCH_STDERR")" \
+  '45-domain blocked-command run reports every completion'
+assert_contains '[45/45]' "$batch_progress" \
+  'completion progress reaches the full domain count'
+assert_contains '单域名检测超时（4 秒）' "$batch_output" \
+  'hard-timeout domain receives an explicit complete timeout result'
+assert_not_contains 'worker failed' "$batch_progress" \
+  'a timed-out domain never aborts the complete batch'
+assert_in_order "$batch_output" \
+  'blocked-command final table preserves all 45 domains in input order' \
+  "${batch_domains[@]}"
+for batch_domain in "${batch_domains[@]}"; do
+  escaped_batch_domain=${batch_domain//./[.]}
+  assert_equal '1' \
+    "$(grep -Ec \
+      "^\\|[[:space:]]+${escaped_batch_domain}[[:space:]]+\\|" \
+      "$BATCH_STDOUT")" \
+    "$batch_domain has exactly one complete result row"
+done
+
+batch_orphans=0
+shopt -s nullglob
+for blocker_pid_file in "$BATCH_BLOCK_PID_DIR"/*.pid; do
+  blocker_pid=$(<"$blocker_pid_file")
+  if kill -0 "$blocker_pid" 2>/dev/null; then
+    (( batch_orphans += 1 ))
+    kill -KILL "$blocker_pid" 2>/dev/null || :
+  fi
+done
+shopt -u nullglob
+assert_equal '0' "$batch_orphans" \
+  'blocked dig, OpenSSL, curl, timeout, and their children leave no orphan process'
+
+main_block=$(sed -n '/^main() {/,/^}/p' "$DOMAIN_CHECK_SCRIPT")
+# The first marker intentionally contains literal shell variable syntax.
+# shellcheck disable=SC2016
+assert_in_order "$main_block" \
+  'transient progress is cleared before the final table is rendered' \
+  'while (( ${#WORKER_PIDS[@]} > 0 ))' 'clear_progress' 'print_results'
+
+rm -f -- "$BATCH_BLOCK_PID_DIR"/*.pid
+INTERRUPT_OUTPUT="$TEST_TEMP_DIR/interrupt-output"
+set +e
+PATH="$BATCH_BIN:$PATH" \
+  REAL_TIMEOUT="$real_timeout" \
+  BATCH_BLOCK_PID_DIR="$BATCH_BLOCK_PID_DIR" \
+  BATCH_COUNTER_LOCK="$BATCH_COUNTER_LOCK" \
+  BATCH_CURL_ACTIVE="$BATCH_CURL_ACTIVE" \
+  BATCH_CURL_MAX="$BATCH_CURL_MAX" \
+  TMPDIR="$TEST_TEMP_DIR/batch-worker-tmp" \
+  DOMAIN_CHECK_SOURCE_ONLY=0 \
+  "$real_timeout" --preserve-status --signal=INT --kill-after=5 1 \
+  bash "$BATCH_DRIVER" hard-timeout.example.com \
+  >"$INTERRUPT_OUTPUT" 2>&1
+interrupt_status=$?
+set -e
+assert_equal 'true' \
+  "$([[ -s "$BATCH_BLOCK_PID_DIR/hard-timeout.pid" ]] && printf true || printf false)" \
+  'interrupt fixture reaches a permanently blocked timeout child'
+assert_equal '130' "$interrupt_status" \
+  'Ctrl+C preserves the conventional interrupted exit status'
+interrupt_blocker_pid=$(<"$BATCH_BLOCK_PID_DIR/hard-timeout.pid")
+set +e
+kill -0 "$interrupt_blocker_pid" 2>/dev/null
+interrupt_blocker_alive=$?
+set -e
+assert_equal '1' "$interrupt_blocker_alive" \
+  'Ctrl+C terminates the active timeout process and its blocking command'
 
 run_mocked_domain_check \
   '200|200|200' \

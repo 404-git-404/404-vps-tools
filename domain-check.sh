@@ -4,7 +4,9 @@ set -Eeuo pipefail
 
 readonly PROGRAM_NAME='domain-check'
 readonly USAGE_TEXT='Usage: domain-check domain1.com/domain2.com/domain3.com'
-readonly MAX_CONCURRENCY=1
+readonly MAX_CONCURRENCY=8
+readonly DOMAIN_HARD_TIMEOUT=90
+readonly DOMAIN_TERMINATE_GRACE=2
 readonly DNS_TIMEOUT=6
 readonly TLS_TIMEOUT=10
 readonly HTTP_TIMEOUT=10
@@ -12,10 +14,18 @@ readonly HTTP_USER_AGENT='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KH
 
 declare -a DOMAIN_INPUTS=()
 declare -a WORKER_PIDS=()
+declare -A WORKER_INDEX_BY_PID=()
 declare -a RESULT_STATUSES=()
 TEMP_DIR=''
 COLOR_ENABLED=false
 ACTIVE_PID=''
+ACTIVE_PID_FILE=''
+DOMAIN_CHILD_PID=''
+DOMAIN_TIMER_PID=''
+DOMAIN_ACTIVE_PID_FILE=''
+READY_SAMPLE_LOCK_HELD=false
+COMPLETED_COUNT=0
+PROGRESS_WIDTH=0
 REASONS=''
 REDIRECT_STATUS='PASS'
 REDIRECT_DETAIL='-'
@@ -354,6 +364,50 @@ append_reason() {
   fi
 }
 
+release_ready_sample_lock_for_pid() {
+  local owner_pid=$1
+  local lock_dir="$TEMP_DIR/ready-sample-lock"
+  local owner_file="$lock_dir/owner"
+  local recorded_pid=''
+
+  [[ -r "$owner_file" ]] || return 0
+  IFS= read -r recorded_pid <"$owner_file" || :
+  [[ "$recorded_pid" == "$owner_pid" ]] || return 0
+  rm -f -- "$owner_file"
+  rmdir -- "$lock_dir" 2>/dev/null || :
+}
+
+release_ready_sample_lock() {
+  if [[ "$READY_SAMPLE_LOCK_HELD" == true ]]; then
+    release_ready_sample_lock_for_pid "$BASHPID"
+    READY_SAMPLE_LOCK_HELD=false
+  fi
+}
+
+acquire_ready_sample_lock() {
+  local lock_dir="$TEMP_DIR/ready-sample-lock"
+
+  while ! mkdir -- "$lock_dir" 2>/dev/null; do
+    sleep 0.05
+  done
+  printf '%s\n' "$BASHPID" >"$lock_dir/owner"
+  READY_SAMPLE_LOCK_HELD=true
+}
+
+terminate_pid_with_grace() {
+  local pid=$1
+  local ticks=0
+  local max_ticks=$(( DOMAIN_TERMINATE_GRACE * 10 ))
+
+  [[ "$pid" =~ ^[0-9]+$ ]] || return 0
+  kill -TERM "$pid" 2>/dev/null || return 0
+  while kill -0 "$pid" 2>/dev/null && (( ticks < max_ticks )); do
+    sleep 0.1
+    (( ticks += 1 ))
+  done
+  kill -KILL "$pid" 2>/dev/null || :
+}
+
 run_network_command() {
   local output_file=$1
   local timeout_seconds=$2
@@ -363,21 +417,28 @@ run_network_command() {
   timeout --signal=TERM --kill-after=2 "$timeout_seconds" \
     "$@" </dev/null >"$output_file" 2>&1 &
   ACTIVE_PID=$!
+  if [[ -n "$ACTIVE_PID_FILE" ]]; then
+    printf '%s\n' "$ACTIVE_PID" >"$ACTIVE_PID_FILE"
+  fi
   if wait "$ACTIVE_PID"; then
     status=0
   else
     status=$?
   fi
   ACTIVE_PID=''
+  [[ -z "$ACTIVE_PID_FILE" ]] || rm -f -- "$ACTIVE_PID_FILE"
   return "$status"
 }
 
 worker_signal() {
   trap - INT TERM
   if [[ -n "$ACTIVE_PID" ]]; then
-    kill -TERM "$ACTIVE_PID" 2>/dev/null || :
+    terminate_pid_with_grace "$ACTIVE_PID"
     wait "$ACTIVE_PID" 2>/dev/null || :
   fi
+  ACTIVE_PID=''
+  [[ -z "$ACTIVE_PID_FILE" ]] || rm -f -- "$ACTIVE_PID_FILE"
+  release_ready_sample_lock
   exit 130
 }
 
@@ -746,6 +807,8 @@ check_domain() {
 
   trap - EXIT ERR
   trap worker_signal INT TERM
+  ACTIVE_PID_FILE="$TEMP_DIR/active-pid-$index"
+  READY_SAMPLE_LOCK_HELD=false
   REASONS=''
 
   if command -v dig >/dev/null 2>&1; then
@@ -792,6 +855,7 @@ check_domain() {
     fi
 
     reset_http_retry_state
+    acquire_ready_sample_lock
     for attempt in 1 2 3; do
       attempt_request_ok=false
       attempt_http_code=''
@@ -834,6 +898,7 @@ check_domain() {
       record_http_attempt "$attempt" "$attempt_request_ok" \
         "$attempt_http_status" "$attempt_location" "$http_header_file"
     done
+    release_ready_sample_lock
 
     if [[ "$tls_command_ok" == true ]] &&
       tls13_evidence_present "$tls_file"; then
@@ -944,6 +1009,89 @@ check_domain() {
     "$domain" "$ip" "$tls_status" "$x25519_status" "$h2_status" \
     "$ready_ms" "$certificate_days" "$cdn_status" "$http_status" \
     "$redirect_code" "$final_status" "$REASONS" >"$result_file"
+  rm -f -- "$ACTIVE_PID_FILE"
+}
+
+write_domain_failure_result() {
+  local index=$1
+  local domain=$2
+  local reason=$3
+
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$domain" - FAIL FAIL FAIL - FAIL - - - FAIL "$reason" \
+    >"$TEMP_DIR/result-$index"
+}
+
+terminate_domain_child() {
+  local child_pid=$1
+  local active_pid_file=$2
+  local active_pid=''
+
+  if [[ -r "$active_pid_file" ]]; then
+    IFS= read -r active_pid <"$active_pid_file" || :
+  fi
+  if [[ "$active_pid" =~ ^[0-9]+$ ]]; then
+    kill -TERM "$active_pid" 2>/dev/null || :
+  fi
+  terminate_pid_with_grace "$child_pid"
+  if [[ "$active_pid" =~ ^[0-9]+$ ]]; then
+    kill -KILL "$active_pid" 2>/dev/null || :
+  fi
+  wait "$child_pid" 2>/dev/null || :
+  release_ready_sample_lock_for_pid "$child_pid"
+  rm -f -- "$active_pid_file"
+}
+
+domain_worker_signal() {
+  trap - INT TERM
+  if [[ -n "$DOMAIN_TIMER_PID" ]]; then
+    kill -TERM "$DOMAIN_TIMER_PID" 2>/dev/null || :
+    wait "$DOMAIN_TIMER_PID" 2>/dev/null || :
+  fi
+  if [[ -n "$DOMAIN_CHILD_PID" ]]; then
+    terminate_domain_child "$DOMAIN_CHILD_PID" "$DOMAIN_ACTIVE_PID_FILE"
+  fi
+  exit 130
+}
+
+run_domain_worker() {
+  local index=$1
+  local domain=$2
+  local completed_pid=''
+  local child_status=0
+
+  DOMAIN_ACTIVE_PID_FILE="$TEMP_DIR/active-pid-$index"
+  trap domain_worker_signal INT TERM
+
+  check_domain "$index" "$domain" &
+  DOMAIN_CHILD_PID=$!
+  sleep "$DOMAIN_HARD_TIMEOUT" &
+  DOMAIN_TIMER_PID=$!
+
+  if wait -n -p completed_pid "$DOMAIN_CHILD_PID" "$DOMAIN_TIMER_PID"; then
+    child_status=0
+  else
+    child_status=$?
+  fi
+
+  if [[ "$completed_pid" == "$DOMAIN_TIMER_PID" ]]; then
+    terminate_domain_child "$DOMAIN_CHILD_PID" "$DOMAIN_ACTIVE_PID_FILE"
+    write_domain_failure_result "$index" "$domain" \
+      "单域名检测超时（${DOMAIN_HARD_TIMEOUT} 秒）"
+  else
+    kill -TERM "$DOMAIN_TIMER_PID" 2>/dev/null || :
+    wait "$DOMAIN_TIMER_PID" 2>/dev/null || :
+    release_ready_sample_lock_for_pid "$DOMAIN_CHILD_PID"
+    rm -f -- "$DOMAIN_ACTIVE_PID_FILE"
+    if (( child_status != 0 )) || [[ ! -s "$TEMP_DIR/result-$index" ]]; then
+      write_domain_failure_result "$index" "$domain" '域名检测内部失败'
+    fi
+  fi
+
+  DOMAIN_CHILD_PID=''
+  DOMAIN_TIMER_PID=''
+  DOMAIN_ACTIVE_PID_FILE=''
+  trap - INT TERM
 }
 
 remove_worker_pid() {
@@ -958,13 +1106,42 @@ remove_worker_pid() {
 
 wait_for_one_worker() {
   local completed_pid=''
+  local completed_index=''
   if wait -n -p completed_pid "${WORKER_PIDS[@]}"; then
     :
   else
     :
   fi
   [[ -n "$completed_pid" ]] || return 1
+  completed_index=${WORKER_INDEX_BY_PID[$completed_pid]-}
+  unset 'WORKER_INDEX_BY_PID[$completed_pid]'
   remove_worker_pid "$completed_pid"
+  if [[ "$completed_index" =~ ^[0-9]+$ ]]; then
+    (( COMPLETED_COUNT += 1 ))
+    report_worker_completion "${DOMAIN_INPUTS[$completed_index]}"
+  fi
+}
+
+report_worker_completion() {
+  local domain=$1
+  local message="[$COMPLETED_COUNT/${#DOMAIN_INPUTS[@]}] $domain"
+
+  if [[ -t 2 ]]; then
+    if (( PROGRESS_WIDTH > 0 )); then
+      printf '\r%*s\r' "$PROGRESS_WIDTH" '' >&2
+    fi
+    printf '%s' "$message" >&2
+    PROGRESS_WIDTH=${#message}
+  else
+    printf '%s\n' "$message" >&2
+  fi
+}
+
+clear_progress() {
+  if (( PROGRESS_WIDTH > 0 )); then
+    printf '\r%*s\r' "$PROGRESS_WIDTH" '' >&2
+    PROGRESS_WIDTH=0
+  fi
 }
 
 terminate_workers() {
@@ -976,12 +1153,14 @@ terminate_workers() {
     wait "$pid" 2>/dev/null || :
   done
   WORKER_PIDS=()
+  WORKER_INDEX_BY_PID=()
 }
 
 cleanup() {
   local exit_code=$?
   trap - EXIT ERR INT TERM
   terminate_workers
+  clear_progress
   if [[ -n "$TEMP_DIR" && "$TEMP_DIR" == /* && -d "$TEMP_DIR" ]]; then
     rm -rf -- "$TEMP_DIR"
   fi
@@ -991,6 +1170,7 @@ cleanup() {
 handle_interrupt() {
   trap - INT TERM
   terminate_workers
+  clear_progress
   exit 130
 }
 
@@ -1005,7 +1185,7 @@ check_dependencies() {
   local command_name
   local -a missing=()
   local -a required=(
-    bash openssl curl timeout awk sed grep mktemp getent date
+    bash openssl curl timeout awk sed grep mktemp getent date sleep
   )
 
   for command_name in "${required[@]}"; do
@@ -1480,9 +1660,12 @@ main() {
   trap handle_interrupt INT TERM
   trap handle_internal_error ERR
 
+  COMPLETED_COUNT=0
+  PROGRESS_WIDTH=0
   for index in "${!DOMAIN_INPUTS[@]}"; do
-    check_domain "$index" "${DOMAIN_INPUTS[$index]}" &
+    run_domain_worker "$index" "${DOMAIN_INPUTS[$index]}" &
     WORKER_PIDS+=("$!")
+    WORKER_INDEX_BY_PID["$!"]=$index
     if (( ${#WORKER_PIDS[@]} >= MAX_CONCURRENCY )); then
       wait_for_one_worker
     fi
@@ -1493,12 +1676,12 @@ main() {
 
   for index in "${!DOMAIN_INPUTS[@]}"; do
     if [[ ! -s "$TEMP_DIR/result-$index" ]]; then
-      printf '%s: worker failed for %s.\n' \
-        "$PROGRAM_NAME" "${DOMAIN_INPUTS[$index]}" >&2
-      exit 2
+      write_domain_failure_result "$index" "${DOMAIN_INPUTS[$index]}" \
+        '域名检测结果缺失'
     fi
   done
 
+  clear_progress
   print_results
   if ! aggregate_exit_code "${RESULT_STATUSES[@]}"; then
     final_exit_code=1
