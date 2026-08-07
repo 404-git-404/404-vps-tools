@@ -16,10 +16,15 @@ source "$DOMAIN_CHECK_SCRIPT"
 
 TEST_COUNT=0
 EXTRACTOR_TEST_NUMBER=0
+TEST_MAIN_BASHPID=$BASHPID
+readonly TEST_MAIN_BASHPID
 TEST_TEMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/domain-check-tests.XXXXXXXX")
 readonly TEST_TEMP_DIR
 
 cleanup_test_files() {
+  if [[ "$BASHPID" != "$TEST_MAIN_BASHPID" ]]; then
+    return 0
+  fi
   if [[ -n "$TEST_TEMP_DIR" && "$TEST_TEMP_DIR" == /* &&
     -d "$TEST_TEMP_DIR" ]]; then
     rm -rf -- "$TEST_TEMP_DIR"
@@ -214,6 +219,35 @@ assert_repository_has_no_legacy_strings() {
     fail 'repository contains a legacy project or command string'
   fi
 }
+
+test_cleanup_process_isolation() {
+  local cleanup_worker_pid
+  local main_cleanup_probe
+
+  sleep 30 &
+  cleanup_worker_pid=$!
+  kill -TERM "$cleanup_worker_pid"
+  wait "$cleanup_worker_pid" 2>/dev/null || :
+  assert_equal 'true' "$(if [[ -d "$TEST_TEMP_DIR" ]]; then
+    printf true
+  else
+    printf false
+  fi)" 'background EXIT trap does not remove the main test temporary directory'
+
+  main_cleanup_probe=$(mktemp -d \
+    "$TEST_TEMP_DIR/main-cleanup-probe.XXXXXXXX")
+  export -f cleanup_test_files
+  env TEST_TEMP_DIR="$main_cleanup_probe" bash -c \
+    "TEST_MAIN_BASHPID=\$BASHPID; cleanup_test_files"
+  export -n -f cleanup_test_files
+  assert_equal 'false' "$(if [[ -d "$main_cleanup_probe" ]]; then
+    printf true
+  else
+    printf false
+  fi)" 'main test shell cleanup removes its temporary directory'
+}
+
+test_cleanup_process_isolation
 
 assert_parse 'example.com' 'example.com'
 assert_parse 'example.com/test.com' 'example.com/test.com'

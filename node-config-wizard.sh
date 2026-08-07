@@ -3,6 +3,7 @@ set -Eeuo pipefail
 
 readonly CONFIG_PATH='/etc/sing-box/config.json'
 readonly CONFIG_DIR='/etc/sing-box'
+readonly MODULE_CANCEL_STATUS=20
 
 TEMP_CONFIG=''
 LOG_JSON='{}'
@@ -12,6 +13,7 @@ ROUTE_JSON='{}'
 BUILT_ITEM=''
 WORKING_CONFIG_JSON=''
 OUTBOUND_TAGS=()
+MODULE_INPUT_ACTIVE=false
 
 RED=''
 GREEN=''
@@ -97,22 +99,100 @@ read_line() {
     local prompt="$2"
     local secret="${3:-false}"
     local value=''
+    local key=''
+    local next_key=''
+    local read_status=0
+    local echo_input=false
 
-    printf '%s' "$prompt"
-    if [[ "$secret" == 'true' ]]; then
-        if ! IFS= read -r -s value; then
-            printf '\n' >&2
-            exit 0
-        fi
-        printf '\n'
-    else
-        if ! IFS= read -r value; then
-            printf '\n' >&2
-            exit 0
-        fi
+    if [[ "$secret" != 'true' && -t 0 ]]; then
+        echo_input=true
     fi
 
-    printf -v "$target_name" '%s' "$value"
+    printf '%s' "$prompt"
+    while true; do
+        if IFS= read -r -s -n 1 key; then
+            :
+        else
+            read_status=$?
+            printf '\n' >&2
+            if (( read_status > 128 )); then
+                return "$read_status"
+            fi
+            exit 0
+        fi
+
+        case "$key" in
+            '')
+                printf '\n'
+                printf -v "$target_name" '%s' "$value"
+                return 0
+                ;;
+            $'\177'|$'\b')
+                if [[ -n "$value" ]]; then
+                    value="${value%?}"
+                    if [[ "$echo_input" == 'true' ]]; then
+                        printf '\b \b'
+                    fi
+                fi
+                ;;
+            $'\e')
+                if IFS= read -r -s -n 1 -t 0.05 next_key; then
+                    consume_escape_sequence "$next_key"
+                    continue
+                fi
+                if [[ "$MODULE_INPUT_ACTIVE" == 'true' ]]; then
+                    printf '\n'
+                    printf -v "$target_name" '%s' ''
+                    return "$MODULE_CANCEL_STATUS"
+                fi
+                ;;
+            *)
+                value+="$key"
+                if [[ "$echo_input" == 'true' ]]; then
+                    printf '%s' "$key"
+                fi
+                ;;
+        esac
+    done
+}
+
+consume_escape_sequence() {
+    local first_key="$1"
+    local key=''
+
+    case "$first_key" in
+        '[')
+            while IFS= read -r -s -n 1 -t 0.01 key; do
+                [[ "$key" == [@-~] ]] && break
+            done
+            ;;
+        'O')
+            IFS= read -r -s -n 1 -t 0.01 key || true
+            ;;
+    esac
+}
+
+begin_module_build() {
+    BUILT_ITEM=''
+    MODULE_INPUT_ACTIVE=true
+}
+
+finish_module_build() {
+    MODULE_INPUT_ACTIVE=false
+}
+
+module_prompt() {
+    local prompt_status=0
+
+    if "$@"; then
+        return 0
+    else
+        prompt_status=$?
+    fi
+
+    BUILT_ITEM=''
+    finish_module_build
+    return "$prompt_status"
 }
 
 prompt_required() {
@@ -120,9 +200,15 @@ prompt_required() {
     local label="$2"
     local secret="${3:-false}"
     local input=''
+    local prompt_status=0
 
     while true; do
-        read_line input "${label}：" "$secret"
+        if read_line input "${label}：" "$secret"; then
+            :
+        else
+            prompt_status=$?
+            return "$prompt_status"
+        fi
         if [[ -n "$input" ]]; then
             printf -v "$target_name" '%s' "$input"
             return
@@ -136,9 +222,15 @@ prompt_port() {
     local label="$2"
     local default_port="$3"
     local input=''
+    local prompt_status=0
 
     while true; do
-        read_line input "${label} [${default_port}]：" false
+        if read_line input "${label} [${default_port}]：" false; then
+            :
+        else
+            prompt_status=$?
+            return "$prompt_status"
+        fi
         input="${input:-$default_port}"
         if [[ "$input" =~ ^[0-9]+$ && ${#input} -le 5 ]] \
             && (( 10#$input >= 1 && 10#$input <= 65535 )); then
@@ -153,9 +245,15 @@ prompt_yes_no() {
     local target_name="$1"
     local label="$2"
     local input=''
+    local prompt_status=0
 
     while true; do
-        read_line input "${label} [y/n]：" false
+        if read_line input "${label} [y/n]：" false; then
+            :
+        else
+            prompt_status=$?
+            return "$prompt_status"
+        fi
         case "${input,,}" in
             y|yes)
                 printf -v "$target_name" '%s' 'yes'
@@ -178,13 +276,24 @@ prompt_numbered_choice() {
     local maximum="$3"
     local default_choice="${4:-}"
     local input=''
+    local prompt_status=0
 
     while true; do
         if [[ -n "$default_choice" ]]; then
-            read_line input "请输入选项 [${default_choice}]：" false
+            if read_line input "请输入选项 [${default_choice}]：" false; then
+                :
+            else
+                prompt_status=$?
+                return "$prompt_status"
+            fi
             input="${input:-$default_choice}"
         else
-            read_line input '请输入选项：' false
+            if read_line input '请输入选项：' false; then
+                :
+            else
+                prompt_status=$?
+                return "$prompt_status"
+            fi
         fi
 
         if [[ "$input" =~ ^[0-9]+$ && ${#input} -le 9 ]] \
@@ -199,12 +308,18 @@ prompt_numbered_choice() {
 prompt_method() {
     local target_name="$1"
     local choice=''
+    local prompt_status=0
 
     printf '\n请选择 Shadowsocks 2022 method：\n\n'
     printf '1. 2022-blake3-aes-128-gcm（默认）\n'
     printf '2. 2022-blake3-aes-256-gcm\n'
     printf '3. 2022-blake3-chacha20-poly1305\n'
-    prompt_numbered_choice choice 1 3 1
+    if prompt_numbered_choice choice 1 3 1; then
+        :
+    else
+        prompt_status=$?
+        return "$prompt_status"
+    fi
 
     case "$choice" in
         1) printf -v "$target_name" '%s' '2022-blake3-aes-128-gcm' ;;
@@ -216,9 +331,15 @@ prompt_method() {
 prompt_server_ip() {
     local target_name="$1"
     local candidate=''
+    local prompt_status=0
 
     while true; do
-        prompt_required candidate '请输入服务器 IP' false
+        if prompt_required candidate '请输入服务器 IP' false; then
+            :
+        else
+            prompt_status=$?
+            return "$prompt_status"
+        fi
         if [[ "$candidate" =~ [[:space:]] ]]; then
             error '服务器 IP 不得包含空格。'
             continue
@@ -231,6 +352,111 @@ prompt_server_ip() {
         fi
 
         error '请输入 IPv4 或 IPv6 地址，不接受域名。'
+    done
+}
+
+is_valid_ipv4() {
+    local candidate="$1"
+    local octet=''
+    local -a octets=()
+
+    [[ "$candidate" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1
+    IFS='.' read -r -a octets <<<"$candidate"
+    (( ${#octets[@]} == 4 )) || return 1
+    for octet in "${octets[@]}"; do
+        [[ ${#octet} -le 3 ]] || return 1
+        (( 10#$octet <= 255 )) || return 1
+    done
+}
+
+is_valid_ipv6() {
+    local candidate="$1"
+    local ipv4_tail=''
+    local left=''
+    local right=''
+    local part=''
+    local explicit_parts=0
+    local -a parts=()
+
+    if [[ "$candidate" == *.* ]]; then
+        ipv4_tail="${candidate##*:}"
+        is_valid_ipv4 "$ipv4_tail" || return 1
+        candidate="${candidate%:*}:0:0"
+    fi
+
+    [[ "$candidate" == *:* && "$candidate" =~ ^[0-9A-Fa-f:]+$ ]] || return 1
+    [[ "$candidate" != *:::* ]] || return 1
+
+    if [[ "$candidate" == *::* ]]; then
+        left="${candidate%%::*}"
+        right="${candidate#*::}"
+        [[ "$right" != *::* ]] || return 1
+        if [[ -n "$left" ]]; then
+            [[ "$left" != :* && "$left" != *: ]] || return 1
+            IFS=':' read -r -a parts <<<"$left"
+            for part in "${parts[@]}"; do
+                [[ "$part" =~ ^[0-9A-Fa-f]{1,4}$ ]] || return 1
+                ((explicit_parts += 1))
+            done
+        fi
+        if [[ -n "$right" ]]; then
+            [[ "$right" != :* && "$right" != *: ]] || return 1
+            IFS=':' read -r -a parts <<<"$right"
+            for part in "${parts[@]}"; do
+                [[ "$part" =~ ^[0-9A-Fa-f]{1,4}$ ]] || return 1
+                ((explicit_parts += 1))
+            done
+        fi
+        (( explicit_parts < 8 ))
+        return
+    fi
+
+    [[ "$candidate" != :* && "$candidate" != *: ]] || return 1
+    IFS=':' read -r -a parts <<<"$candidate"
+    (( ${#parts[@]} == 8 )) || return 1
+    for part in "${parts[@]}"; do
+        [[ "$part" =~ ^[0-9A-Fa-f]{1,4}$ ]] || return 1
+    done
+}
+
+is_valid_domain() {
+    local candidate="$1"
+    local label=''
+    local -a labels=()
+
+    (( ${#candidate} <= 253 )) || return 1
+    [[ "$candidate" != .* && "$candidate" != *. && "$candidate" != *..* ]] || return 1
+    [[ ! "$candidate" =~ ^[0-9.]+$ ]] || return 1
+    IFS='.' read -r -a labels <<<"$candidate"
+    for label in "${labels[@]}"; do
+        (( ${#label} >= 1 && ${#label} <= 63 )) || return 1
+        [[ "$label" =~ ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?$ ]] || return 1
+    done
+}
+
+prompt_server_address() {
+    local target_name="$1"
+    local candidate=''
+    local prompt_status=0
+
+    while true; do
+        if prompt_required candidate '请输入 server' false; then
+            :
+        else
+            prompt_status=$?
+            return "$prompt_status"
+        fi
+
+        if [[ "$candidate" =~ [[:space:]] || "$candidate" == *://* \
+            || "$candidate" == */* ]]; then
+            error 'server 必须是 IPv4、IPv6 或域名，且不得包含空格、协议或路径。'
+        elif is_valid_ipv4 "$candidate" || is_valid_ipv6 "$candidate" \
+            || is_valid_domain "$candidate"; then
+            printf -v "$target_name" '%s' "$candidate"
+            return 0
+        else
+            error '请输入合法的 IPv4、IPv6 或域名；server 中不要附带端口。'
+        fi
     done
 }
 
@@ -249,9 +475,15 @@ tag_exists() {
 prompt_outbound_tag() {
     local target_name="$1"
     local candidate=''
+    local prompt_status=0
 
     while true; do
-        prompt_required candidate '请输入 outbound tag' false
+        if prompt_required candidate '请输入 outbound tag' false; then
+            :
+        else
+            prompt_status=$?
+            return "$prompt_status"
+        fi
         if [[ "$candidate" =~ [[:space:]] ]]; then
             error 'outbound tag 不得包含空格。'
         elif [[ "$candidate" == 'direct' ]]; then
@@ -267,12 +499,24 @@ prompt_outbound_tag() {
 
 append_inbound() {
     local item="$1"
-    INBOUNDS_JSON="$(jq -c --argjson item "$item" '. + [$item]' <<<"$INBOUNDS_JSON")"
+    local updated=''
+
+    if updated="$(jq -c --argjson item "$item" '. + [$item]' <<<"$INBOUNDS_JSON")"; then
+        INBOUNDS_JSON="$updated"
+        return 0
+    fi
+    return 1
 }
 
 append_outbound() {
     local item="$1"
-    OUTBOUNDS_JSON="$(jq -c --argjson item "$item" '. + [$item]' <<<"$OUTBOUNDS_JSON")"
+    local updated=''
+
+    if updated="$(jq -c --argjson item "$item" '. + [$item]' <<<"$OUTBOUNDS_JSON")"; then
+        OUTBOUNDS_JSON="$updated"
+        return 0
+    fi
+    return 1
 }
 
 reset_generation_state() {
@@ -283,6 +527,7 @@ reset_generation_state() {
     BUILT_ITEM=''
     WORKING_CONFIG_JSON=''
     OUTBOUND_TAGS=()
+    MODULE_INPUT_ACTIVE=false
 
     if [[ -n "$TEMP_CONFIG" && -f "$TEMP_CONFIG" ]]; then
         rm -f -- "$TEMP_CONFIG"
@@ -414,6 +659,9 @@ refresh_outbound_tags_from_working() {
 append_working_outbound() {
     local item="$1"
     local tag=''
+    local updated=''
+    local original_config="$WORKING_CONFIG_JSON"
+    local -a original_tags=("${OUTBOUND_TAGS[@]}")
 
     ensure_working_array 'outbounds' || return 1
     tag="$(jq -r '.tag // empty' <<<"$item")"
@@ -434,10 +682,17 @@ append_working_outbound() {
         return 1
     fi
 
-    WORKING_CONFIG_JSON="$(jq -c --argjson item "$item" \
+    if updated="$(jq -c --argjson item "$item" \
         '.outbounds = ((.outbounds // []) + [$item])' \
-        <<<"$WORKING_CONFIG_JSON")"
-    refresh_outbound_tags_from_working
+        <<<"$WORKING_CONFIG_JSON")"; then
+        WORKING_CONFIG_JSON="$updated"
+        if refresh_outbound_tags_from_working; then
+            return 0
+        fi
+        WORKING_CONFIG_JSON="$original_config"
+        OUTBOUND_TAGS=("${original_tags[@]}")
+    fi
+    return 1
 }
 
 set_working_route_final() {
@@ -523,13 +778,14 @@ build_reality_inbound() {
     local private_key=''
     local short_id=''
 
+    begin_module_build
     info '配置 VLESS Reality inbound'
-    prompt_port listen_port '请输入监听端口' 443
-    prompt_required uuid '请输入 UUID' true
-    prompt_required disguise_domain '请输入 Reality 伪装域名' false
-    prompt_port handshake_port '请输入 Reality handshake.server_port' 443
-    prompt_required private_key '请输入 Reality private_key' true
-    prompt_required short_id '请输入 Reality short_id' true
+    module_prompt prompt_port listen_port '请输入监听端口' 443 || return $?
+    module_prompt prompt_required uuid '请输入 UUID' true || return $?
+    module_prompt prompt_required disguise_domain '请输入 Reality 伪装域名' false || return $?
+    module_prompt prompt_port handshake_port '请输入 Reality handshake.server_port' 443 || return $?
+    module_prompt prompt_required private_key '请输入 Reality private_key' true || return $?
+    module_prompt prompt_required short_id '请输入 Reality short_id' true || return $?
 
     BUILT_ITEM="$(jq -cn \
         --argjson listen_port "$listen_port" \
@@ -561,24 +817,27 @@ build_reality_inbound() {
                     short_id: [$short_id]
                 }
             }
-        }')"
+        }')" || {
+        BUILT_ITEM=''
+        finish_module_build
+        return 1
+    }
+    finish_module_build
 }
 
 build_transit_hysteria2_inbound() {
     local listen_port=''
-    local obfs_password=''
     local user_password=''
     local certificate_directory=''
 
+    begin_module_build
     info '配置 Hysteria2 inbound'
-    prompt_port listen_port '请输入监听端口' 443
-    prompt_required obfs_password '请输入 salamander obfs password' true
-    prompt_required user_password '请输入 Hysteria2 用户 password' true
-    prompt_required certificate_directory '请输入 /etc/ssl/ 下的证书目录名' false
+    module_prompt prompt_port listen_port '请输入监听端口' 443 || return $?
+    module_prompt prompt_required user_password '请输入 Hysteria2 用户 password' true || return $?
+    module_prompt prompt_required certificate_directory '请输入 /etc/ssl/ 下的证书目录名' false || return $?
 
     BUILT_ITEM="$(jq -cn \
         --argjson listen_port "$listen_port" \
-        --arg obfs_password "$obfs_password" \
         --arg user_password "$user_password" \
         --arg certificate_path "/etc/ssl/${certificate_directory}/fullchain.pem" \
         --arg key_path "/etc/ssl/${certificate_directory}/privkey.pem" \
@@ -587,10 +846,6 @@ build_transit_hysteria2_inbound() {
             tag: "hy2-in",
             listen: "::",
             listen_port: $listen_port,
-            obfs: {
-                type: "salamander",
-                password: $obfs_password
-            },
             users: [{
                 name: "main",
                 password: $user_password
@@ -601,7 +856,12 @@ build_transit_hysteria2_inbound() {
                 key_path: $key_path,
                 min_version: "1.3"
             }
-        }')"
+        }')" || {
+        BUILT_ITEM=''
+        finish_module_build
+        return 1
+    }
+    finish_module_build
 }
 
 build_exit_hysteria2_inbound() {
@@ -609,10 +869,11 @@ build_exit_hysteria2_inbound() {
     local user_password=''
     local certificate_directory=''
 
+    begin_module_build
     info '配置 Hysteria2 inbound'
-    prompt_port listen_port '请输入监听端口' 32124
-    prompt_required user_password '请输入 Hysteria2 用户 password' true
-    prompt_required certificate_directory '请输入 /etc/ssl/ 下的证书目录名' false
+    module_prompt prompt_port listen_port '请输入监听端口' 32124 || return $?
+    module_prompt prompt_required user_password '请输入 Hysteria2 用户 password' true || return $?
+    module_prompt prompt_required certificate_directory '请输入 /etc/ssl/ 下的证书目录名' false || return $?
 
     BUILT_ITEM="$(jq -cn \
         --argjson listen_port "$listen_port" \
@@ -634,16 +895,22 @@ build_exit_hysteria2_inbound() {
                 key_path: $key_path,
                 min_version: "1.3"
             }
-        }')"
+        }')" || {
+        BUILT_ITEM=''
+        finish_module_build
+        return 1
+    }
+    finish_module_build
 }
 
 build_cf_tunnel_inbound() {
     local listen_port=''
     local uuid=''
 
+    begin_module_build
     info '配置 CF Tunnel inbound'
-    prompt_port listen_port '请输入监听端口' 33333
-    prompt_required uuid '请输入 UUID' true
+    module_prompt prompt_port listen_port '请输入监听端口' 33333 || return $?
+    module_prompt prompt_required uuid '请输入 UUID' true || return $?
 
     BUILT_ITEM="$(jq -cn \
         --argjson listen_port "$listen_port" \
@@ -661,7 +928,12 @@ build_cf_tunnel_inbound() {
                 type: "ws",
                 path: ""
             }
-        }')"
+        }')" || {
+        BUILT_ITEM=''
+        finish_module_build
+        return 1
+    }
+    finish_module_build
 }
 
 build_cf_websocket_inbound() {
@@ -670,11 +942,12 @@ build_cf_websocket_inbound() {
     local certificate_directory=''
     local websocket_path=''
 
+    begin_module_build
     info '配置 CF WebSocket inbound'
-    prompt_port listen_port '请输入监听端口' 8443
-    prompt_required uuid '请输入 UUID' true
-    prompt_required certificate_directory '请输入 /etc/ssl/ 下的证书目录名' false
-    prompt_required websocket_path '请输入 WebSocket path' false
+    module_prompt prompt_port listen_port '请输入监听端口' 8443 || return $?
+    module_prompt prompt_required uuid '请输入 UUID' true || return $?
+    module_prompt prompt_required certificate_directory '请输入 /etc/ssl/ 下的证书目录名' false || return $?
+    module_prompt prompt_required websocket_path '请输入 WebSocket path' false || return $?
     if [[ "$websocket_path" != /* ]]; then
         websocket_path="/${websocket_path}"
     fi
@@ -703,7 +976,12 @@ build_cf_websocket_inbound() {
                 type: "ws",
                 path: $websocket_path
             }
-        }')"
+        }')" || {
+        BUILT_ITEM=''
+        finish_module_build
+        return 1
+    }
+    finish_module_build
 }
 
 build_exit_shadowsocks_inbound() {
@@ -711,10 +989,11 @@ build_exit_shadowsocks_inbound() {
     local method=''
     local password=''
 
+    begin_module_build
     info '配置 SS2022 inbound'
-    prompt_port listen_port '请输入监听端口' 32123
-    prompt_method method
-    prompt_required password '请输入 SS2022 password' true
+    module_prompt prompt_port listen_port '请输入监听端口' 32123 || return $?
+    module_prompt prompt_method method || return $?
+    module_prompt prompt_required password '请输入 SS2022 password' true || return $?
 
     BUILT_ITEM="$(jq -cn \
         --argjson listen_port "$listen_port" \
@@ -727,43 +1006,26 @@ build_exit_shadowsocks_inbound() {
             listen_port: $listen_port,
             method: $method,
             password: $password
-        }')"
+        }')" || {
+        BUILT_ITEM=''
+        finish_module_build
+        return 1
+    }
+    finish_module_build
 }
 
 configure_transit_inbounds() {
-    local answer=''
-    local item=''
-
     while true; do
         INBOUNDS_JSON='[]'
 
-        prompt_yes_no answer '是否添加 VLESS Reality inbound？'
-        if [[ "$answer" == 'yes' ]]; then
-            build_reality_inbound
-            item="$BUILT_ITEM"
-            append_inbound "$item"
-        fi
-
-        prompt_yes_no answer '是否添加 Hysteria2 inbound？'
-        if [[ "$answer" == 'yes' ]]; then
-            build_transit_hysteria2_inbound
-            item="$BUILT_ITEM"
-            append_inbound "$item"
-        fi
-
-        prompt_yes_no answer '是否添加 CF Tunnel inbound？'
-        if [[ "$answer" == 'yes' ]]; then
-            build_cf_tunnel_inbound
-            item="$BUILT_ITEM"
-            append_inbound "$item"
-        fi
-
-        prompt_yes_no answer '是否添加 CF WebSocket inbound？'
-        if [[ "$answer" == 'yes' ]]; then
-            build_cf_websocket_inbound
-            item="$BUILT_ITEM"
-            append_inbound "$item"
-        fi
+        configure_optional_inbound '是否添加 VLESS Reality inbound？' \
+            build_reality_inbound || return $?
+        configure_optional_inbound '是否添加 Hysteria2 inbound？' \
+            build_transit_hysteria2_inbound || return $?
+        configure_optional_inbound '是否添加 CF Tunnel inbound？' \
+            build_cf_tunnel_inbound || return $?
+        configure_optional_inbound '是否添加 CF WebSocket inbound？' \
+            build_cf_websocket_inbound || return $?
 
         if (( $(jq 'length' <<<"$INBOUNDS_JSON") > 0 )); then
             return
@@ -774,45 +1036,50 @@ configure_transit_inbounds() {
 }
 
 configure_exit_inbounds() {
-    local answer=''
-    local item=''
-
     while true; do
         INBOUNDS_JSON='[]'
 
-        prompt_yes_no answer '是否添加 SS2022 inbound？'
-        if [[ "$answer" == 'yes' ]]; then
-            build_exit_shadowsocks_inbound
-            item="$BUILT_ITEM"
-            append_inbound "$item"
-        fi
-
-        prompt_yes_no answer '是否添加 Hysteria2 inbound？'
-        if [[ "$answer" == 'yes' ]]; then
-            build_exit_hysteria2_inbound
-            item="$BUILT_ITEM"
-            append_inbound "$item"
-        fi
-
-        prompt_yes_no answer '是否添加 CF Tunnel inbound？'
-        if [[ "$answer" == 'yes' ]]; then
-            build_cf_tunnel_inbound
-            item="$BUILT_ITEM"
-            append_inbound "$item"
-        fi
-
-        prompt_yes_no answer '是否添加 CF WebSocket inbound？'
-        if [[ "$answer" == 'yes' ]]; then
-            build_cf_websocket_inbound
-            item="$BUILT_ITEM"
-            append_inbound "$item"
-        fi
+        configure_optional_inbound '是否添加 SS2022 inbound？' \
+            build_exit_shadowsocks_inbound || return $?
+        configure_optional_inbound '是否添加 Hysteria2 inbound？' \
+            build_exit_hysteria2_inbound || return $?
+        configure_optional_inbound '是否添加 CF Tunnel inbound？' \
+            build_cf_tunnel_inbound || return $?
+        configure_optional_inbound '是否添加 CF WebSocket inbound？' \
+            build_cf_websocket_inbound || return $?
 
         if (( $(jq 'length' <<<"$INBOUNDS_JSON") > 0 )); then
             return
         fi
 
         error '落地配置至少需要一个 inbound，请重新选择。'
+    done
+}
+
+configure_optional_inbound() {
+    local question="$1"
+    local builder="$2"
+    local answer=''
+    local item=''
+    local build_status=0
+
+    while true; do
+        prompt_yes_no answer "$question"
+        [[ "$answer" == 'yes' ]] || return 0
+
+        if "$builder"; then
+            item="$BUILT_ITEM"
+            append_inbound "$item" || return $?
+            return 0
+        else
+            build_status=$?
+        fi
+
+        if (( build_status == MODULE_CANCEL_STATUS )); then
+            warn '已取消当前 inbound，未保存任何字段。'
+            continue
+        fi
+        return "$build_status"
     done
 }
 
@@ -823,14 +1090,13 @@ build_shadowsocks_outbound() {
     local method=''
     local password=''
 
+    begin_module_build
     info '配置 SS2022 outbound'
-    prompt_outbound_tag tag
-    prompt_server_ip server
-    prompt_port server_port '请输入 server_port' 32123
-    prompt_method method
-    prompt_required password '请输入 SS2022 password' true
-
-    OUTBOUND_TAGS+=("$tag")
+    module_prompt prompt_outbound_tag tag || return $?
+    module_prompt prompt_server_ip server || return $?
+    module_prompt prompt_port server_port '请输入 server_port' 32123 || return $?
+    module_prompt prompt_method method || return $?
+    module_prompt prompt_required password '请输入 SS2022 password' true || return $?
 
     BUILT_ITEM="$(jq -cn \
         --arg tag "$tag" \
@@ -845,7 +1111,55 @@ build_shadowsocks_outbound() {
             server_port: $server_port,
             method: $method,
             password: $password
-        }')"
+        }')" || {
+        BUILT_ITEM=''
+        finish_module_build
+        return 1
+    }
+    finish_module_build
+}
+
+build_socks5_outbound() {
+    local tag=''
+    local server=''
+    local server_port=''
+    local use_auth=''
+    local username=''
+    local password=''
+
+    begin_module_build
+    info '配置 SOCKS5 outbound'
+    module_prompt prompt_outbound_tag tag || return $?
+    module_prompt prompt_server_address server || return $?
+    module_prompt prompt_port server_port '请输入 server_port' 443 || return $?
+    module_prompt prompt_yes_no use_auth '是否使用用户名和密码认证？' || return $?
+    if [[ "$use_auth" == 'yes' ]]; then
+        module_prompt prompt_required username '请输入 username' false || return $?
+        module_prompt prompt_required password '请输入 password' true || return $?
+    fi
+
+    BUILT_ITEM="$(jq -cn \
+        --arg tag "$tag" \
+        --arg server "$server" \
+        --argjson server_port "$server_port" \
+        --arg use_auth "$use_auth" \
+        --arg username "$username" \
+        --arg password "$password" \
+        '{
+            type: "socks",
+            tag: $tag,
+            server: $server,
+            server_port: $server_port,
+            version: "5"
+        } + if $use_auth == "yes" then {
+            username: $username,
+            password: $password
+        } else {} end')" || {
+        BUILT_ITEM=''
+        finish_module_build
+        return 1
+    }
+    finish_module_build
 }
 
 build_hysteria2_outbound() {
@@ -855,14 +1169,13 @@ build_hysteria2_outbound() {
     local password=''
     local server_name=''
 
+    begin_module_build
     info '配置 Hysteria2 outbound'
-    prompt_outbound_tag tag
-    prompt_server_ip server
-    prompt_port server_port '请输入 server_port' 32124
-    prompt_required password '请输入 Hysteria2 password' true
-    prompt_required server_name '请输入 tls.server_name' false
-
-    OUTBOUND_TAGS+=("$tag")
+    module_prompt prompt_outbound_tag tag || return $?
+    module_prompt prompt_server_ip server || return $?
+    module_prompt prompt_port server_port '请输入 server_port' 32124 || return $?
+    module_prompt prompt_required password '请输入 Hysteria2 password' true || return $?
+    module_prompt prompt_required server_name '请输入 tls.server_name' false || return $?
 
     BUILT_ITEM="$(jq -cn \
         --arg tag "$tag" \
@@ -880,34 +1193,62 @@ build_hysteria2_outbound() {
                 enabled: true,
                 server_name: $server_name
             }
-        }')"
+        }')" || {
+        BUILT_ITEM=''
+        finish_module_build
+        return 1
+    }
+    finish_module_build
 }
 
 configure_transit_outbounds() {
-    local answer=''
+    local outbound_choice=''
+    local builder=''
     local item=''
+    local tag=''
+    local build_status=0
 
     OUTBOUNDS_JSON='[]'
     OUTBOUND_TAGS=()
 
-    prompt_yes_no answer '是否添加 SS2022 outbound？'
-    while [[ "$answer" == 'yes' ]]; do
-        build_shadowsocks_outbound
-        item="$BUILT_ITEM"
-        append_outbound "$item"
-        prompt_yes_no answer '是否继续添加 SS2022 outbound？'
+    while true; do
+        printf '\n请选择要添加的 outbound：\n\n'
+        printf '1. SS2022 outbound\n'
+        printf '2. SOCKS5 outbound\n'
+        printf '3. Hysteria2 outbound\n'
+        printf '4. 完成并返回\n'
+        prompt_numbered_choice outbound_choice 1 4
+
+        case "$outbound_choice" in
+            1) builder='build_shadowsocks_outbound' ;;
+            2) builder='build_socks5_outbound' ;;
+            3) builder='build_hysteria2_outbound' ;;
+            4) break ;;
+        esac
+
+        if "$builder"; then
+            item="$BUILT_ITEM"
+            tag="$(jq -r '.tag' <<<"$item")"
+            if append_outbound "$item"; then
+                OUTBOUND_TAGS+=("$tag")
+            else
+                return $?
+            fi
+        else
+            build_status=$?
+            if (( build_status == MODULE_CANCEL_STATUS )); then
+                warn '已取消当前 outbound，未保存任何字段。'
+                continue
+            fi
+            return "$build_status"
+        fi
     done
 
-    prompt_yes_no answer '是否添加 Hysteria2 outbound？'
-    while [[ "$answer" == 'yes' ]]; do
-        build_hysteria2_outbound
-        item="$BUILT_ITEM"
-        append_outbound "$item"
-        prompt_yes_no answer '是否继续添加 Hysteria2 outbound？'
-    done
-
-    append_outbound "$(jq -cn '{type:"direct",tag:"direct"}')"
-    OUTBOUND_TAGS+=('direct')
+    if append_outbound "$(jq -cn '{type:"direct",tag:"direct"}')"; then
+        OUTBOUND_TAGS+=('direct')
+    else
+        return $?
+    fi
 }
 
 configure_transit_route() {
@@ -1016,6 +1357,8 @@ add_inbound_to_working_config() {
     local config_kind=''
     local inbound_choice=''
     local target_tag=''
+    local builder=''
+    local build_status=0
 
     ensure_working_array 'inbounds' || return 1
 
@@ -1028,65 +1371,64 @@ add_inbound_to_working_config() {
         return 0
     fi
 
-    printf '\n请选择要添加的 inbound：\n\n'
-    if [[ "$config_kind" == '1' ]]; then
-        printf '1. VLESS Reality inbound\n'
-        printf '2. Hysteria2 inbound\n'
-        printf '3. CF Tunnel inbound\n'
-        printf '4. CF WebSocket inbound\n'
-        printf '5. 返回\n'
-        prompt_numbered_choice inbound_choice 1 5
-        case "$inbound_choice" in
-            1) target_tag='vless-reality-in' ;;
-            2) target_tag='hy2-in' ;;
-            3) target_tag='cf-tunnel-in' ;;
-            4) target_tag='vless-cf-ws-in' ;;
-            5) return 0 ;;
-        esac
-    else
-        printf '1. SS2022 inbound\n'
-        printf '2. Hysteria2 inbound\n'
-        printf '3. CF Tunnel inbound\n'
-        printf '4. CF WebSocket inbound\n'
-        printf '5. 返回\n'
-        prompt_numbered_choice inbound_choice 1 5
-        case "$inbound_choice" in
-            1) target_tag='ss2022-in' ;;
-            2) target_tag='hy2-in' ;;
-            3) target_tag='cf-tunnel-in' ;;
-            4) target_tag='vless-cf-ws-in' ;;
-            5) return 0 ;;
-        esac
-    fi
+    while true; do
+        printf '\n请选择要添加的 inbound：\n\n'
+        if [[ "$config_kind" == '1' ]]; then
+            printf '1. VLESS Reality inbound\n'
+            printf '2. Hysteria2 inbound\n'
+            printf '3. CF Tunnel inbound\n'
+            printf '4. CF WebSocket inbound\n'
+            printf '5. 返回\n'
+            prompt_numbered_choice inbound_choice 1 5
+            case "$inbound_choice" in
+                1) target_tag='vless-reality-in'; builder='build_reality_inbound' ;;
+                2) target_tag='hy2-in'; builder='build_transit_hysteria2_inbound' ;;
+                3) target_tag='cf-tunnel-in'; builder='build_cf_tunnel_inbound' ;;
+                4) target_tag='vless-cf-ws-in'; builder='build_cf_websocket_inbound' ;;
+                5) return 0 ;;
+            esac
+        else
+            printf '1. SS2022 inbound\n'
+            printf '2. Hysteria2 inbound\n'
+            printf '3. CF Tunnel inbound\n'
+            printf '4. CF WebSocket inbound\n'
+            printf '5. 返回\n'
+            prompt_numbered_choice inbound_choice 1 5
+            case "$inbound_choice" in
+                1) target_tag='ss2022-in'; builder='build_exit_shadowsocks_inbound' ;;
+                2) target_tag='hy2-in'; builder='build_exit_hysteria2_inbound' ;;
+                3) target_tag='cf-tunnel-in'; builder='build_cf_tunnel_inbound' ;;
+                4) target_tag='vless-cf-ws-in'; builder='build_cf_websocket_inbound' ;;
+                5) return 0 ;;
+            esac
+        fi
 
-    if working_tag_exists 'inbounds' "$target_tag"; then
-        error "inbound tag '${target_tag}' 已经存在，不允许重复追加。"
-        return 0
-    fi
+        if working_tag_exists 'inbounds' "$target_tag"; then
+            error "inbound tag '${target_tag}' 已经存在，不允许重复追加。"
+            return 0
+        fi
 
-    if [[ "$config_kind" == '1' ]]; then
-        case "$inbound_choice" in
-            1) build_reality_inbound ;;
-            2) build_transit_hysteria2_inbound ;;
-            3) build_cf_tunnel_inbound ;;
-            4) build_cf_websocket_inbound ;;
-        esac
-    else
-        case "$inbound_choice" in
-            1) build_exit_shadowsocks_inbound ;;
-            2) build_exit_hysteria2_inbound ;;
-            3) build_cf_tunnel_inbound ;;
-            4) build_cf_websocket_inbound ;;
-        esac
-    fi
-
-    if append_working_inbound "$BUILT_ITEM"; then
-        success "已追加 inbound：${target_tag}"
-    fi
+        if "$builder"; then
+            if append_working_inbound "$BUILT_ITEM"; then
+                success "已追加 inbound：${target_tag}"
+            fi
+            return 0
+        else
+            build_status=$?
+            if (( build_status == MODULE_CANCEL_STATUS )); then
+                warn '已取消当前 inbound，未保存任何字段。'
+                continue
+            fi
+            return "$build_status"
+        fi
+    done
 }
 
 add_outbounds_to_working_config() {
     local outbound_choice=''
+    local builder=''
+    local build_status=0
+    local tag=''
 
     ensure_working_array 'outbounds' || return 1
     refresh_outbound_tags_from_working || return 1
@@ -1094,18 +1436,30 @@ add_outbounds_to_working_config() {
     while true; do
         printf '\n请选择要添加的 outbound：\n\n'
         printf '1. SS2022 outbound\n'
-        printf '2. Hysteria2 outbound\n'
-        printf '3. 完成并返回\n'
-        prompt_numbered_choice outbound_choice 1 3
+        printf '2. SOCKS5 outbound\n'
+        printf '3. Hysteria2 outbound\n'
+        printf '4. 完成并返回\n'
+        prompt_numbered_choice outbound_choice 1 4
 
         case "$outbound_choice" in
-            1) build_shadowsocks_outbound ;;
-            2) build_hysteria2_outbound ;;
-            3) return 0 ;;
+            1) builder='build_shadowsocks_outbound' ;;
+            2) builder='build_socks5_outbound' ;;
+            3) builder='build_hysteria2_outbound' ;;
+            4) return 0 ;;
         esac
 
-        if append_working_outbound "$BUILT_ITEM"; then
-            success "已追加 outbound：${OUTBOUND_TAGS[$((${#OUTBOUND_TAGS[@]} - 1))]}"
+        if "$builder"; then
+            tag="$(jq -r '.tag' <<<"$BUILT_ITEM")"
+            if append_working_outbound "$BUILT_ITEM"; then
+                success "已追加 outbound：${tag}"
+            fi
+        else
+            build_status=$?
+            if (( build_status == MODULE_CANCEL_STATUS )); then
+                warn '已取消当前 outbound，未保存任何字段。'
+                continue
+            fi
+            return "$build_status"
         fi
     done
 }
@@ -1292,6 +1646,9 @@ apply_config_to_path() {
     local sing_box_bin=''
     local backup_path=''
     local service_status=''
+    local enable_output=''
+    local enable_status=''
+    local enable_check_exit=0
 
     if ! jq empty "$TEMP_CONFIG"; then
         error 'jq 校验失败；正式配置未修改，sing-box 未重启。'
@@ -1313,7 +1670,10 @@ apply_config_to_path() {
         return 1
     fi
 
-    install -d -m 0755 "$target_dir"
+    if ! install -d -m 0755 "$target_dir"; then
+        error "无法创建配置目录：${target_dir}；正式配置未修改，服务未重启。"
+        return 1
+    fi
 
     if [[ -e "$target_config" ]]; then
         backup_path="${target_config}.bak-$(date '+%Y%m%d-%H%M%S')"
@@ -1321,10 +1681,16 @@ apply_config_to_path() {
             error "备份目标已存在：${backup_path}；正式配置未修改。"
             return 1
         fi
-        cp -a -- "$target_config" "$backup_path"
+        if ! cp -a -- "$target_config" "$backup_path"; then
+            error "无法备份现有配置：${target_config}；正式配置未修改，服务未重启。"
+            return 1
+        fi
     fi
 
-    install -m 0600 -- "$TEMP_CONFIG" "$target_config"
+    if ! install -m 0600 -- "$TEMP_CONFIG" "$target_config"; then
+        error "无法写入正式配置：${target_config}；服务未重启。"
+        return 1
+    fi
     success "配置已写入：${target_config}"
     if [[ -n "$backup_path" ]]; then
         success "旧配置备份路径：${backup_path}"
@@ -1338,12 +1704,37 @@ apply_config_to_path() {
     fi
 
     if service_status="$(systemctl is-active sing-box 2>&1)"; then
-        success "sing-box 当前状态：${service_status}"
-        return 0
+        if [[ "$service_status" != 'active' ]]; then
+            show_service_failure "$backup_path" "${service_status:-未知}"
+            return 2
+        fi
+    else
+        show_service_failure "$backup_path" "${service_status:-未知}"
+        return 2
     fi
 
-    show_service_failure "$backup_path" "${service_status:-未知}"
-    return 2
+    if ! enable_output="$(systemctl enable sing-box.service 2>&1)"; then
+        error '配置已经应用且服务正在运行，但设置开机自启失败。'
+        if [[ -n "$enable_output" ]]; then
+            warn "systemctl enable 诊断：${enable_output}"
+        else
+            warn 'systemctl enable 未返回诊断信息。'
+        fi
+        return 2
+    fi
+
+    if enable_status="$(systemctl is-enabled sing-box.service 2>&1)"; then
+        enable_check_exit=0
+    else
+        enable_check_exit=$?
+    fi
+    if (( enable_check_exit != 0 )) || [[ "$enable_status" != 'enabled' ]]; then
+        error "配置已经应用且服务正在运行，但开机自启状态验证失败：${enable_status:-无输出}；退出码：${enable_check_exit}"
+        return 2
+    fi
+
+    success "sing-box 当前状态：${service_status}；开机自启状态：${enable_status}"
+    return 0
 }
 
 apply_config() {

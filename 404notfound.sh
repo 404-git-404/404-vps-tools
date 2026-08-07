@@ -81,7 +81,7 @@ readonly -a BASE_PACKAGES=(
   ca-certificates curl wget git rsync tar unzip xz-utils jq nano gnupg
   openssl socat cron openssh-server ufw dnsutils iproute2 iputils-ping
   netcat-openbsd mtr-tiny traceroute tcpdump procps lsof htop chrony vnstat
-  python3 util-linux file
+  python3 util-linux file sudo
 )
 
 usage() {
