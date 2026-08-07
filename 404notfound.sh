@@ -21,6 +21,8 @@ readonly SAGER_KEY_FINGERPRINT='2C317FBD5D886B4E89BAE8DA6D9152172A2B2F0C'
 readonly SMARTDNS_CONFIG_TARGET='/etc/smartdns/smartdns.conf'
 readonly SMARTDNS_RELEASE_TAG='smartdns-debian-pinned-2026-07'
 readonly SMARTDNS_RELEASE_BASE='https://github.com/404-git-404/404notfound/releases/download/smartdns-debian-pinned-2026-07'
+readonly APT_LOCK_TIMEOUT_SECONDS=300
+readonly APT_LOCK_RETRY_INTERVAL_SECONDS=2
 
 SSH_PORT="$DEFAULT_SSH_PORT"
 SING_BOX_VERSION=''
@@ -793,25 +795,146 @@ apt_lock_is_held() {
 }
 
 wait_for_apt_locks() {
-  local deadline=$((SECONDS + 300))
+  local deadline=$((SECONDS + APT_LOCK_TIMEOUT_SECONDS))
   local announced=false
   if ! command -v lslocks >/dev/null 2>&1; then
-    warn 'lslocks 不可用；将依赖 apt/dpkg 自身的 300 秒锁等待机制。'
+    warn "lslocks 不可用；将依赖 apt/dpkg 自身的 ${APT_LOCK_TIMEOUT_SECONDS} 秒锁等待机制。"
     return 0
   fi
   while apt_lock_is_held; do
     if [[ "$announced" == false ]]; then
-      log '检测到 apt/dpkg 锁，最多等待 300 秒；不会删除锁文件。'
+      log "检测到 apt/dpkg 锁，最多等待 ${APT_LOCK_TIMEOUT_SECONDS} 秒；不会删除锁文件。"
       announced=true
     fi
     (( SECONDS < deadline )) || die '等待 apt/dpkg 锁超时。'
-    sleep 2
+    sleep "$APT_LOCK_RETRY_INTERVAL_SECONDS"
   done
 }
 
 apt_get() {
   wait_for_apt_locks
-  apt-get -o DPkg::Lock::Timeout=300 "$@"
+  apt-get -o "DPkg::Lock::Timeout=$APT_LOCK_TIMEOUT_SECONDS" "$@"
+}
+
+apt_mark_error_is_lock() {
+  local output=$1
+
+  grep -Eqi \
+    'dpkg (frontend|database) lock was locked by another process|Could not get lock /var/lib/(dpkg|apt)|Unable to acquire (the )?(dpkg|apt)( frontend)? lock|is held by process [0-9]+|is another process using it' \
+    <<<"$output"
+}
+
+apt_lock_holder_details() {
+  local error_output=$1
+  local command_name=''
+  local holder_rows=''
+  local lock_rows=''
+  local pid=''
+
+  pid=$(
+    sed -nE \
+      -e 's/.*process with pid[[:space:]]+([0-9]+).*/\1/p' \
+      -e 's/.*held by process[[:space:]]+([0-9]+).*/\1/p' \
+      <<<"$error_output" |
+      awk 'NF { print; exit }'
+  )
+  if [[ -n "$pid" ]]; then
+    if [[ -r "/proc/$pid/comm" ]]; then
+      command_name=$(<"/proc/$pid/comm")
+    fi
+    if [[ -z "$command_name" ]]; then
+      command_name=$(
+        sed -nE \
+          's/.*held by process[[:space:]]+[0-9]+[[:space:]]+\(([^)]+)\).*/\1/p' \
+          <<<"$error_output" |
+          awk 'NF { print; exit }'
+      )
+    fi
+    if [[ -z "$command_name" ]] && command -v lslocks >/dev/null 2>&1; then
+      if ! lock_rows=$(lslocks --noheadings --raw \
+        --output PID,COMMAND,PATH 2>/dev/null); then
+        lock_rows=''
+      fi
+      command_name=$(
+        awk -v expected_pid="$pid" \
+          '$1 == expected_pid { print $2; exit }' <<<"$lock_rows"
+      )
+    fi
+    [[ -n "$command_name" ]] || command_name='未知或进程已退出'
+    printf 'PID=%s COMMAND=%s' "$pid" "$command_name"
+    return 0
+  fi
+
+  if command -v lslocks >/dev/null 2>&1; then
+    if ! lock_rows=$(lslocks --noheadings --raw \
+      --output PID,COMMAND,PATH 2>/dev/null); then
+      lock_rows=''
+    fi
+    holder_rows=$(
+      awk '
+        $3 == "/var/lib/dpkg/lock" ||
+        $3 == "/var/lib/dpkg/lock-frontend" ||
+        $3 == "/var/lib/apt/lists/lock" ||
+        $3 == "/var/cache/apt/archives/lock" {
+          if (found) {
+            printf "; "
+          }
+          printf "PID=%s COMMAND=%s LOCK=%s", $1, $2, $3
+          found = 1
+        }
+      ' <<<"$lock_rows"
+    )
+  fi
+  if [[ -n "$holder_rows" ]]; then
+    printf '%s' "$holder_rows"
+  else
+    printf 'PID=未知 COMMAND=未知'
+  fi
+}
+
+apt_mark_with_lock_retry() {
+  local command_text=''
+  local elapsed
+  local holder_details
+  local output
+  local retry_delay
+  local started_at=$SECONDS
+  local status
+  local waited=false
+
+  printf -v command_text ' %q' apt-mark "$@"
+  command_text=${command_text# }
+  while true; do
+    if output=$(apt-mark "$@" 2>&1); then
+      if [[ "$waited" == true ]]; then
+        elapsed=$((SECONDS - started_at))
+        log "apt/dpkg 锁已释放；继续执行命令：$command_text；已等待 ${elapsed} 秒。"
+      fi
+      return 0
+    else
+      status=$?
+    fi
+
+    if ! apt_mark_error_is_lock "$output"; then
+      [[ -z "$output" ]] || printf '%s\n' "$output" >&2
+      return "$status"
+    fi
+
+    waited=true
+    elapsed=$((SECONDS - started_at))
+    holder_details=$(apt_lock_holder_details "$output")
+    if (( elapsed >= APT_LOCK_TIMEOUT_SECONDS )); then
+      [[ -z "$output" ]] || printf '%s\n' "$output" >&2
+      warn "apt-mark 锁等待超时（${APT_LOCK_TIMEOUT_SECONDS} 秒）；命令：$command_text；占锁进程：$holder_details。"
+      return "$status"
+    fi
+    warn "apt-mark 遇到锁竞争；命令：$command_text；占锁进程：$holder_details；已等待 ${elapsed} 秒。"
+    retry_delay=$APT_LOCK_RETRY_INTERVAL_SECONDS
+    if ((elapsed + retry_delay > APT_LOCK_TIMEOUT_SECONDS)); then
+      retry_delay=$((APT_LOCK_TIMEOUT_SECONDS - elapsed))
+    fi
+    sleep "$retry_delay"
+  done
 }
 
 find_mismatched_debian_suites() {
@@ -2125,9 +2248,9 @@ restore_smartdns_transaction() {
     systemctl stop smartdns.service >/dev/null 2>&1 || restore_status=1
   fi
   if [[ "$SMARTDNS_WAS_HELD" == true ]]; then
-    apt-mark hold smartdns >/dev/null 2>&1 || restore_status=1
+    apt_mark_with_lock_retry hold smartdns || restore_status=1
   else
-    apt-mark unhold smartdns >/dev/null 2>&1 || restore_status=1
+    apt_mark_with_lock_retry unhold smartdns || restore_status=1
   fi
   if ((restore_status == 0)); then
     warn 'SmartDNS 原配置、服务状态和 hold 状态已恢复。'
@@ -2183,10 +2306,10 @@ smartdns_package_is_current() {
   local installed_status
   local installed_version
 
-  installed_status=$(dpkg-query -W -f='${db:Status-Abbrev}' smartdns 2>/dev/null || true)
+  installed_status=$(dpkg-query -W -f='${Status}' smartdns 2>/dev/null || true)
   installed_version=$(dpkg-query -W -f='${Version}' smartdns 2>/dev/null || true)
   installed_architecture=$(dpkg-query -W -f='${Architecture}' smartdns 2>/dev/null || true)
-  [[ "$installed_status" == ii* &&
+  [[ "$installed_status" == *' ok installed' &&
     "$installed_version" == "$SMARTDNS_EXPECTED_VERSION" &&
     "$installed_architecture" == "$CPU_ARCH" ]]
 }
@@ -2369,7 +2492,7 @@ install_smartdns() {
   if smartdns_package_is_current; then
     log "已安装精确目标版本 $SMARTDNS_EXPECTED_VERSION；跳过重复安装。"
   else
-    apt-mark unhold smartdns >/dev/null 2>&1 ||
+    apt_mark_with_lock_retry unhold smartdns ||
       die '安装前无法取消 smartdns hold。'
     apt_get -o Dpkg::Options::='--force-confold' install -y \
       --allow-downgrades "$SMARTDNS_PACKAGE_PATH"
@@ -2443,7 +2566,7 @@ install_smartdns() {
   grep -Eq 'status:[[:space:]]*NOERROR([,[:space:]]|$)' <<<"$aaaa_output" ||
     smartdns_health_fail "SmartDNS AAAA 查询状态不是 NOERROR：$(shorten_line "$aaaa_output")"
 
-  apt-mark hold smartdns >/dev/null ||
+  apt_mark_with_lock_retry hold smartdns ||
     smartdns_health_fail '健康检查通过后无法 hold smartdns。'
   apt-mark showhold | grep -Fxq smartdns ||
     smartdns_health_fail 'apt-mark 未确认 smartdns 处于 hold 状态。'
