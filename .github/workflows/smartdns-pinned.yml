@@ -204,7 +204,7 @@ jobs:
             ' scripts/update-smartdns.sh
             # shellcheck disable=SC2016
             printf '%s\n' \
-              'write_smartdns_configuration /tmp/smartdns.conf "${CONFIG_VARIANT}"'
+              'write_smartdns_configuration /tmp/smartdns.conf "${CONFIG_VARIANT}" ipv4'
           } > /tmp/render-config.sh
           CONFIG_VARIANT="${{ matrix.variant }}" bash /tmp/render-config.sh
           sed \
@@ -353,7 +353,7 @@ jobs:
                   capture && \$0 == \"}\" { exit }
                 " /repo/scripts/update-smartdns.sh
                 printf "%s\n" \
-                  "write_smartdns_configuration /tmp/smartdns.conf v40"
+                  "write_smartdns_configuration /tmp/smartdns.conf v40 ipv4"
               } > /tmp/render-config.sh
               bash /tmp/render-config.sh
 
