@@ -218,6 +218,43 @@ file_hash() {
     sha256sum "$1" | awk '{print $1}'
 }
 
+test_network_stack_listen_addresses() {
+    local mode=''
+    local expected=''
+
+    for mode in ipv4 ipv6 dual; do
+        NETWORK_STACK="$mode"
+        case "$mode" in
+            ipv4) expected='0.0.0.0' ;;
+            ipv6|dual) expected='::' ;;
+        esac
+        assert_equal "$expected" "$(get_listen_address)" \
+            "$mode maps to the required public listen address"
+
+        reset_generation_state
+        build_exit_shadowsocks_inbound >/dev/null <<'EOF'
+
+
+test-password
+EOF
+        assert_equal "$expected" "$(jq -r '.listen' <<<"$BUILT_ITEM")" \
+            "$mode public inbound uses get_listen_address"
+
+        reset_generation_state
+        build_cf_tunnel_inbound >/dev/null <<'EOF'
+
+test-uuid
+EOF
+        assert_equal '127.0.0.1' "$(jq -r '.listen' <<<"$BUILT_ITEM")" \
+            "$mode keeps CF Tunnel localhost-only"
+    done
+
+    NETWORK_STACK='dual'
+    select_network_stack >/dev/null <<<''
+    assert_equal 'ipv4' "$NETWORK_STACK" \
+        'direct Enter selects IPv4-only by default'
+}
+
 test_reality_domain_is_reused() {
     local output_file="$TEST_TEMP_DIR/reality-output"
     local prompt_output=''
@@ -869,7 +906,7 @@ test_cancel_in_existing_mode_is_transactional() {
     before="$WORKING_CONFIG_JSON"
     add_outbounds_to_working_config >/dev/null < <(
         printf '2\nsocks-existing-cancel\n\033'
-        sleep 0.2
+        sleep 1
         printf '4\n'
     )
     assert_json_equal "$before" "$WORKING_CONFIG_JSON" \
@@ -1012,6 +1049,7 @@ test_outbound_menu_order_and_sudo_package() {
 
 command -v jq >/dev/null 2>&1 || fail 'jq is required for this test'
 
+test_network_stack_listen_addresses
 test_reality_domain_is_reused
 test_transit_hysteria2_has_no_salamander_obfs
 test_append_hy2_preserves_reality_and_unknown_fields

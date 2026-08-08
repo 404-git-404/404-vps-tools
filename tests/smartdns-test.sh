@@ -150,19 +150,23 @@ render_configuration() {
   local script=$1
   local variant=$2
   local target=$3
+  local network_stack=$4
   local library="$TMP_DIR/render-library.sh"
 
   {
     printf '%s\n' 'set -Eeuo pipefail'
+    printf 'NETWORK_STACK=%q\n' "$network_stack"
     printf '%s\n' 'die() { printf "%s\n" "$*" >&2; exit 1; }'
     extract_function "$script" write_smartdns_configuration
-    printf 'write_smartdns_configuration %q %q\n' "$target" "$variant"
+    printf 'write_smartdns_configuration %q %q %q\n' \
+      "$target" "$variant" "$network_stack"
   } >"$library"
   bash "$library"
 }
 
 write_expected_common() {
   local target=$1
+  local network_stack=$2
   cat >"$target" <<'EXPECTED_COMMON'
 bind 127.0.0.1:53
 bind-tcp 127.0.0.1:53
@@ -176,10 +180,8 @@ serve-expired-reply-ttl 3
 serve-expired-prefetch-time 21600
 prefetch-domain yes
 
-speed-check-mode tcp:443,ping
-response-mode first-ping
-dualstack-ip-selection yes
-dualstack-ip-selection-threshold 10
+speed-check-mode none
+response-mode fastest-response
 
 log-level warn
 log-console no
@@ -189,49 +191,387 @@ audit-enable no
 ca-file /etc/ssl/certs/ca-certificates.crt
 
 EXPECTED_COMMON
+  case "$network_stack" in
+    ipv4) printf '%s\n\n' 'force-AAAA-SOA yes' >>"$target" ;;
+    ipv6) printf '%s\n\n' 'force-qtype-SOA 1' >>"$target" ;;
+    dual) ;;
+  esac
 }
 
 test_configurations() {
   local installer_config
   local updater_config
   local expected_config
+  local network_stack
   local variant
 
   for variant in v40 v46; do
-    installer_config="$TMP_DIR/installer-$variant.conf"
-    updater_config="$TMP_DIR/updater-$variant.conf"
-    expected_config="$TMP_DIR/expected-$variant.conf"
-    render_configuration "$INSTALLER" "$variant" "$installer_config"
-    render_configuration "$UPDATER" "$variant" "$updater_config"
+    for network_stack in ipv4 ipv6 dual; do
+    installer_config="$TMP_DIR/installer-$variant-$network_stack.conf"
+    updater_config="$TMP_DIR/updater-$variant-$network_stack.conf"
+    expected_config="$TMP_DIR/expected-$variant-$network_stack.conf"
+    render_configuration "$INSTALLER" "$variant" "$installer_config" "$network_stack"
+    render_configuration "$UPDATER" "$variant" "$updater_config" "$network_stack"
     cmp -s "$installer_config" "$updater_config" ||
-      fail "主脚本与更新脚本的 $variant 配置不一致。"
-    write_expected_common "$expected_config"
-    if [[ "$variant" == v40 ]]; then
+      fail "主脚本与更新脚本的 $variant/$network_stack 配置不一致。"
+    write_expected_common "$expected_config" "$network_stack"
+    if [[ "$variant:$network_stack" == 'v40:ipv6' ]]; then
+      cat >>"$expected_config" <<'EXPECTED_VARIANT'
+server-https https://[2606:4700:4700::1111]/dns-query -host-name cloudflare-dns.com -http-host cloudflare-dns.com -tls-host-verify cloudflare-dns.com
+server-https https://[2001:4860:4860::8888]/dns-query -host-name dns.google -http-host dns.google -tls-host-verify dns.google
+EXPECTED_VARIANT
+    elif [[ "$variant" == v40 ]]; then
       cat >>"$expected_config" <<'EXPECTED_VARIANT'
 server-https https://1.1.1.1/dns-query -host-name cloudflare-dns.com -http-host cloudflare-dns.com -tls-host-verify cloudflare-dns.com
 server-https https://8.8.8.8/dns-query -host-name dns.google -http-host dns.google -tls-host-verify dns.google
-server-https https://9.9.9.10/dns-query -host-name dns.quad9.net -http-host dns.quad9.net -tls-host-verify dns.quad9.net -fallback
+EXPECTED_VARIANT
+    elif [[ "$network_stack" == ipv6 ]]; then
+      cat >>"$expected_config" <<'EXPECTED_VARIANT'
+server-https https://cloudflare-dns.com/dns-query -host-ip 2606:4700:4700::1111
+server-https https://dns.google/dns-query -host-ip 2001:4860:4860::8888
 EXPECTED_VARIANT
     else
       cat >>"$expected_config" <<'EXPECTED_VARIANT'
 server-https https://cloudflare-dns.com/dns-query -host-ip 1.1.1.1
 server-https https://dns.google/dns-query -host-ip 8.8.8.8
-server-https https://dns.quad9.net/dns-query -host-ip 9.9.9.10 -fallback
 EXPECTED_VARIANT
     fi
     cmp -s "$expected_config" "$installer_config" ||
-      fail "$variant 配置与要求的精确模板不一致。"
+      fail "$variant/$network_stack 配置与要求的精确模板不一致。"
     ! grep -Eq '\\[[:space:]]*$' "$installer_config" ||
       fail "$variant 配置不应使用续行。"
-    [[ $(grep -c '^server-https ' "$installer_config") -eq 3 ]] ||
-      fail "$variant 配置必须严格包含三条 DoH 上游。"
+    [[ $(grep -c '^server-https ' "$installer_config") -eq 2 ]] ||
+      fail "$variant/$network_stack 配置必须严格包含两条 DoH 上游。"
+    assert_file_contains_line "$installer_config" 'bind 127.0.0.1:53'
+    assert_file_contains_line "$installer_config" 'bind-tcp 127.0.0.1:53'
+    ! grep -Eqi 'quad9|9\.9\.9\.9|149\.112\.' "$installer_config" ||
+      fail "$variant/$network_stack 配置仍包含 Quad9。"
+    done
   done
-  assert_file_contains_line "$TMP_DIR/installer-v40.conf" \
-    'server-https https://9.9.9.10/dns-query -host-name dns.quad9.net -http-host dns.quad9.net -tls-host-verify dns.quad9.net -fallback'
-  assert_file_contains_line "$TMP_DIR/installer-v46.conf" \
-    'server-https https://dns.quad9.net/dns-query -host-ip 9.9.9.10 -fallback'
   ((TESTS_RUN += 1))
-  log 'v40/v46 精确配置、DoH 参数和无续行测试通过。'
+  log 'v40/v46 × 三种 NETWORK_STACK 精确配置、DoH 参数、过滤规则和无 Quad9 测试通过。'
+}
+
+run_network_switch_case() {
+  local target_stack=$1
+  local case_dir="$TMP_DIR/network-switch-$target_stack"
+  local driver="$case_dir/driver.sh"
+  local output
+
+  mkdir -p "$case_dir"
+  {
+    cat <<'DRIVER'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+IPV6_DISABLE_CONFIG="$CASE_DIR/etc/99-disable-ipv6.conf"
+NETWORK_STACK_UNIT="$CASE_DIR/etc/404-network-stack.service"
+NETWORK_STACK_UNIT_NAME='404-network-stack.service'
+TMP_DIR="$CASE_DIR"
+NETWORK_STACK='ipv4'
+printf '0\n' >"$CASE_DIR/all"
+printf '0\n' >"$CASE_DIR/default"
+printf '0\n' >"$CASE_DIR/lo"
+log() { :; }
+fail_with_recovery() { printf '%s\n' "$1" >&2; exit 1; }
+install() {
+  local source=${*: -2:1}
+  local target=${*: -1}
+  mkdir -p "$(dirname "$target")"
+  cp "$source" "$target"
+}
+sysctl() {
+  local key=''
+  local value=''
+  if [[ "$1" == '--load' ]]; then
+    printf '1\n' >"$CASE_DIR/all"
+    printf '1\n' >"$CASE_DIR/default"
+    printf '1\n' >"$CASE_DIR/lo"
+    return 0
+  fi
+  if [[ "$1" == '-n' ]]; then
+    key=${2##*.}
+    [[ "$key" == disable_ipv6 ]] && key=${2#net.ipv6.conf.}
+    key=${key%.disable_ipv6}
+    cat "$CASE_DIR/$key"
+    return 0
+  fi
+  [[ "$1" == '-q' && "$2" == '-w' ]] || return 2
+  key=${3%%=*}
+  value=${3#*=}
+  key=${key#net.ipv6.conf.}
+  key=${key%.disable_ipv6}
+  printf '%s\n' "$value" >"$CASE_DIR/$key"
+}
+restore_ipv6_network_configuration() { :; }
+install_ipv4_network_stack_unit() {
+  rm -f -- "$IPV6_DISABLE_CONFIG"
+  mkdir -p -- "$(dirname "$NETWORK_STACK_UNIT")"
+  printf 'managed\n' >"$NETWORK_STACK_UNIT"
+  printf '1\n' >"$CASE_DIR/all"
+  printf '1\n' >"$CASE_DIR/default"
+  printf '1\n' >"$CASE_DIR/lo"
+}
+remove_ipv4_network_stack_unit() {
+  rm -f -- "$NETWORK_STACK_UNIT" "$IPV6_DISABLE_CONFIG"
+}
+DRIVER
+    extract_function "$UPDATER" configure_network_stack
+    cat <<'DRIVER'
+configure_network_stack
+NETWORK_STACK="$TARGET_STACK"
+configure_network_stack
+printf '%s|%s|%s|%s\n' \
+  "$(<"$CASE_DIR/all")" "$(<"$CASE_DIR/default")" \
+  "$(<"$CASE_DIR/lo")" "$([[ -e "$IPV6_DISABLE_CONFIG" ]] && printf present || printf absent)"
+DRIVER
+  } >"$driver"
+  output=$(CASE_DIR="$case_dir" TARGET_STACK="$target_stack" bash "$driver")
+  assert_eq '0|0|0|absent' "$output" \
+    "IPv4-only -> $target_stack 必须恢复 IPv6 并删除禁用配置"
+}
+
+test_ipv6_network_recovery() {
+  local case_dir="$TMP_DIR/ipv6-network-recovery"
+  local driver="$case_dir/driver.sh"
+  local output
+
+  mkdir -p "$case_dir/bin"
+  cat >"$case_dir/bin/ip" <<'MOCK_IP'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+if [[ -e "$CASE_DIR/ipv6-ready" ]]; then
+  if [[ "$*" == '-6 -o addr show scope global' ]]; then
+    printf '2: eth0    inet6 2001:db8::10/64 scope global\n'
+  elif [[ "$*" == '-6 route show default' ]]; then
+    printf 'default via 2001:db8::1 dev eth0\n'
+  fi
+fi
+MOCK_IP
+  cat >"$case_dir/bin/ifup" <<'MOCK_IFUP'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+printf '%s\n' "$*" >"$CASE_DIR/ifup-args"
+touch "$CASE_DIR/ipv6-ready"
+MOCK_IFUP
+  cat >"$case_dir/bin/sleep" <<'MOCK_SLEEP'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+printf '%s\n' "$*" >>"$CASE_DIR/sleeps"
+MOCK_SLEEP
+  chmod +x "$case_dir/bin/ip" "$case_dir/bin/ifup" "$case_dir/bin/sleep"
+
+  {
+    cat <<'DRIVER'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+NETWORK_STACK='dual'
+log() { :; }
+warn() { :; }
+DRIVER
+    extract_function "$UPDATER" ipv6_network_ready
+    extract_function "$UPDATER" restore_ipv6_network_configuration
+    cat <<'DRIVER'
+restore_ipv6_network_configuration
+ipv6_network_ready
+printf '%s\n' "$(<"$CASE_DIR/ifup-args")"
+DRIVER
+  } >"$driver"
+
+  output=$(CASE_DIR="$case_dir" PATH="$case_dir/bin:$PATH" bash "$driver")
+  assert_eq '--force --ignore-errors -a' "$output" \
+    'IPv6 地址/路由缺失时必须在不 ifdown 的情况下重新应用 ifupdown 配置'
+}
+
+test_delayed_ipv6_disable_unit() {
+  local case_dir="$TMP_DIR/delayed-ipv6-disable"
+  local driver="$case_dir/driver.sh"
+  local output
+
+  mkdir -p "$case_dir"
+  {
+    cat <<'DRIVER'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+NETWORK_STACK_UNIT="$CASE_DIR/etc/systemd/system/404-network-stack.service"
+NETWORK_STACK_UNIT_NAME='404-network-stack.service'
+IPV6_DISABLE_CONFIG="$CASE_DIR/99-disable-ipv6.conf"
+TMP_DIR="$CASE_DIR"
+NETWORK_STACK='ipv4'
+printf '0\n' >"$CASE_DIR/all"
+printf '0\n' >"$CASE_DIR/default"
+printf '0\n' >"$CASE_DIR/lo"
+printf 'disabled\n' >"$CASE_DIR/unit-enabled"
+printf 'inactive\n' >"$CASE_DIR/unit-active"
+printf 'legacy\n' >"$IPV6_DISABLE_CONFIG"
+log() { :; }
+warn() { :; }
+fail_with_recovery() { printf '%s\n' "$1" >&2; exit 1; }
+install() {
+  local source=${*: -2:1}
+  local target=${*: -1}
+  mkdir -p "$(dirname "$target")"
+  cp "$source" "$target"
+}
+sysctl() {
+  local key
+  local value
+  if [[ "$1" == '-n' ]]; then
+    key=${2#net.ipv6.conf.}
+    key=${key%.disable_ipv6}
+    cat "$CASE_DIR/$key"
+    return 0
+  fi
+  [[ "$1" == '-q' && "$2" == '-w' ]] || return 2
+  key=${3%%=*}
+  value=${3#*=}
+  key=${key#net.ipv6.conf.}
+  key=${key%.disable_ipv6}
+  printf '%s\n' "$value" >"$CASE_DIR/$key"
+}
+systemctl() {
+  case "$1" in
+    cat) [[ -e "$NETWORK_STACK_UNIT" ]] ;;
+    daemon-reload) ;;
+    enable) printf 'enabled\n' >"$CASE_DIR/unit-enabled" ;;
+    disable)
+      printf 'disabled\n' >"$CASE_DIR/unit-enabled"
+      [[ " $* " != *' --now '* ]] || printf 'inactive\n' >"$CASE_DIR/unit-active"
+      ;;
+    restart)
+      printf 'active\n' >"$CASE_DIR/unit-active"
+      printf '1\n' >"$CASE_DIR/all"
+      printf '1\n' >"$CASE_DIR/default"
+      printf '1\n' >"$CASE_DIR/lo"
+      ;;
+    stop) printf 'inactive\n' >"$CASE_DIR/unit-active" ;;
+    is-enabled) [[ "$(<"$CASE_DIR/unit-enabled")" == enabled ]] ;;
+    is-active) [[ "$(<"$CASE_DIR/unit-active")" == active ]] ;;
+    *) return 2 ;;
+  esac
+}
+restore_ipv6_network_configuration() { :; }
+DRIVER
+    extract_function "$UPDATER" install_ipv4_network_stack_unit
+    extract_function "$UPDATER" remove_ipv4_network_stack_unit
+    extract_function "$UPDATER" configure_network_stack
+    cat <<'DRIVER'
+configure_network_stack
+first_hash=$(sha256sum "$NETWORK_STACK_UNIT" | awk '{ print $1 }')
+grep -Fxq 'After=networking.service' "$NETWORK_STACK_UNIT"
+grep -Fxq 'Before=smartdns.service sing-box.service' "$NETWORK_STACK_UNIT"
+test ! -e "$IPV6_DISABLE_CONFIG"
+configure_network_stack
+second_hash=$(sha256sum "$NETWORK_STACK_UNIT" | awk '{ print $1 }')
+printf '0\n' >"$CASE_DIR/all"
+printf '0\n' >"$CASE_DIR/default"
+printf '0\n' >"$CASE_DIR/lo"
+printf 'inactive\n' >"$CASE_DIR/unit-active"
+if [[ "$(<"$CASE_DIR/unit-enabled")" == enabled ]]; then
+  systemctl restart "$NETWORK_STACK_UNIT_NAME"
+fi
+ipv4_boot="$(<"$CASE_DIR/all")/$(<"$CASE_DIR/default")/$(<"$CASE_DIR/lo")"
+NETWORK_STACK='dual'
+configure_network_stack
+dual_state="$(<"$CASE_DIR/all")/$(<"$CASE_DIR/default")/$(<"$CASE_DIR/lo")"
+printf '0\n' >"$CASE_DIR/all"
+printf '0\n' >"$CASE_DIR/default"
+printf '0\n' >"$CASE_DIR/lo"
+if [[ "$(<"$CASE_DIR/unit-enabled")" == enabled ]]; then
+  systemctl restart "$NETWORK_STACK_UNIT_NAME"
+fi
+dual_boot="$(<"$CASE_DIR/all")/$(<"$CASE_DIR/default")/$(<"$CASE_DIR/lo")"
+printf '%s|%s|%s|%s|%s|%s\n' \
+  "$([[ "$first_hash" == "$second_hash" ]] && printf stable || printf drift)" \
+  "$ipv4_boot" "$([[ -e "$NETWORK_STACK_UNIT" ]] && printf present || printf absent)" \
+  "$(<"$CASE_DIR/unit-enabled")" "$dual_state" "$dual_boot"
+DRIVER
+  } >"$driver"
+
+  output=$(CASE_DIR="$case_dir" bash "$driver")
+  assert_eq 'stable|1/1/1|absent|disabled|0/0/0|0/0/0' "$output" \
+    '延后禁用 unit 必须幂等、IPv4 reboot 重放 1/1/1，并在 dual/reboot 保持清理和 0/0/0'
+}
+
+test_network_stack_rollback_cleanup() {
+  local case_dir="$TMP_DIR/network-stack-rollback"
+  local driver="$case_dir/driver.sh"
+  local output
+
+  mkdir -p "$case_dir/backup"
+  {
+    cat <<'DRIVER'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+BACKUP_READY=true
+BACKUP_DIR="$CASE_DIR/backup"
+CONFIG_TARGET="$CASE_DIR/smartdns.conf"
+IPV6_DISABLE_CONFIG="$CASE_DIR/99-disable-ipv6.conf"
+NETWORK_STACK_UNIT="$CASE_DIR/404-network-stack.service"
+NETWORK_STACK_UNIT_NAME='404-network-stack.service'
+RESOLV_CONF="$CASE_DIR/resolv.conf"
+CONFIG_PREEXISTED=false
+IPV6_CONFIG_PREEXISTED=false
+NETWORK_STACK_UNIT_PREEXISTED=false
+NETWORK_STACK_UNIT_WAS_ENABLED=false
+NETWORK_STACK_UNIT_WAS_ACTIVE=false
+RESOLV_CONF_PREEXISTED=false
+SMARTDNS_WAS_ENABLED=false
+SMARTDNS_WAS_ACTIVE=false
+SMARTDNS_WAS_HELD=false
+SYSTEMD_RESOLVED_UNIT_PRESENT=false
+SYSTEMD_RESOLVED_WAS_ENABLED=false
+SYSTEMD_RESOLVED_WAS_ACTIVE=false
+IPV6_ALL_WAS_DISABLED='0'
+IPV6_DEFAULT_WAS_DISABLED='0'
+IPV6_LOOPBACK_WAS_DISABLED='0'
+printf 'unit\n' >"$NETWORK_STACK_UNIT"
+printf 'legacy\n' >"$IPV6_DISABLE_CONFIG"
+printf '1\n' >"$CASE_DIR/all"
+printf '1\n' >"$CASE_DIR/default"
+printf '1\n' >"$CASE_DIR/lo"
+: >"$CASE_DIR/systemctl-trace"
+warn() { :; }
+apt-mark() { :; }
+sysctl() {
+  local key=${3%%=*}
+  local value=${3#*=}
+  key=${key#net.ipv6.conf.}
+  key=${key%.disable_ipv6}
+  printf '%s\n' "$value" >"$CASE_DIR/$key"
+}
+systemctl() {
+  printf '%s\n' "$*" >>"$CASE_DIR/systemctl-trace"
+  if [[ "$1" == cat ]]; then
+    [[ -e "$NETWORK_STACK_UNIT" ]]
+  fi
+  return 0
+}
+DRIVER
+    extract_function "$UPDATER" restore_previous_state
+    cat <<'DRIVER'
+restore_previous_state
+printf '%s|%s|%s|%s|%s\n' \
+  "$([[ -e "$NETWORK_STACK_UNIT" ]] && printf present || printf absent)" \
+  "$([[ -e "$IPV6_DISABLE_CONFIG" ]] && printf present || printf absent)" \
+  "$(<"$CASE_DIR/all")/$(<"$CASE_DIR/default")/$(<"$CASE_DIR/lo")" \
+  "$(grep -Fxc 'disable --now 404-network-stack.service' "$CASE_DIR/systemctl-trace")" \
+  "$(grep -Fxc 'daemon-reload' "$CASE_DIR/systemctl-trace")"
+DRIVER
+  } >"$driver"
+
+  output=$(CASE_DIR="$case_dir" bash "$driver")
+  assert_eq 'absent|absent|0/0/0|1|1' "$output" \
+    'rollback 必须停用并删除新建 network-stack unit、早期 sysctl 文件并恢复原 sysctl'
+}
+
+test_network_stack_switches() {
+  run_network_switch_case dual
+  run_network_switch_case ipv6
+  test_ipv6_network_recovery
+  test_delayed_ipv6_disable_unit
+  test_network_stack_rollback_cleanup
+  ((TESTS_RUN += 1))
+  log '延后 IPv6 禁用、IPv4/dual reboot、幂等、ifupdown 恢复和 rollback 清理测试通过。'
 }
 
 write_mock_commands() {
@@ -428,24 +768,38 @@ set -Eeuo pipefail
 printf 'systemctl %s\n' "$*" >>"$MOCK_TRACE"
 case "$1" in
   stop)
+    [[ " $* " == *' systemd-resolved.service '* ]] && exit 0
     printf 'inactive\n' >"$MOCK_SERVICE_STATE"
+    ;;
+  start)
+    [[ " $* " == *' systemd-resolved.service '* ]] && exit 0
+    printf 'active\n' >"$MOCK_SERVICE_STATE"
     ;;
   restart)
     printf 'active\n' >"$MOCK_SERVICE_STATE"
     ;;
   enable)
+    [[ " $* " == *' systemd-resolved.service '* ]] && exit 0
     printf 'enabled\n' >"$MOCK_ENABLED_STATE"
     ;;
   disable)
+    [[ " $* " == *' systemd-resolved.service '* ]] && exit 0
     printf 'disabled\n' >"$MOCK_ENABLED_STATE"
     ;;
-  daemon-reload | reset-failed)
+  daemon-reload)
+    ;;
+  reset-failed)
+    exit "${MOCK_RESET_FAILED_RC:-0}"
     ;;
   is-enabled)
+    if [[ " $* " == *' systemd-resolved.service '* ]]; then exit 1; fi
+    if [[ " $* " == *' 404-network-stack.service '* ]]; then exit 1; fi
     [[ "$(<"$MOCK_ENABLED_STATE")" == enabled ]] || exit 1
     [[ " $* " == *' --quiet '* ]] || printf 'enabled\n'
     ;;
   is-active)
+    if [[ " $* " == *' systemd-resolved.service '* ]]; then exit 1; fi
+    if [[ " $* " == *' 404-network-stack.service '* ]]; then exit 1; fi
     [[ "$(<"$MOCK_SERVICE_STATE")" == active ]] || exit 1
     [[ " $* " == *' --quiet '* ]] || printf 'active\n'
     ;;
@@ -521,6 +875,10 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 
 readonly CONFIG_TARGET="$MOCK_CASE_DIR/etc/smartdns/smartdns.conf"
+readonly IPV6_DISABLE_CONFIG="$MOCK_CASE_DIR/etc/sysctl.d/99-disable-ipv6.conf"
+readonly NETWORK_STACK_UNIT="$MOCK_CASE_DIR/etc/systemd/system/404-network-stack.service"
+readonly NETWORK_STACK_UNIT_NAME='404-network-stack.service'
+readonly RESOLV_CONF="$MOCK_RESOLV_CONF"
 readonly SMARTDNS_RELEASE_TAG='smartdns-debian-pinned-2026-07'
 TMP_DIR="$MOCK_CASE_DIR/work"
 STAGED_CONFIG="$TMP_DIR/smartdns.conf"
@@ -555,9 +913,29 @@ SMARTDNS_WAS_HELD=false
 SMARTDNS_WAS_ENABLED=false
 SMARTDNS_WAS_ACTIVE=false
 BACKUP_READY=false
+NETWORK_STACK='ipv4'
+IPV6_CONFIG_PREEXISTED=false
+NETWORK_STACK_UNIT_PREEXISTED=false
+NETWORK_STACK_UNIT_WAS_ENABLED=false
+NETWORK_STACK_UNIT_WAS_ACTIVE=false
+RESOLV_CONF_PREEXISTED=false
+IPV6_ALL_WAS_DISABLED='0'
+IPV6_DEFAULT_WAS_DISABLED='0'
+IPV6_LOOPBACK_WAS_DISABLED='0'
+SYSTEMD_RESOLVED_WAS_ENABLED=false
+SYSTEMD_RESOLVED_WAS_ACTIVE=false
 
 mock_step() {
   printf 'step %s\n' "$1" >>"$MOCK_TRACE"
+}
+
+parse_args() {
+  mock_step parse-args
+}
+
+sysctl() {
+  [[ "${1:-}" == '-n' ]] && printf '0\n'
+  return 0
 }
 
 require_root_and_debian() {
@@ -599,6 +977,9 @@ create_backup() {
 
 validate_configuration_independently() {
   mock_step validate-configuration-independently
+  if [[ "${MOCK_CONFIG_FAILURE:-false}" == true ]]; then
+    fail_with_recovery 'SmartDNS 配置验证失败。'
+  fi
 }
 
 check_port_53_conflicts() {
@@ -607,6 +988,20 @@ check_port_53_conflicts() {
 
 deploy_configuration() {
   mock_step deploy-configuration
+}
+
+configure_network_stack() {
+  mock_step configure-network-stack
+}
+
+validate_network_stack_health() {
+  mock_step validate-network-stack-health
+}
+
+configure_system_resolver() {
+  printf 'nameserver 127.0.0.1\noptions timeout:2 attempts:2\n' >"$TMP_DIR/resolv.conf"
+  cp "$TMP_DIR/resolv.conf" "$MOCK_RESOLV_CONF"
+  mock_step configure-system-resolver
 }
 DRIVER_PREAMBLE
     extract_function "$UPDATER" log
@@ -624,14 +1019,8 @@ DRIVER_PREAMBLE
     extract_function "$UPDATER" listener_present
     extract_function "$UPDATER" first_valid_ipv4
     extract_function "$UPDATER" query_smartdns_ipv4
-    extract_function "$UPDATER" valid_system_ipv4_answer
     extract_function "$UPDATER" start_and_validate_service
-    # shellcheck disable=SC2016
-    extract_function "$UPDATER" report_system_dns_mismatch |
-      sed 's#/etc/resolv\.conf#"$MOCK_RESOLV_CONF"#g'
-    # shellcheck disable=SC2016
-    extract_function "$UPDATER" check_debian_system_dns |
-      sed 's#/etc/resolv\.conf#"$MOCK_RESOLV_CONF"#g'
+    extract_function "$UPDATER" check_debian_system_dns
     extract_function "$UPDATER" print_summary
     extract_function "$UPDATER" main
     printf '%s\n' 'main "$@"'
@@ -648,7 +1037,7 @@ prepare_updater_flow_case() {
   printf 'active\n' >"$case_dir/service-state"
   printf 'enabled\n' >"$case_dir/enabled-state"
   printf 'smartdns\n' >"$case_dir/hold-state"
-  printf 'nameserver %s\n' "$nameserver" >"$case_dir/resolv.conf"
+  printf 'nameserver %s\noptions timeout:2 attempts:2\n' "$nameserver" >"$case_dir/resolv.conf"
   write_updater_flow_mocks "$case_dir/bin"
   write_updater_flow_driver "$case_dir/driver.sh"
 }
@@ -657,6 +1046,8 @@ run_updater_flow_case() {
   local case_dir=$1
   local residual=$2
   local output=$3
+  local config_failure=${4:-false}
+  local reset_failed_rc=${5:-0}
 
   PATH="$case_dir/bin:$PATH" \
     MOCK_CASE_DIR="$case_dir" \
@@ -666,6 +1057,8 @@ run_updater_flow_case() {
     MOCK_HOLD_STATE="$case_dir/hold-state" \
     MOCK_RESOLV_CONF="$case_dir/resolv.conf" \
     MOCK_RESIDUAL="$residual" \
+    MOCK_CONFIG_FAILURE="$config_failure" \
+    MOCK_RESET_FAILED_RC="$reset_failed_rc" \
     bash "$case_dir/driver.sh" >"$output" 2>&1
 }
 
@@ -692,8 +1085,11 @@ test_capture_state_false_returns_success() {
   {
     printf '%s\n' 'set -Eeuo pipefail'
     printf '%s\n' 'SMARTDNS_WAS_HELD=true; SMARTDNS_WAS_ENABLED=true; SMARTDNS_WAS_ACTIVE=true'
+    printf '%s\n' "NETWORK_STACK_UNIT_NAME='404-network-stack.service'"
+    printf '%s\n' 'NETWORK_STACK_UNIT_WAS_ENABLED=true; NETWORK_STACK_UNIT_WAS_ACTIVE=true'
     printf '%s\n' 'apt-mark() { return 1; }'
     printf '%s\n' 'systemctl() { return 1; }'
+    printf '%s\n' 'sysctl() { printf "0\n"; }'
     extract_function "$UPDATER" capture_existing_state
     printf '%s\n' 'capture_existing_state'
     # shellcheck disable=SC2016
@@ -705,10 +1101,12 @@ test_capture_state_false_returns_success() {
 }
 
 test_updater_full_regression_flow() {
-  local bad_dns_case="$TMP_DIR/updater-flow-bad-dns"
-  local bad_dns_output="$bad_dns_case/output"
+  local bad_config_case="$TMP_DIR/updater-flow-bad-config"
+  local bad_config_output="$bad_config_case/output"
   local residual_case="$TMP_DIR/updater-flow-residual"
   local residual_output="$residual_case/output"
+  local reset_failed_case="$TMP_DIR/updater-flow-reset-failed"
+  local reset_failed_output="$reset_failed_case/output"
   local status
   local success_case="$TMP_DIR/updater-flow-success"
   local success_output="$success_case/output"
@@ -724,6 +1122,8 @@ test_updater_full_regression_flow() {
     fail '精确版本且 hold 时没有跳过重复安装。'
   ! grep -Fq 'apt-get ' "$success_case/trace" ||
     fail '精确版本且 hold 时不应调用 apt-get 安装 SmartDNS。'
+  ! grep -Fq 'step download-and-verify-package' "$success_case/trace" ||
+    fail '精确版本已安装时不应依赖外部下载后才能切换网络栈。'
   assert_trace_order "$success_case/trace" \
     'systemctl is-active --quiet smartdns.service' \
     'step create-backup' \
@@ -731,19 +1131,18 @@ test_updater_full_regression_flow() {
     'step validate-configuration-independently' \
     'step check-port-53-conflicts' \
     'step deploy-configuration' \
+    'step configure-network-stack' \
     'systemctl restart smartdns.service' \
     'ss -H -lntup sport = :53' \
-    'dig @127.0.0.1 cloudflare.com A +short +time=4 +tries=1' \
-    'dig @127.0.0.1 cloudflare.com AAAA +time=4 +tries=1' \
+    'step validate-network-stack-health' \
     'apt-mark hold smartdns' \
-    'getent ahostsv4 cloudflare.com'
+    'step configure-system-resolver' \
+    'getent hosts cloudflare.com'
   grep -Fq '127.0.0.1:53 的 TCP 和 UDP 监听验证通过。' "$success_output" ||
     fail '成功路径缺少 TCP/UDP 53 验证。'
-  grep -Fq 'IPv4 查询第 1 次成功：104.16.132.229' "$success_output" ||
-    fail '成功路径缺少 IPv4 验证。'
-  grep -Fq 'AAAA 查询状态：NOERROR' "$success_output" ||
-    fail '成功路径缺少 AAAA 验证。'
-  grep -Fq 'Debian 系统 DNS 验证通过：仅 127.0.0.1。' "$success_output" ||
+  grep -Fq '网络栈健康检查：ipv4。' "$success_output" ||
+    fail '成功路径缺少网络栈验证。'
+  grep -Fq 'Debian 系统 DNS 验证通过：仅 127.0.0.1，systemd-resolved inactive。' "$success_output" ||
     fail '成功路径缺少 Debian 系统 DNS 验证。'
   grep -Fq 'SmartDNS 更新成功' "$success_output" ||
     fail '成功路径没有执行 print_summary。'
@@ -753,6 +1152,17 @@ test_updater_full_regression_flow() {
     '成功后 smartdns.service 应保持 enabled'
   assert_eq 'smartdns' "$(<"$success_case/hold-state")" \
     '成功后 smartdns 应保持 hold'
+
+  prepare_updater_flow_case "$reset_failed_case" '127.0.0.1'
+  if ! run_updater_flow_case \
+    "$reset_failed_case" false "$reset_failed_output" false 1; then
+    cat "$reset_failed_output" >&2
+    fail '普通 inactive unit 没有 failed 状态时，不应因 reset-failed 非零而中止更新。'
+  fi
+  grep -Fq 'systemctl restart smartdns.service' "$reset_failed_case/trace" ||
+    fail 'reset-failed 非零后没有继续严格启动 SmartDNS。'
+  assert_eq 'active' "$(<"$reset_failed_case/service-state")" \
+    'reset-failed 非零后 smartdns.service 应通过 restart 进入 active'
 
   prepare_updater_flow_case "$residual_case" '127.0.0.1'
   set +e
@@ -772,24 +1182,26 @@ test_updater_full_regression_flow() {
   assert_eq 'active' "$(<"$residual_case/service-state")" \
     '残留进程失败恢复后服务应恢复为 active'
 
-  prepare_updater_flow_case "$bad_dns_case" '8.8.8.8'
+  prepare_updater_flow_case "$bad_config_case" '127.0.0.1'
   set +e
-  run_updater_flow_case "$bad_dns_case" false "$bad_dns_output"
+  run_updater_flow_case "$bad_config_case" false "$bad_config_output" true
   status=$?
   set -e
   [[ "$status" -ne 0 ]] ||
-    fail '系统 DNS 不仅为 127.0.0.1 时更新流程必须失败。'
-  grep -Fq 'Debian 系统 DNS 未指向 127.0.0.1' "$bad_dns_output" ||
-    fail '系统 DNS 不匹配没有明确报错。'
-  grep -Fq 'apt-mark hold smartdns' "$bad_dns_case/trace" ||
-    fail '系统 DNS 检查前必须完成服务健康检查和 hold。'
-  ! grep -Fq 'SmartDNS 更新成功' "$bad_dns_output" ||
-    fail '系统 DNS 不匹配时不应输出成功摘要。'
-  assert_eq 'active' "$(<"$bad_dns_case/service-state")" \
-    '系统 DNS 检查失败时服务仍应为 active'
+    fail 'SmartDNS 配置验证失败时更新流程必须失败。'
+  grep -Fq 'SmartDNS 配置验证失败。' "$bad_config_output" ||
+    fail '配置验证失败没有明确报错。'
+  grep -Fq '状态恢复：成功' "$bad_config_output" ||
+    fail '配置验证失败没有执行 rollback。'
+  ! grep -Fq 'step deploy-configuration' "$bad_config_case/trace" ||
+    fail '配置验证失败后不应部署 staged config。'
+  ! grep -Fq 'SmartDNS 更新成功' "$bad_config_output" ||
+    fail '配置验证失败时不应输出成功摘要。'
+  assert_eq 'active' "$(<"$bad_config_case/service-state")" \
+    '配置验证失败 rollback 后服务应恢复为 active'
 
   ((TESTS_RUN += 1))
-  log 'Debian 12 已安装且 hold 的完整更新路径、停止返回值、服务健康检查、系统 DNS、成功摘要和失败恢复回归测试通过。'
+  log 'Debian 12 已安装且 hold 的完整更新路径、三模式接入、resolver、配置失败 rollback 和服务恢复测试通过。'
 }
 
 test_static_safety_guards() {
@@ -835,6 +1247,7 @@ main() {
   TMP_DIR=$(mktemp -d)
   test_fixed_mapping
   test_configurations
+  test_network_stack_switches
   test_retry_logic
   test_updater_full_regression_flow
   test_static_safety_guards

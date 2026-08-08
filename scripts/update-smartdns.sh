@@ -13,6 +13,10 @@ readonly CONFIG_TARGET='/etc/smartdns/smartdns.conf'
 readonly CA_FILE='/etc/ssl/certs/ca-certificates.crt'
 readonly SMARTDNS_RELEASE_TAG='smartdns-debian-pinned-2026-07'
 readonly SMARTDNS_RELEASE_BASE='https://github.com/404-git-404/404notfound/releases/download/smartdns-debian-pinned-2026-07'
+readonly IPV6_DISABLE_CONFIG='/etc/sysctl.d/99-disable-ipv6.conf'
+readonly NETWORK_STACK_UNIT='/etc/systemd/system/404-network-stack.service'
+readonly NETWORK_STACK_UNIT_NAME='404-network-stack.service'
+readonly RESOLV_CONF='/etc/resolv.conf'
 
 TMP_DIR=''
 STAGED_CONFIG=''
@@ -40,13 +44,24 @@ SOCKET_OUTPUT=''
 IPV4_ANSWER=''
 IPV4_ATTEMPTS=0
 LAST_DIG_OUTPUT=''
-AAAA_QUERY_OUTPUT=''
 SYSTEM_LOOKUP_OUTPUT=''
 CONFIG_PREEXISTED=false
 SMARTDNS_WAS_HELD=false
 SMARTDNS_WAS_ENABLED=false
 SMARTDNS_WAS_ACTIVE=false
 BACKUP_READY=false
+NETWORK_STACK=${NETWORK_STACK:-ipv4}
+IPV6_CONFIG_PREEXISTED=false
+NETWORK_STACK_UNIT_PREEXISTED=false
+NETWORK_STACK_UNIT_WAS_ENABLED=false
+NETWORK_STACK_UNIT_WAS_ACTIVE=false
+RESOLV_CONF_PREEXISTED=false
+IPV6_ALL_WAS_DISABLED=''
+IPV6_DEFAULT_WAS_DISABLED=''
+IPV6_LOOPBACK_WAS_DISABLED=''
+SYSTEMD_RESOLVED_WAS_ENABLED=false
+SYSTEMD_RESOLVED_WAS_ACTIVE=false
+SYSTEMD_RESOLVED_UNIT_PRESENT=false
 
 log() {
   printf '[INFO] %s\n' "$*"
@@ -59,6 +74,35 @@ warn() {
 die() {
   printf '[FAIL] %s\n' "$*" >&2
   exit 1
+}
+
+usage() {
+  printf '用法：bash scripts/update-smartdns.sh [--network-stack ipv4|ipv6|dual]\n'
+}
+
+validate_network_stack() {
+  case "$NETWORK_STACK" in
+    ipv4|ipv6|dual) ;;
+    *) die "网络栈必须是 ipv4、ipv6 或 dual，当前值：${NETWORK_STACK:-空}。" ;;
+  esac
+}
+
+parse_args() {
+  while (($# > 0)); do
+    case "$1" in
+      --network-stack)
+        (($# >= 2)) || die '--network-stack 缺少参数。'
+        NETWORK_STACK=$2
+        shift 2
+        ;;
+      --help|-h)
+        usage
+        exit 0
+        ;;
+      *) die "未知参数：$1。" ;;
+    esac
+  done
+  validate_network_stack
 }
 
 shorten_line() {
@@ -113,8 +157,8 @@ verify_required_commands() {
   local command_name
   local -a required_commands=(
     apt-get apt-mark awk cat cmp cp curl date dig dpkg dpkg-deb dpkg-query
-    getent grep install journalctl kill mktemp pgrep pkill readlink rm sed
-    sha256sum sleep ss stat systemctl timeout tr
+    getent grep install ip journalctl kill mktemp pgrep pkill readlink rm sed
+    sha256sum sleep ss stat sysctl systemctl timeout tr
   )
 
   for command_name in "${required_commands[@]}"; do
@@ -195,6 +239,7 @@ create_temporary_directory() {
 write_smartdns_configuration() {
   local target=$1
   local variant=$2
+  local network_stack=${3:-$NETWORK_STACK}
 
   cat >"$target" <<'SMARTDNS_CONFIG_COMMON'
 bind 127.0.0.1:53
@@ -209,10 +254,8 @@ serve-expired-reply-ttl 3
 serve-expired-prefetch-time 21600
 prefetch-domain yes
 
-speed-check-mode tcp:443,ping
-response-mode first-ping
-dualstack-ip-selection yes
-dualstack-ip-selection-threshold 10
+speed-check-mode none
+response-mode fastest-response
 
 log-level warn
 log-console no
@@ -223,19 +266,36 @@ ca-file /etc/ssl/certs/ca-certificates.crt
 
 SMARTDNS_CONFIG_COMMON
 
-  case "$variant" in
-    v40)
+  case "$network_stack" in
+    ipv4) printf '%s\n\n' 'force-AAAA-SOA yes' >>"$target" ;;
+    ipv6) printf '%s\n\n' 'force-qtype-SOA 1' >>"$target" ;;
+    dual) ;;
+    *) die "未知网络栈：$network_stack。" ;;
+  esac
+
+  case "$variant:$network_stack" in
+    v40:ipv4|v40:dual)
       cat >>"$target" <<'SMARTDNS_CONFIG_VARIANT'
 server-https https://1.1.1.1/dns-query -host-name cloudflare-dns.com -http-host cloudflare-dns.com -tls-host-verify cloudflare-dns.com
 server-https https://8.8.8.8/dns-query -host-name dns.google -http-host dns.google -tls-host-verify dns.google
-server-https https://9.9.9.10/dns-query -host-name dns.quad9.net -http-host dns.quad9.net -tls-host-verify dns.quad9.net -fallback
 SMARTDNS_CONFIG_VARIANT
       ;;
-    v46)
+    v40:ipv6)
+      cat >>"$target" <<'SMARTDNS_CONFIG_VARIANT'
+server-https https://[2606:4700:4700::1111]/dns-query -host-name cloudflare-dns.com -http-host cloudflare-dns.com -tls-host-verify cloudflare-dns.com
+server-https https://[2001:4860:4860::8888]/dns-query -host-name dns.google -http-host dns.google -tls-host-verify dns.google
+SMARTDNS_CONFIG_VARIANT
+      ;;
+    v46:ipv4|v46:dual)
       cat >>"$target" <<'SMARTDNS_CONFIG_VARIANT'
 server-https https://cloudflare-dns.com/dns-query -host-ip 1.1.1.1
 server-https https://dns.google/dns-query -host-ip 8.8.8.8
-server-https https://dns.quad9.net/dns-query -host-ip 9.9.9.10 -fallback
+SMARTDNS_CONFIG_VARIANT
+      ;;
+    v46:ipv6)
+      cat >>"$target" <<'SMARTDNS_CONFIG_VARIANT'
+server-https https://cloudflare-dns.com/dns-query -host-ip 2606:4700:4700::1111
+server-https https://dns.google/dns-query -host-ip 2001:4860:4860::8888
 SMARTDNS_CONFIG_VARIANT
       ;;
     *)
@@ -285,6 +345,11 @@ capture_existing_state() {
   SMARTDNS_WAS_HELD=false
   SMARTDNS_WAS_ENABLED=false
   SMARTDNS_WAS_ACTIVE=false
+  NETWORK_STACK_UNIT_WAS_ENABLED=false
+  NETWORK_STACK_UNIT_WAS_ACTIVE=false
+  SYSTEMD_RESOLVED_WAS_ENABLED=false
+  SYSTEMD_RESOLVED_WAS_ACTIVE=false
+  SYSTEMD_RESOLVED_UNIT_PRESENT=false
   if apt-mark showhold | grep -Fxq smartdns; then
     SMARTDNS_WAS_HELD=true
   fi
@@ -294,6 +359,24 @@ capture_existing_state() {
   if systemctl is-active --quiet smartdns.service 2>/dev/null; then
     SMARTDNS_WAS_ACTIVE=true
   fi
+  if systemctl is-enabled --quiet "$NETWORK_STACK_UNIT_NAME" 2>/dev/null; then
+    NETWORK_STACK_UNIT_WAS_ENABLED=true
+  fi
+  if systemctl is-active --quiet "$NETWORK_STACK_UNIT_NAME" 2>/dev/null; then
+    NETWORK_STACK_UNIT_WAS_ACTIVE=true
+  fi
+  if systemctl is-enabled --quiet systemd-resolved.service 2>/dev/null; then
+    SYSTEMD_RESOLVED_WAS_ENABLED=true
+  fi
+  if systemctl is-active --quiet systemd-resolved.service 2>/dev/null; then
+    SYSTEMD_RESOLVED_WAS_ACTIVE=true
+  fi
+  if systemctl cat systemd-resolved.service >/dev/null 2>&1; then
+    SYSTEMD_RESOLVED_UNIT_PRESENT=true
+  fi
+  IPV6_ALL_WAS_DISABLED=$(sysctl -n net.ipv6.conf.all.disable_ipv6)
+  IPV6_DEFAULT_WAS_DISABLED=$(sysctl -n net.ipv6.conf.default.disable_ipv6)
+  IPV6_LOOPBACK_WAS_DISABLED=$(sysctl -n net.ipv6.conf.lo.disable_ipv6)
   return 0
 }
 
@@ -315,6 +398,18 @@ create_backup() {
   else
     printf '配置在升级前不存在。\n' >"$BACKUP_DIR/config-was-absent.txt"
   fi
+  if [[ -e "$IPV6_DISABLE_CONFIG" || -L "$IPV6_DISABLE_CONFIG" ]]; then
+    cp -a -- "$IPV6_DISABLE_CONFIG" "$BACKUP_DIR/99-disable-ipv6.conf"
+    IPV6_CONFIG_PREEXISTED=true
+  fi
+  if [[ -e "$NETWORK_STACK_UNIT" || -L "$NETWORK_STACK_UNIT" ]]; then
+    cp -a -- "$NETWORK_STACK_UNIT" "$BACKUP_DIR/404-network-stack.service"
+    NETWORK_STACK_UNIT_PREEXISTED=true
+  fi
+  if [[ -e "$RESOLV_CONF" || -L "$RESOLV_CONF" ]]; then
+    cp -a -- "$RESOLV_CONF" "$BACKUP_DIR/resolv.conf"
+    RESOLV_CONF_PREEXISTED=true
+  fi
 
   if command -v smartdns >/dev/null 2>&1; then
     smartdns -v >"$BACKUP_DIR/smartdns-version-before.txt" 2>&1 || true
@@ -327,6 +422,11 @@ create_backup() {
   printf 'held=%s\nenabled=%s\nactive=%s\n' \
     "$SMARTDNS_WAS_HELD" "$SMARTDNS_WAS_ENABLED" "$SMARTDNS_WAS_ACTIVE" \
     >"$BACKUP_DIR/service-state-before.txt"
+  printf 'all=%s\ndefault=%s\nlo=%s\nresolved_present=%s\nresolved_enabled=%s\nresolved_active=%s\n' \
+    "$IPV6_ALL_WAS_DISABLED" "$IPV6_DEFAULT_WAS_DISABLED" \
+    "$IPV6_LOOPBACK_WAS_DISABLED" "$SYSTEMD_RESOLVED_UNIT_PRESENT" \
+    "$SYSTEMD_RESOLVED_WAS_ENABLED" \
+    "$SYSTEMD_RESOLVED_WAS_ACTIVE" >"$BACKUP_DIR/network-state-before.txt"
   BACKUP_READY=true
   log "升级前状态已备份到：$BACKUP_DIR"
 }
@@ -344,8 +444,42 @@ restore_previous_state() {
   else
     rm -f -- "$CONFIG_TARGET" || restore_status=1
   fi
+  if systemctl cat "$NETWORK_STACK_UNIT_NAME" >/dev/null 2>&1 ||
+    [[ -e "$NETWORK_STACK_UNIT" || -L "$NETWORK_STACK_UNIT" ]]; then
+    systemctl disable --now "$NETWORK_STACK_UNIT_NAME" >/dev/null 2>&1 ||
+      restore_status=1
+  fi
+  rm -f -- "$NETWORK_STACK_UNIT" || restore_status=1
+  if [[ "$NETWORK_STACK_UNIT_PREEXISTED" == true ]]; then
+    cp -a -- "$BACKUP_DIR/404-network-stack.service" "$NETWORK_STACK_UNIT" ||
+      restore_status=1
+  fi
+  rm -f -- "$IPV6_DISABLE_CONFIG" || restore_status=1
+  if [[ "$IPV6_CONFIG_PREEXISTED" == true ]]; then
+    cp -a -- "$BACKUP_DIR/99-disable-ipv6.conf" "$IPV6_DISABLE_CONFIG" ||
+      restore_status=1
+  fi
+  sysctl -q -w "net.ipv6.conf.all.disable_ipv6=$IPV6_ALL_WAS_DISABLED" || restore_status=1
+  sysctl -q -w "net.ipv6.conf.default.disable_ipv6=$IPV6_DEFAULT_WAS_DISABLED" || restore_status=1
+  sysctl -q -w "net.ipv6.conf.lo.disable_ipv6=$IPV6_LOOPBACK_WAS_DISABLED" || restore_status=1
 
   systemctl daemon-reload >/dev/null 2>&1 || restore_status=1
+  if [[ "$NETWORK_STACK_UNIT_PREEXISTED" == true ]]; then
+    if [[ "$NETWORK_STACK_UNIT_WAS_ENABLED" == true ]]; then
+      systemctl enable "$NETWORK_STACK_UNIT_NAME" >/dev/null 2>&1 ||
+        restore_status=1
+    else
+      systemctl disable "$NETWORK_STACK_UNIT_NAME" >/dev/null 2>&1 ||
+        restore_status=1
+    fi
+    if [[ "$NETWORK_STACK_UNIT_WAS_ACTIVE" == true ]]; then
+      systemctl restart "$NETWORK_STACK_UNIT_NAME" >/dev/null 2>&1 ||
+        restore_status=1
+    else
+      systemctl stop "$NETWORK_STACK_UNIT_NAME" >/dev/null 2>&1 ||
+        restore_status=1
+    fi
+  fi
   if [[ "$SMARTDNS_WAS_ENABLED" == true ]]; then
     systemctl enable smartdns.service >/dev/null 2>&1 || restore_status=1
   else
@@ -360,6 +494,22 @@ restore_previous_state() {
     apt-mark hold smartdns >/dev/null 2>&1 || restore_status=1
   else
     apt-mark unhold smartdns >/dev/null 2>&1 || restore_status=1
+  fi
+  if [[ "$SYSTEMD_RESOLVED_UNIT_PRESENT" == true ]]; then
+    if [[ "$SYSTEMD_RESOLVED_WAS_ENABLED" == true ]]; then
+      systemctl enable systemd-resolved.service >/dev/null 2>&1 || restore_status=1
+    else
+      systemctl disable systemd-resolved.service >/dev/null 2>&1 || restore_status=1
+    fi
+    if [[ "$SYSTEMD_RESOLVED_WAS_ACTIVE" == true ]]; then
+      systemctl start systemd-resolved.service >/dev/null 2>&1 || restore_status=1
+    else
+      systemctl stop systemd-resolved.service >/dev/null 2>&1 || restore_status=1
+    fi
+  fi
+  rm -f -- "$RESOLV_CONF" || restore_status=1
+  if [[ "$RESOLV_CONF_PREEXISTED" == true ]]; then
+    cp -a -- "$BACKUP_DIR/resolv.conf" "$RESOLV_CONF" || restore_status=1
   fi
   return "$restore_status"
 }
@@ -595,6 +745,132 @@ deploy_configuration() {
     fail_with_recovery "SmartDNS 配置权限异常：$config_owner $config_mode。"
 }
 
+install_ipv4_network_stack_unit() {
+  local staged_unit="$TMP_DIR/404-network-stack.service"
+
+  cat >"$staged_unit" <<'EOF'
+[Unit]
+Description=Apply 404notfound IPv4-only network stack
+After=networking.service
+Before=smartdns.service sing-box.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/sysctl -q -w net.ipv6.conf.all.disable_ipv6=1
+ExecStart=/usr/sbin/sysctl -q -w net.ipv6.conf.default.disable_ipv6=1
+ExecStart=/usr/sbin/sysctl -q -w net.ipv6.conf.lo.disable_ipv6=1
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  rm -f -- "$IPV6_DISABLE_CONFIG" ||
+    fail_with_recovery "无法删除早期 IPv6 禁用配置：$IPV6_DISABLE_CONFIG。"
+  if ! install -D -o root -g root -m 0644 "$staged_unit" "$NETWORK_STACK_UNIT"; then
+    fail_with_recovery '无法安装 IPv4-only network-stack unit。'
+  fi
+  cmp -s "$staged_unit" "$NETWORK_STACK_UNIT" ||
+    fail_with_recovery 'IPv4-only network-stack unit 部署后内容不一致。'
+  systemctl daemon-reload ||
+    fail_with_recovery 'network-stack unit daemon-reload 失败。'
+  systemctl enable "$NETWORK_STACK_UNIT_NAME" ||
+    fail_with_recovery '无法启用 IPv4-only network-stack unit。'
+  systemctl restart "$NETWORK_STACK_UNIT_NAME" ||
+    fail_with_recovery '无法执行 IPv4-only network-stack unit。'
+  systemctl is-enabled --quiet "$NETWORK_STACK_UNIT_NAME" ||
+    fail_with_recovery 'IPv4-only network-stack unit 未设置为 enabled。'
+  systemctl is-active --quiet "$NETWORK_STACK_UNIT_NAME" ||
+    fail_with_recovery 'IPv4-only network-stack unit 未处于 active 状态。'
+}
+
+remove_ipv4_network_stack_unit() {
+  if systemctl cat "$NETWORK_STACK_UNIT_NAME" >/dev/null 2>&1 ||
+    [[ -e "$NETWORK_STACK_UNIT" || -L "$NETWORK_STACK_UNIT" ]]; then
+    systemctl disable --now "$NETWORK_STACK_UNIT_NAME" ||
+      fail_with_recovery '无法停用 IPv4-only network-stack unit。'
+  fi
+  rm -f -- "$NETWORK_STACK_UNIT" ||
+    fail_with_recovery '无法删除 IPv4-only network-stack unit。'
+  rm -f -- "$IPV6_DISABLE_CONFIG" ||
+    fail_with_recovery "无法删除早期 IPv6 禁用配置：$IPV6_DISABLE_CONFIG。"
+  systemctl daemon-reload ||
+    fail_with_recovery '删除 network-stack unit 后 daemon-reload 失败。'
+  [[ ! -e "$NETWORK_STACK_UNIT" && ! -L "$NETWORK_STACK_UNIT" ]] ||
+    fail_with_recovery 'IPv4-only network-stack unit 删除后仍然存在。'
+}
+
+ipv6_network_ready() {
+  ip -6 -o addr show scope global 2>/dev/null | grep -q ' inet6 ' &&
+    ip -6 route show default 2>/dev/null | grep -q '^default[[:space:]]'
+}
+
+restore_ipv6_network_configuration() {
+  local attempt
+
+  [[ "$NETWORK_STACK" != ipv4 ]] || return 0
+  ipv6_network_ready && return 0
+
+  if command -v ifup >/dev/null 2>&1; then
+    log '重新应用 ifupdown 配置以恢复 IPv6；保留现有 IPv4 和 SSH 会话。'
+    # Do not run ifdown: the current IPv4 SSH path must remain available.
+    # Existing IPv4 entries may report EEXIST, so let ifup continue to the
+    # inet6 stanza and rely on the strict network health gate below.
+    if ! ifup --force --ignore-errors -a; then
+      warn 'ifupdown 重新应用返回失败；将等待网络自行恢复并继续严格验证。'
+    fi
+  else
+    warn '未找到 ifup；将等待网络管理器自行恢复 IPv6。'
+  fi
+
+  for attempt in {1..10}; do
+    ipv6_network_ready && return 0
+    ((attempt == 10)) || sleep 1
+  done
+  warn 'IPv6 global 地址或 default route 尚未恢复；后续健康检查将决定是否回滚。'
+}
+
+configure_network_stack() {
+  local current_value
+  local default_value
+  local loopback_value
+
+  case "$NETWORK_STACK" in
+    ipv4)
+      install_ipv4_network_stack_unit
+      ;;
+    ipv6|dual)
+      remove_ipv4_network_stack_unit
+      sysctl -q -w net.ipv6.conf.all.disable_ipv6=0 ||
+        fail_with_recovery '无法恢复 net.ipv6.conf.all.disable_ipv6=0。'
+      sysctl -q -w net.ipv6.conf.default.disable_ipv6=0 ||
+        fail_with_recovery '无法恢复 net.ipv6.conf.default.disable_ipv6=0。'
+      sysctl -q -w net.ipv6.conf.lo.disable_ipv6=0 ||
+        fail_with_recovery '无法恢复 net.ipv6.conf.lo.disable_ipv6=0。'
+      restore_ipv6_network_configuration
+      ;;
+  esac
+
+  current_value=$(sysctl -n net.ipv6.conf.all.disable_ipv6) ||
+    fail_with_recovery '无法读取 disable_ipv6。'
+  default_value=$(sysctl -n net.ipv6.conf.default.disable_ipv6) ||
+    fail_with_recovery '无法读取 default.disable_ipv6。'
+  loopback_value=$(sysctl -n net.ipv6.conf.lo.disable_ipv6) ||
+    fail_with_recovery '无法读取 lo.disable_ipv6。'
+  if [[ "$NETWORK_STACK" == ipv4 ]]; then
+    [[ "$current_value" == 1 && "$default_value" == 1 && "$loopback_value" == 1 ]] ||
+      fail_with_recovery 'IPv4-only 验证失败：all/default/lo 的 disable_ipv6 未全部设为 1。'
+    [[ ! -e "$IPV6_DISABLE_CONFIG" && ! -L "$IPV6_DISABLE_CONFIG" ]] ||
+      fail_with_recovery "IPv4-only 验证失败：仍残留早期配置 $IPV6_DISABLE_CONFIG。"
+  else
+    [[ "$current_value" == 0 && "$default_value" == 0 && "$loopback_value" == 0 ]] ||
+      fail_with_recovery "$NETWORK_STACK 验证失败：all/default/lo 的 disable_ipv6 未全部恢复为 0。"
+    [[ ! -e "$IPV6_DISABLE_CONFIG" && ! -L "$IPV6_DISABLE_CONFIG" ]] ||
+      fail_with_recovery "$NETWORK_STACK 验证失败：IPv6 禁用配置仍存在。"
+  fi
+  log "网络栈已应用并验证：$NETWORK_STACK，disable_ipv6=$current_value/$default_value/$loopback_value。"
+}
+
 listener_present() {
   local protocol=$1
 
@@ -657,6 +933,94 @@ query_smartdns_ipv4() {
   return 1
 }
 
+first_valid_ipv6() {
+  awk '
+    $1 ~ /^[0-9A-Fa-f:]+$/ && index($1, ":") > 0 {
+      print $1
+      found = 1
+      exit
+    }
+    END { exit !found }
+  '
+}
+
+query_smartdns_short() {
+  local qtype=$1
+  local attempt
+  local output=''
+
+  for attempt in {1..10}; do
+    if output=$(dig @127.0.0.1 cloudflare.com "$qtype" +short +time=4 +tries=1 2>&1); then
+      printf '%s' "$output"
+      return 0
+    fi
+    ((attempt == 10)) || sleep 2
+  done
+  printf '%s' "$output"
+  return 1
+}
+
+validate_network_stack_health() {
+  local a_output=''
+  local aaaa_output=''
+  local disable_ipv6
+
+  disable_ipv6=$(sysctl -n net.ipv6.conf.all.disable_ipv6) ||
+    fail_with_recovery '无法读取 net.ipv6.conf.all.disable_ipv6。'
+  if [[ "$NETWORK_STACK" == ipv6 ]]; then
+    a_output=$(query_smartdns_short A) ||
+      fail_with_recovery "SmartDNS A 查询失败：$(shorten_line "$a_output")"
+  else
+    query_smartdns_ipv4 ||
+      fail_with_recovery "SmartDNS A 查询连续 $IPV4_ATTEMPTS 次失败：$(shorten_line "$LAST_DIG_OUTPUT")"
+    a_output=$IPV4_ANSWER
+  fi
+  aaaa_output=$(query_smartdns_short AAAA) ||
+    fail_with_recovery "SmartDNS AAAA 查询失败：$(shorten_line "$aaaa_output")"
+
+  case "$NETWORK_STACK" in
+    ipv4)
+      [[ "$disable_ipv6" == 1 ]] ||
+        fail_with_recovery 'IPv4-only 健康检查失败：disable_ipv6 不是 1。'
+      first_valid_ipv4 <<<"$a_output" >/dev/null ||
+        fail_with_recovery "IPv4-only 健康检查失败：A 没有结果：$(shorten_line "$a_output")"
+      [[ -z "$aaaa_output" ]] ||
+        fail_with_recovery "IPv4-only 健康检查失败：AAAA 应为空：$(shorten_line "$aaaa_output")"
+      curl -4 --fail --silent --show-error --output /dev/null \
+        --connect-timeout 8 --max-time 20 https://www.cloudflare.com/cdn-cgi/trace ||
+        fail_with_recovery 'IPv4-only 健康检查失败：curl -4 HTTPS 失败。'
+      ;;
+    ipv6)
+      [[ "$disable_ipv6" == 0 ]] ||
+        fail_with_recovery 'IPv6-only 健康检查失败：disable_ipv6 不是 0。'
+      [[ -z "$a_output" ]] ||
+        fail_with_recovery "IPv6-only 健康检查失败：A 应为空：$(shorten_line "$a_output")"
+      first_valid_ipv6 <<<"$aaaa_output" >/dev/null ||
+        fail_with_recovery "IPv6-only 健康检查失败：AAAA 没有结果：$(shorten_line "$aaaa_output")"
+      ip -6 route show default | grep -q '^default' ||
+        fail_with_recovery 'IPv6-only 健康检查失败：没有可用 IPv6 default route。'
+      curl -6 --fail --silent --show-error --output /dev/null \
+        --connect-timeout 8 --max-time 20 https://www.cloudflare.com/cdn-cgi/trace ||
+        fail_with_recovery 'IPv6-only 健康检查失败：curl -6 HTTPS 失败。'
+      ;;
+    dual)
+      [[ "$disable_ipv6" == 0 ]] ||
+        fail_with_recovery 'Dual-stack 健康检查失败：disable_ipv6 不是 0。'
+      first_valid_ipv4 <<<"$a_output" >/dev/null ||
+        fail_with_recovery "Dual-stack 健康检查失败：A 没有结果：$(shorten_line "$a_output")"
+      first_valid_ipv6 <<<"$aaaa_output" >/dev/null ||
+        fail_with_recovery "Dual-stack 健康检查失败：AAAA 没有结果：$(shorten_line "$aaaa_output")"
+      curl -4 --fail --silent --show-error --output /dev/null \
+        --connect-timeout 8 --max-time 20 https://www.cloudflare.com/cdn-cgi/trace ||
+        fail_with_recovery 'Dual-stack 健康检查失败：curl -4 HTTPS 失败。'
+      curl -6 --fail --silent --show-error --output /dev/null \
+        --connect-timeout 8 --max-time 20 https://www.cloudflare.com/cdn-cgi/trace ||
+        fail_with_recovery 'Dual-stack 健康检查失败：curl -6 HTTPS 失败。'
+      ;;
+  esac
+  log "$NETWORK_STACK 的 DNS 记录、sysctl、路由与 HTTPS 健康检查通过。"
+}
+
 valid_system_ipv4_answer() {
   first_valid_ipv4 <<<"$SYSTEM_LOOKUP_OUTPUT" >/dev/null
 }
@@ -666,8 +1030,9 @@ start_and_validate_service() {
 
   systemctl daemon-reload ||
     fail_with_recovery 'systemctl daemon-reload 失败。'
-  systemctl reset-failed smartdns.service ||
-    fail_with_recovery '无法重置 SmartDNS 服务失败状态。'
+  # Debian's systemctl may return non-zero when an inactive unit has no failed
+  # state to clear. Restart and the strict service checks below are decisive.
+  systemctl reset-failed smartdns.service >/dev/null 2>&1 || true
   systemctl enable smartdns.service ||
     fail_with_recovery '无法设置 SmartDNS 开机启动。'
   systemctl restart smartdns.service ||
@@ -708,15 +1073,7 @@ start_and_validate_service() {
   listener_present tcp ||
     fail_with_recovery 'SmartDNS 未在 127.0.0.1:53/tcp 监听。'
 
-  if ! query_smartdns_ipv4; then
-    fail_with_recovery "SmartDNS IPv4 查询连续 $IPV4_ATTEMPTS 次未返回合法 IPv4；最后输出：$(shorten_line "$LAST_DIG_OUTPUT")"
-  fi
-  if ! AAAA_QUERY_OUTPUT=$(dig @127.0.0.1 cloudflare.com AAAA +time=4 +tries=1 2>&1); then
-    fail_with_recovery "SmartDNS AAAA 查询执行失败：$(shorten_line "$AAAA_QUERY_OUTPUT")"
-  fi
-  if ! grep -Eq 'status:[[:space:]]*NOERROR([,[:space:]]|$)' <<<"$AAAA_QUERY_OUTPUT"; then
-    fail_with_recovery "SmartDNS AAAA 查询状态不是 NOERROR：$(shorten_line "$AAAA_QUERY_OUTPUT")"
-  fi
+  validate_network_stack_health
 
   apt-mark hold smartdns >/dev/null ||
     fail_with_recovery '健康检查通过后无法 hold smartdns。'
@@ -727,48 +1084,50 @@ start_and_validate_service() {
   log "systemctl is-active smartdns：$ACTIVE_STATUS"
   log '本次启动日志未发现 unsupported config、启动或配置解析错误。'
   log '127.0.0.1:53 的 TCP 和 UDP 监听验证通过。'
-  log "IPv4 查询第 $IPV4_ATTEMPTS 次成功：$IPV4_ANSWER"
-  log 'AAAA 查询状态：NOERROR（允许 ANSWER 为 0）。'
+  log "网络栈健康检查：$NETWORK_STACK。"
   log 'smartdns 已设置为 hold。'
 }
 
-report_system_dns_mismatch() {
-  local nameserver_text=$1
+configure_system_resolver() {
+  local staged_resolv="$TMP_DIR/resolv.conf"
 
-  printf '[FAIL] SmartDNS 已更新并正常运行，但 Debian 系统 DNS 未指向 127.0.0.1。\n' >&2
-  printf '[INFO] 当前有效 nameserver：%s\n' "$nameserver_text" >&2
-  printf '[INFO] 请检查 /etc/resolv.conf；脚本不会自动修改系统 DNS。\n' >&2
-  exit 1
+  cat >"$staged_resolv" <<'EOF'
+nameserver 127.0.0.1
+options timeout:2 attempts:2
+EOF
+  if ! systemctl disable --now systemd-resolved.service >/dev/null 2>&1; then
+    if systemctl is-active --quiet systemd-resolved.service; then
+      fail_with_recovery '无法停止 systemd-resolved，拒绝切换 /etc/resolv.conf。'
+    fi
+  fi
+  systemctl is-active --quiet systemd-resolved.service &&
+    fail_with_recovery 'systemd-resolved 仍处于 active 状态。'
+  rm -f -- "$RESOLV_CONF" ||
+    fail_with_recovery '无法移除旧 /etc/resolv.conf。'
+  install -o root -g root -m 0644 "$staged_resolv" "$RESOLV_CONF" ||
+    fail_with_recovery '无法部署受管 /etc/resolv.conf。'
+  [[ ! -L "$RESOLV_CONF" ]] ||
+    fail_with_recovery '/etc/resolv.conf 仍是符号链接。'
+  cmp -s -- "$staged_resolv" "$RESOLV_CONF" ||
+    fail_with_recovery '/etc/resolv.conf 内容验证失败。'
+  log 'systemd-resolved 已停用；/etc/resolv.conf 已切换为 SmartDNS 受管普通文件。'
 }
 
 check_debian_system_dns() {
-  local index
-  local nameserver_text='（无）'
-  local -a nameservers=()
+  local expected_resolv="$TMP_DIR/resolv.conf"
 
-  if [[ ! -e /etc/resolv.conf || ! -r /etc/resolv.conf ]]; then
-    report_system_dns_mismatch '（/etc/resolv.conf 不存在或不可读）'
+  [[ -f "$RESOLV_CONF" && ! -L "$RESOLV_CONF" ]] ||
+    fail_with_recovery '/etc/resolv.conf 不是普通文件。'
+  cmp -s -- "$expected_resolv" "$RESOLV_CONF" ||
+    fail_with_recovery '/etc/resolv.conf 不是要求的 SmartDNS 两行配置。'
+  systemctl is-active --quiet systemd-resolved.service &&
+    fail_with_recovery 'systemd-resolved 健康检查失败：服务仍 active。'
+  if ! SYSTEM_LOOKUP_OUTPUT=$(getent hosts cloudflare.com 2>&1); then
+    fail_with_recovery "Debian 系统默认解析失败：$(shorten_line "$SYSTEM_LOOKUP_OUTPUT")"
   fi
-  mapfile -t nameservers < <(
-    awk '
-      /^[[:space:]]*($|[;#])/ { next }
-      $1 == "nameserver" && NF >= 2 && $2 !~ /^[;#]/ { print $2 }
-    ' /etc/resolv.conf
-  )
-  if ((${#nameservers[@]} > 0)); then
-    nameserver_text=${nameservers[0]}
-    for ((index = 1; index < ${#nameservers[@]}; index++)); do
-      nameserver_text+=", ${nameservers[index]}"
-    done
-  fi
-  if ((${#nameservers[@]} != 1)) || [[ "${nameservers[0]:-}" != '127.0.0.1' ]]; then
-    report_system_dns_mismatch "$nameserver_text"
-  fi
-  if ! SYSTEM_LOOKUP_OUTPUT=$(getent ahostsv4 cloudflare.com 2>&1) ||
-    ! valid_system_ipv4_answer; then
-    die 'Debian 系统默认解析失败；脚本未修改系统 DNS。'
-  fi
-  log 'Debian 系统 DNS 验证通过：仅 127.0.0.1。'
+  dig @127.0.0.1 cloudflare.com +time=4 +tries=1 >/dev/null 2>&1 ||
+    fail_with_recovery '通过 127.0.0.1 的 dig 健康检查失败。'
+  log 'Debian 系统 DNS 验证通过：仅 127.0.0.1，systemd-resolved inactive。'
   log 'Debian 系统默认解析验证通过。'
 }
 
@@ -777,6 +1136,7 @@ print_summary() {
   printf '固定 Release：%s\n' "$SMARTDNS_RELEASE_TAG"
   printf 'Debian / 架构：%s / %s\n' "$OS_VERSION" "$ARCH"
   printf '配置变体：%s\n' "$CONFIG_VARIANT"
+  printf '网络栈：%s\n' "$NETWORK_STACK"
   printf 'Release 资产：%s\n' "$ASSET_NAME"
   printf 'SmartDNS 当前版本：%s\n' "$SMARTDNS_VERSION_TEXT"
   printf 'Debian 软件包版本：%s\n' "$PACKAGE_VERSION"
@@ -786,8 +1146,7 @@ print_summary() {
   printf '当前运行状态：%s\n' "$ACTIVE_STATUS"
   printf 'TCP 53：正常\n'
   printf 'UDP 53：正常\n'
-  printf 'IPv4 查询：第 %s 次成功，%s\n' "$IPV4_ATTEMPTS" "$IPV4_ANSWER"
-  printf 'AAAA 查询：NOERROR（允许空答案）\n'
+  printf '网络栈 DNS / HTTPS：正常\n'
   printf 'APT hold：smartdns\n'
   printf '系统 DNS：仅 127.0.0.1\n'
   printf '系统解析：正常\n'
@@ -795,13 +1154,18 @@ print_summary() {
 }
 
 main() {
+  parse_args "$@"
   require_root_and_debian
   install_dependencies
   verify_required_commands
   select_platform
   create_temporary_directory
   write_smartdns_configuration "$STAGED_CONFIG" "$CONFIG_VARIANT"
-  download_and_verify_package
+  if package_is_already_installed; then
+    log "已安装精确目标版本 $EXPECTED_VERSION；无需下载重复软件包。"
+  else
+    download_and_verify_package
+  fi
   capture_existing_state
   create_backup
   install_pinned_package
@@ -810,7 +1174,9 @@ main() {
   validate_configuration_independently
   check_port_53_conflicts
   deploy_configuration
+  configure_network_stack
   start_and_validate_service
+  configure_system_resolver
   check_debian_system_dns
   print_summary
 }
