@@ -14,6 +14,7 @@ BUILT_ITEM=''
 WORKING_CONFIG_JSON=''
 OUTBOUND_TAGS=()
 MODULE_INPUT_ACTIVE=false
+NETWORK_STACK='ipv4'
 
 RED=''
 GREEN=''
@@ -770,8 +771,36 @@ configure_log() {
     esac
 }
 
+select_network_stack() {
+    local choice=''
+
+    printf '\n请选择网络栈：\n\n'
+    printf '1) IPv4-only [默认]\n'
+    printf '2) IPv6-only\n'
+    printf '3) Dual-stack\n'
+    prompt_numbered_choice choice 1 3 1
+
+    case "$choice" in
+        1) NETWORK_STACK='ipv4' ;;
+        2) NETWORK_STACK='ipv6' ;;
+        3) NETWORK_STACK='dual' ;;
+    esac
+}
+
+get_listen_address() {
+    case "$NETWORK_STACK" in
+        ipv4) printf '0.0.0.0' ;;
+        ipv6|dual) printf '::' ;;
+        *)
+            error "未知网络栈：${NETWORK_STACK}"
+            return 1
+            ;;
+    esac
+}
+
 build_reality_inbound() {
     local listen_port=''
+    local listen_address=''
     local uuid=''
     local disguise_domain=''
     local handshake_port=''
@@ -786,8 +815,10 @@ build_reality_inbound() {
     module_prompt prompt_port handshake_port '请输入 Reality handshake.server_port' 443 || return $?
     module_prompt prompt_required private_key '请输入 Reality private_key' true || return $?
     module_prompt prompt_required short_id '请输入 Reality short_id' true || return $?
+    listen_address="$(get_listen_address)" || return $?
 
     BUILT_ITEM="$(jq -cn \
+        --arg listen_address "$listen_address" \
         --argjson listen_port "$listen_port" \
         --arg uuid "$uuid" \
         --arg disguise_domain "$disguise_domain" \
@@ -797,7 +828,7 @@ build_reality_inbound() {
         '{
             type: "vless",
             tag: "vless-reality-in",
-            listen: "::",
+            listen: $listen_address,
             listen_port: $listen_port,
             users: [{
                 name: "main",
@@ -827,6 +858,7 @@ build_reality_inbound() {
 
 build_transit_hysteria2_inbound() {
     local listen_port=''
+    local listen_address=''
     local user_password=''
     local certificate_directory=''
 
@@ -835,8 +867,10 @@ build_transit_hysteria2_inbound() {
     module_prompt prompt_port listen_port '请输入监听端口' 443 || return $?
     module_prompt prompt_required user_password '请输入 Hysteria2 用户 password' true || return $?
     module_prompt prompt_required certificate_directory '请输入 /etc/ssl/ 下的证书目录名' false || return $?
+    listen_address="$(get_listen_address)" || return $?
 
     BUILT_ITEM="$(jq -cn \
+        --arg listen_address "$listen_address" \
         --argjson listen_port "$listen_port" \
         --arg user_password "$user_password" \
         --arg certificate_path "/etc/ssl/${certificate_directory}/fullchain.pem" \
@@ -844,7 +878,7 @@ build_transit_hysteria2_inbound() {
         '{
             type: "hysteria2",
             tag: "hy2-in",
-            listen: "::",
+            listen: $listen_address,
             listen_port: $listen_port,
             users: [{
                 name: "main",
@@ -866,6 +900,7 @@ build_transit_hysteria2_inbound() {
 
 build_exit_hysteria2_inbound() {
     local listen_port=''
+    local listen_address=''
     local user_password=''
     local certificate_directory=''
 
@@ -874,8 +909,10 @@ build_exit_hysteria2_inbound() {
     module_prompt prompt_port listen_port '请输入监听端口' 32124 || return $?
     module_prompt prompt_required user_password '请输入 Hysteria2 用户 password' true || return $?
     module_prompt prompt_required certificate_directory '请输入 /etc/ssl/ 下的证书目录名' false || return $?
+    listen_address="$(get_listen_address)" || return $?
 
     BUILT_ITEM="$(jq -cn \
+        --arg listen_address "$listen_address" \
         --argjson listen_port "$listen_port" \
         --arg user_password "$user_password" \
         --arg certificate_path "/etc/ssl/${certificate_directory}/fullchain.pem" \
@@ -883,7 +920,7 @@ build_exit_hysteria2_inbound() {
         '{
             type: "hysteria2",
             tag: "hy2-in",
-            listen: "::",
+            listen: $listen_address,
             listen_port: $listen_port,
             users: [{
                 name: "main",
@@ -938,6 +975,7 @@ build_cf_tunnel_inbound() {
 
 build_cf_websocket_inbound() {
     local listen_port=''
+    local listen_address=''
     local uuid=''
     local certificate_directory=''
     local websocket_path=''
@@ -951,8 +989,10 @@ build_cf_websocket_inbound() {
     if [[ "$websocket_path" != /* ]]; then
         websocket_path="/${websocket_path}"
     fi
+    listen_address="$(get_listen_address)" || return $?
 
     BUILT_ITEM="$(jq -cn \
+        --arg listen_address "$listen_address" \
         --argjson listen_port "$listen_port" \
         --arg uuid "$uuid" \
         --arg certificate_path "/etc/ssl/${certificate_directory}/fullchain.pem" \
@@ -961,7 +1001,7 @@ build_cf_websocket_inbound() {
         '{
             type: "vless",
             tag: "vless-cf-ws-in",
-            listen: "0.0.0.0",
+            listen: $listen_address,
             listen_port: $listen_port,
             users: [{
                 name: "cf-ws",
@@ -986,6 +1026,7 @@ build_cf_websocket_inbound() {
 
 build_exit_shadowsocks_inbound() {
     local listen_port=''
+    local listen_address=''
     local method=''
     local password=''
 
@@ -994,15 +1035,17 @@ build_exit_shadowsocks_inbound() {
     module_prompt prompt_port listen_port '请输入监听端口' 32123 || return $?
     module_prompt prompt_method method || return $?
     module_prompt prompt_required password '请输入 SS2022 password' true || return $?
+    listen_address="$(get_listen_address)" || return $?
 
     BUILT_ITEM="$(jq -cn \
+        --arg listen_address "$listen_address" \
         --argjson listen_port "$listen_port" \
         --arg method "$method" \
         --arg password "$password" \
         '{
             type: "shadowsocks",
             tag: "ss2022-in",
-            listen: "0.0.0.0",
+            listen: $listen_address,
             listen_port: $listen_port,
             method: $method,
             password: $password
@@ -1797,6 +1840,7 @@ main() {
 
     init_colors
     check_environment
+    select_network_stack
 
     while true; do
         reset_generation_state

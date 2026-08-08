@@ -204,7 +204,7 @@ jobs:
             ' scripts/update-smartdns.sh
             # shellcheck disable=SC2016
             printf '%s\n' \
-              'write_smartdns_configuration /tmp/smartdns.conf "${CONFIG_VARIANT}"'
+              'write_smartdns_configuration /tmp/smartdns.conf "${CONFIG_VARIANT}" ipv4'
           } > /tmp/render-config.sh
           CONFIG_VARIANT="${{ matrix.variant }}" bash /tmp/render-config.sh
           sed \
@@ -353,7 +353,7 @@ jobs:
                   capture && \$0 == \"}\" { exit }
                 " /repo/scripts/update-smartdns.sh
                 printf "%s\n" \
-                  "write_smartdns_configuration /tmp/smartdns.conf v40"
+                  "write_smartdns_configuration /tmp/smartdns.conf v40 ipv4"
               } > /tmp/render-config.sh
               bash /tmp/render-config.sh
 
@@ -367,6 +367,8 @@ jobs:
               systemctl daemon-reload
               systemctl enable --now smartdns.service
               apt-mark hold smartdns
+              umount /etc/resolv.conf
+              rm -f /etc/resolv.conf
               printf "nameserver 127.0.0.1\n" > /etc/resolv.conf
 
               test "$(dpkg-query -W -f="\${Version}" smartdns)" = 40+dfsg-1
@@ -391,7 +393,8 @@ jobs:
                 /tmp/updater-output
               grep -Fq "127.0.0.1:53 的 TCP 和 UDP 监听验证通过。" \
                 /tmp/updater-output
-              grep -Fq "Debian 系统 DNS 验证通过：仅 127.0.0.1。" \
+              grep -Fq \
+                "Debian 系统 DNS 验证通过：仅 127.0.0.1，systemd-resolved inactive。" \
                 /tmp/updater-output
               grep -Fq "SmartDNS 更新成功" /tmp/updater-output
               grep -Fq "开机启动状态：enabled" /tmp/updater-output
