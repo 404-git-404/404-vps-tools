@@ -36,6 +36,9 @@ readonly TCP_RETRANS_DIAGNOSTIC_PENALTY=15
 readonly DEFAULT_HISTORY_LIMIT=20
 readonly MAX_HISTORY_LIMIT=100
 readonly HISTORY_RETENTION=100
+readonly TEST_RESULT_OK=0
+readonly TEST_RESULT_FAILED=1
+readonly TEST_RESULT_BUDGET_DENIED=2
 
 MODE='client'
 PEER=''
@@ -54,13 +57,16 @@ BUDGET_MB=$DEFAULT_BUDGET_MB
 MAX_PERCENT=$DEFAULT_MAX_PERCENT
 BUDGET_BYTES=0
 TRAFFIC_RESERVED_BYTES=0
+TRAFFIC_ACCOUNTED_BYTES=0
 TRAFFIC_ACTUAL_BYTES=0
 TEMP_DIR=''
 RESULT_FILE=''
+FAILURE_FILE=''
 ACTIVE_IPERF_PID=''
 ACTIVE_PING_PID=''
 FIREWALL_RULE_ADDED=false
 FIREWALL_COMMENT=''
+FIREWALL_STATUS='unchanged'
 SERVER_TESTS=0
 TEST_FAILURES=0
 TCP_FAILURES=0
@@ -98,8 +104,20 @@ CONFIDENCE='LOW'
 STATUS='POOR'
 PREFERRED='FIX LINK'
 REASON='Insufficient evidence to classify this VPS-to-VPS link.'
+RESULT_STATE='COMPLETE'
+TCP_EVALUABLE=false
+UDP_EVALUABLE=false
 ASYMMETRY_REASON=''
 LABELS=''
+PLATFORM_FAMILY=''
+PLATFORM_VERSION=''
+AWK_BIN=''
+PRIVILEGE_HELPER=''
+IPERF3_INSTALLED_NOW=false
+OS_RELEASE_FILE=${PROTOCOL_BENCHMARK_OS_RELEASE_FILE:-/etc/os-release}
+declare -a UFW_COMMAND=()
+declare -a MISSING_COMMANDS=()
+declare -a MISSING_PACKAGES=()
 MAIN_BASHPID=$BASHPID
 readonly MAIN_BASHPID
 
@@ -133,7 +151,8 @@ Two-VPS workflow:
   VPS-B: bash protocol-benchmark.sh --server --allow-peer A_IP
   VPS-A: bash protocol-benchmark.sh B_IP --port PORT
 
-The server prints its random PORT. Allow that TCP/UDP port only from VPS-A.
+The server prints its random PORT and temporarily manages an already active UFW.
+Use --allow-peer to enforce a peer-only temporary TCP/UDP rule.
 The result describes the underlying VPS-to-VPS link, not sing-box or proxies.
 EOF
 }
@@ -151,12 +170,41 @@ command_exists() {
   command -v "$1" >/dev/null 2>&1
 }
 
+is_root() {
+  (( EUID == 0 ))
+}
+
+awk() {
+  if [[ -n "$AWK_BIN" ]]; then
+    "$AWK_BIN" "$@"
+  else
+    command awk "$@"
+  fi
+}
+
 is_uint() {
   [[ "$1" =~ ^[0-9]+$ ]]
 }
 
 is_positive_number() {
-  awk -v value="$1" 'BEGIN { exit !(value ~ /^[0-9]+([.][0-9]+)?$/ && value > 0) }'
+  local value=$1
+  [[ "$value" =~ ^[0-9]+([.][0-9]+)?$ &&
+    "$value" =~ [1-9] ]]
+}
+
+number_not_greater_than_100000() {
+  local value=$1
+  local whole=${value%%.*}
+  local fraction=''
+
+  [[ "$value" == *.* ]] && fraction=${value#*.}
+  while [[ ${#whole} -gt 1 && "$whole" == 0* ]]; do
+    whole=${whole#0}
+  done
+  (( ${#whole} < 6 )) && return 0
+  (( ${#whole} > 6 )) && return 1
+  [[ "$whole" == '100000' && ( -z "$fraction" ||
+    ! "$fraction" =~ [1-9] ) ]]
 }
 
 validate_port() {
@@ -178,28 +226,193 @@ check_platform() {
   local os_id=''
   local version_id=''
 
-  [[ -r /etc/os-release ]] || die 'Debian 12 or 13 is required.'
-  # shellcheck disable=SC1091
-  source /etc/os-release
+  [[ -r "$OS_RELEASE_FILE" ]] ||
+    die 'Debian 12/13 or Alpine 3.21-3.23 is required.'
+  # shellcheck disable=SC1090
+  source "$OS_RELEASE_FILE"
   os_id=${ID:-}
   version_id=${VERSION_ID:-}
-  [[ "$os_id" == 'debian' && ( "$version_id" == '12' ||
-    "$version_id" == '13' ) ]] ||
-    die 'This repository supports Debian 12 and Debian 13 only.'
+  case "$os_id" in
+    debian)
+      [[ "$version_id" == '12' || "$version_id" == '13' ]] ||
+        die 'Debian 12/13 or Alpine 3.21-3.23 is required.'
+      PLATFORM_FAMILY='debian'
+      PLATFORM_VERSION=$version_id
+      ;;
+    alpine)
+      [[ "$version_id" =~ ^3[.](21|22|23)([.][0-9]+)*$ ]] ||
+        die 'Debian 12/13 or Alpine 3.21-3.23 is required.'
+      PLATFORM_FAMILY='alpine'
+      PLATFORM_VERSION="3.${BASH_REMATCH[1]}"
+      ;;
+    *)
+      die 'Debian 12/13 or Alpine 3.21-3.23 is required.'
+      ;;
+  esac
+  [[ -n "$PLATFORM_FAMILY" && -n "$PLATFORM_VERSION" ]] ||
+    die 'Unable to identify the supported platform.'
+}
+
+add_missing_dependency() {
+  local description=$1
+  local package=$2
+  local existing
+
+  MISSING_COMMANDS+=("$description")
+  for existing in "${MISSING_PACKAGES[@]}"; do
+    [[ "$existing" != "$package" ]] || return 0
+  done
+  MISSING_PACKAGES+=("$package")
+}
+
+has_gnu_sed() {
+  command_exists sed && sed --version 2>/dev/null | grep -q 'GNU sed'
+}
+
+has_coreutils_date() {
+  local value
+  command_exists date || return 1
+  value=$(date -u +%N 2>/dev/null) || return 1
+  [[ "$value" =~ ^[0-9]{9}$ ]]
+}
+
+has_coreutils_timeout() {
+  command_exists timeout &&
+    timeout --version 2>/dev/null | grep -q 'GNU coreutils'
+}
+
+has_coreutils_sort() {
+  command_exists sort && sort --version 2>/dev/null | grep -q 'GNU coreutils'
+}
+
+has_iputils_ping() {
+  command_exists ping && ping -V 2>&1 | grep -qi 'iputils'
+}
+
+collect_missing_dependencies() {
+  MISSING_COMMANDS=()
+  MISSING_PACKAGES=()
+
+  if [[ "$MODE" == 'history' ]]; then
+    command_exists jq || add_missing_dependency 'jq' 'jq'
+    has_coreutils_sort || add_missing_dependency 'coreutils sort' 'coreutils'
+    return 0
+  fi
+
+  command_exists mawk || add_missing_dependency 'mawk-compatible awk' 'mawk'
+  has_gnu_sed || add_missing_dependency 'GNU sed' 'sed'
+  command_exists iperf3 || add_missing_dependency 'iperf3' 'iperf3'
+  has_coreutils_timeout ||
+    add_missing_dependency 'coreutils timeout --foreground' 'coreutils'
+  if [[ "$MODE" == 'client' ]]; then
+    command_exists jq || add_missing_dependency 'jq' 'jq'
+    has_coreutils_date ||
+      add_missing_dependency 'coreutils date with nanoseconds' 'coreutils'
+    has_iputils_ping || add_missing_dependency 'iputils ping' \
+      "$([[ "$PLATFORM_FAMILY" == 'debian' ]] && printf 'iputils-ping' || printf 'iputils')"
+  fi
+}
+
+manual_install_command() {
+  local packages=${MISSING_PACKAGES[*]}
+  if [[ "$PLATFORM_FAMILY" == 'debian' ]]; then
+    printf 'apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends %s' \
+      "$packages"
+  else
+    printf 'apk add --no-cache %s' "$packages"
+  fi
+}
+
+choose_privilege_helper() {
+  PRIVILEGE_HELPER=''
+  ! is_root || return 0
+  if [[ "$PLATFORM_FAMILY" == 'alpine' ]] && command_exists doas; then
+    PRIVILEGE_HELPER='doas'
+  elif command_exists sudo; then
+    PRIVILEGE_HELPER='sudo'
+  else
+    return 1
+  fi
+}
+
+install_runtime_packages() {
+  local package_manager
+
+  (( ${#MISSING_PACKAGES[@]} > 0 )) || return 0
+  choose_privilege_helper || die "Missing runtime capabilities: ${MISSING_COMMANDS[*]}. Required packages: ${MISSING_PACKAGES[*]}. Run as root: $(manual_install_command)"
+  if [[ "$PLATFORM_FAMILY" == 'debian' ]]; then
+    package_manager=(apt-get)
+    if [[ -z "$PRIVILEGE_HELPER" ]]; then
+      DEBIAN_FRONTEND=noninteractive apt-get update ||
+        die 'apt-get update failed; no benchmark was started.'
+      DEBIAN_FRONTEND=noninteractive apt-get install -y \
+        --no-install-recommends "${MISSING_PACKAGES[@]}" ||
+        die 'apt-get install failed; no benchmark was started.'
+    else
+      "$PRIVILEGE_HELPER" env DEBIAN_FRONTEND=noninteractive apt-get update ||
+        die 'apt-get update failed; no benchmark was started.'
+      "$PRIVILEGE_HELPER" env DEBIAN_FRONTEND=noninteractive apt-get install -y \
+        --no-install-recommends "${MISSING_PACKAGES[@]}" ||
+        die 'apt-get install failed; no benchmark was started.'
+    fi
+  else
+    package_manager=(apk)
+    [[ -z "$PRIVILEGE_HELPER" ]] || package_manager=("$PRIVILEGE_HELPER" apk)
+    "${package_manager[@]}" add --no-cache "${MISSING_PACKAGES[@]}" ||
+      die 'apk add failed; no benchmark was started.'
+  fi
+}
+
+run_privileged() {
+  if is_root; then
+    "$@"
+  elif [[ -n "$PRIVILEGE_HELPER" ]]; then
+    "$PRIVILEGE_HELPER" "$@"
+  else
+    return 1
+  fi
+}
+
+ensure_new_iperf3_daemon_disabled() {
+  [[ "$PLATFORM_FAMILY" == 'debian' &&
+    "$IPERF3_INSTALLED_NOW" == true ]] || return 0
+  if command_exists systemctl; then
+    run_privileged systemctl stop iperf3.service >/dev/null 2>&1 || true
+    run_privileged systemctl disable iperf3.service >/dev/null 2>&1 || true
+    if systemctl is-active --quiet iperf3.service 2>/dev/null ||
+      [[ "$(systemctl is-enabled iperf3.service 2>/dev/null || true)" == 'enabled' ]]; then
+      die 'The newly installed iperf3 service could not be left inactive and disabled.'
+    fi
+  else
+    if command_exists service; then
+      run_privileged service iperf3 stop >/dev/null 2>&1 || true
+    fi
+    if command_exists update-rc.d; then
+      run_privileged update-rc.d iperf3 disable >/dev/null 2>&1 || true
+    fi
+  fi
 }
 
 check_dependencies() {
-  local dependency
-  local -a dependencies=(jq awk sed)
+  local iperf3_was_missing=false
 
+  [[ "$MODE" == 'history' ]] || command_exists iperf3 ||
+    iperf3_was_missing=true
+  collect_missing_dependencies
+  install_runtime_packages
+  collect_missing_dependencies
+  if (( ${#MISSING_COMMANDS[@]} > 0 )); then
+    die "Runtime dependencies remain unavailable after installation: ${MISSING_COMMANDS[*]} (packages: ${MISSING_PACKAGES[*]})."
+  fi
   if [[ "$MODE" != 'history' ]]; then
-    dependencies+=(iperf3 ping timeout)
+    AWK_BIN=$(command -v mawk)
+    [[ -x "$AWK_BIN" ]] || die 'A verified mawk executable is required.'
   fi
 
-  for dependency in "${dependencies[@]}"; do
-    command_exists "$dependency" ||
-      die "Missing dependency: $dependency (install iperf3, iputils-ping, jq, and coreutils)."
-  done
+  if [[ "$iperf3_was_missing" == true && "$MODE" != 'history' ]]; then
+    IPERF3_INSTALLED_NOW=true
+    ensure_new_iperf3_daemon_disabled
+  fi
 }
 
 parse_args() {
@@ -308,7 +521,7 @@ parse_args() {
   fi
   if [[ -n "$NOMINAL_MBPS" ]]; then
     is_positive_number "$NOMINAL_MBPS" || die 'Bandwidth must be a positive Mbps value.'
-    awk -v value="$NOMINAL_MBPS" 'BEGIN { exit !(value <= 100000) }' ||
+    number_not_greater_than_100000 "$NOMINAL_MBPS" ||
       die 'Bandwidth is unreasonably large.'
   fi
 }
@@ -377,13 +590,23 @@ random_port() {
   return 1
 }
 
+run_ufw() {
+  if (( ${#UFW_COMMAND[@]} > 0 )); then
+    "${UFW_COMMAND[@]}" "$@"
+  else
+    ufw "$@"
+  fi
+}
+
 cleanup_firewall() {
   local number
+  local protocol
   local status_output
+  local cleanup_failed=false
   local -a rule_numbers=()
 
   [[ "$FIREWALL_RULE_ADDED" == true ]] || return 0
-  status_output=$(LC_ALL=C ufw status numbered 2>/dev/null || true)
+  status_output=$(LC_ALL=C run_ufw status numbered 2>/dev/null || true)
   mapfile -t rule_numbers < <(printf '%s\n' "$status_output" | awk \
     -v marker="$FIREWALL_COMMENT" 'index($0, "# " marker) {
       number=$0; sub(/^[^[]*\[[[:space:]]*/, "", number);
@@ -391,11 +614,35 @@ cleanup_firewall() {
       if (number != "") print number
     }' | sort -rn)
   for number in "${rule_numbers[@]}"; do
-    ufw --force delete "$number" >/dev/null 2>&1 ||
+    if ! run_ufw --force delete "$number" >/dev/null 2>&1; then
       warn "Could not remove temporary UFW rule $number; inspect ufw status numbered."
+      cleanup_failed=true
+    fi
   done
   if (( ${#rule_numbers[@]} == 0 )); then
-    warn 'Temporary UFW rules were not found by their unique comment; inspect ufw status numbered.'
+    for protocol in tcp udp; do
+      if [[ -n "$ALLOW_PEER" ]]; then
+        if ! run_ufw --force delete allow from "$ALLOW_PEER" to any port \
+          "$PORT" proto "$protocol" comment "$FIREWALL_COMMENT" \
+          >/dev/null 2>&1; then
+          cleanup_failed=true
+        fi
+      else
+        if ! run_ufw --force delete allow to any port "$PORT" proto "$protocol" \
+          comment "$FIREWALL_COMMENT" >/dev/null 2>&1; then
+          cleanup_failed=true
+        fi
+      fi
+    done
+  fi
+  status_output=$(LC_ALL=C run_ufw status numbered 2>/dev/null || true)
+  if printf '%s\n' "$status_output" | grep -Fq "# $FIREWALL_COMMENT"; then
+    warn 'Temporary UFW rule cleanup could not be verified; inspect ufw status numbered.'
+    return 1
+  fi
+  if [[ "$cleanup_failed" == true ]]; then
+    warn 'One or more temporary UFW rule deletions failed.'
+    return 1
   fi
   FIREWALL_RULE_ADDED=false
 }
@@ -417,7 +664,8 @@ cleanup() {
     wait "$ACTIVE_IPERF_PID" 2>/dev/null || true
     ACTIVE_IPERF_PID=''
   fi
-  cleanup_firewall
+  cleanup_firewall ||
+    warn 'Automatic UFW cleanup was incomplete; inspect the unique benchmark comment.'
   if [[ -n "$TEMP_DIR" && "$TEMP_DIR" == /tmp/* && -d "$TEMP_DIR" ]]; then
     rm -rf -- "$TEMP_DIR"
   fi
@@ -434,35 +682,60 @@ trap signal_exit INT TERM HUP
 setup_firewall() {
   local ufw_status
   local verified_count
+  local protocol
 
-  [[ -n "$ALLOW_PEER" ]] || {
-    printf 'Firewall:     unchanged; allow TCP/UDP %s only from VPS-A if required.\n' "$PORT"
+  FIREWALL_STATUS='unchanged (UFW is not active)'
+  UFW_COMMAND=()
+  if ! command_exists ufw; then
+    [[ -z "$ALLOW_PEER" ]] ||
+      die '--allow-peer requested but peer-only firewall enforcement is unavailable (UFW is not installed).'
+    warn 'Firewall unchanged: UFW is not installed.'
     return 0
-  }
-  (( EUID == 0 )) || die '--allow-peer requires root.'
-  command_exists ufw || die '--allow-peer was requested, but UFW is not installed.'
-  ufw_status=$(LC_ALL=C ufw status 2>/dev/null | sed -n '1p')
-  [[ "$ufw_status" == 'Status: active' ]] ||
-    die '--allow-peer requires an already active UFW; no firewall was changed.'
-  FIREWALL_COMMENT="protocol-benchmark-$$"
+  fi
+  if is_root; then
+    UFW_COMMAND=(ufw)
+  elif command_exists sudo && sudo -n ufw status >/dev/null 2>&1; then
+    UFW_COMMAND=(sudo -n ufw)
+  else
+    [[ -z "$ALLOW_PEER" ]] ||
+      die '--allow-peer requested but peer-only firewall enforcement is unavailable (cannot inspect UFW).'
+    FIREWALL_STATUS='unchanged (UFW status unavailable)'
+    warn 'Firewall unchanged: UFW is installed but cannot be inspected without privilege.'
+    return 0
+  fi
+  ufw_status=$(LC_ALL=C "${UFW_COMMAND[@]}" status 2>/dev/null | sed -n '1p')
+  if [[ "$ufw_status" != 'Status: active' ]]; then
+    [[ -z "$ALLOW_PEER" ]] ||
+      die '--allow-peer requested but peer-only firewall enforcement is unavailable (UFW is not active).'
+    warn 'Firewall unchanged: UFW is not active.'
+    return 0
+  fi
+  FIREWALL_COMMENT="protocol-benchmark-${MAIN_BASHPID}-${PORT}-${RANDOM}"
   FIREWALL_RULE_ADDED=true
-  if ! ufw insert 1 allow from "$ALLOW_PEER" to any port "$PORT" proto tcp \
-    comment "$FIREWALL_COMMENT" >/dev/null; then
-    cleanup_firewall
-    die 'Unable to add the temporary TCP UFW rule.'
-  fi
-  if ! ufw insert 1 allow from "$ALLOW_PEER" to any port "$PORT" proto udp \
-    comment "$FIREWALL_COMMENT" >/dev/null; then
-    cleanup_firewall
-    die 'Unable to add the temporary UDP UFW rule.'
-  fi
-  verified_count=$(LC_ALL=C ufw status numbered 2>/dev/null | awk \
+  for protocol in tcp udp; do
+    if [[ -n "$ALLOW_PEER" ]]; then
+      if ! "${UFW_COMMAND[@]}" insert 1 allow from "$ALLOW_PEER" to any \
+        port "$PORT" proto "$protocol" comment "$FIREWALL_COMMENT" >/dev/null; then
+        cleanup_firewall || true
+        die "Unable to add the temporary $protocol UFW rule."
+      fi
+    elif ! "${UFW_COMMAND[@]}" insert 1 allow to any port "$PORT" \
+      proto "$protocol" comment "$FIREWALL_COMMENT" >/dev/null; then
+      cleanup_firewall || true
+      die "Unable to add the temporary $protocol UFW rule."
+    fi
+  done
+  verified_count=$(LC_ALL=C "${UFW_COMMAND[@]}" status numbered 2>/dev/null | awk \
     -v marker="$FIREWALL_COMMENT" 'index($0, "# " marker) {count++} END {print count+0}')
   if (( verified_count != 2 )); then
-    cleanup_firewall
+    cleanup_firewall || true
     die 'Temporary UFW rules could not be verified; rules were rolled back.'
   fi
-  printf 'Firewall:     temporary TCP/UDP allow from %s\n' "$ALLOW_PEER"
+  if [[ -n "$ALLOW_PEER" ]]; then
+    FIREWALL_STATUS="temporary TCP/UDP allow from $ALLOW_PEER"
+  else
+    FIREWALL_STATUS='temporary TCP/UDP allow added'
+  fi
 }
 
 run_server() {
@@ -477,10 +750,12 @@ run_server() {
   printf '\nProtocol Benchmark temporary server\n'
   printf '%s\n' '-----------------------------------'
   printf 'Port:         %s (TCP and UDP)\n' "$PORT"
-  printf 'Client:       bash protocol-benchmark.sh <B-IP> --port %s\n' "$PORT"
+  printf 'Firewall:     %s\n' "$FIREWALL_STATUS"
   printf 'First wait:   %s seconds\n' "$SERVER_WAIT"
   printf 'Auto-close:   %s seconds after the last test\n' "$SERVER_SESSION_IDLE"
-  printf 'Stop:         Ctrl+C (cleanup is automatic)\n\n'
+  printf '\nClient command:\n'
+  printf 'bash <(curl -fsSL https://raw.githubusercontent.com/404-git-404/404notfound/main/protocol-benchmark.sh) SERVER_IP --port %s\n' "$PORT"
+  printf '\nStop: Ctrl+C (cleanup is automatic)\n\n'
 
   while true; do
     if (( SERVER_TESTS == 0 )); then
@@ -590,11 +865,103 @@ planned_bytes() {
 
 reserve_budget() {
   local bytes=$1
-  if (( TRAFFIC_RESERVED_BYTES + bytes > BUDGET_BYTES )); then
+  if (( TRAFFIC_ACCOUNTED_BYTES + TRAFFIC_RESERVED_BYTES + bytes > BUDGET_BYTES )); then
     BUDGET_LIMITED=true
-    return 1
+    return "$TEST_RESULT_BUDGET_DENIED"
   fi
   (( TRAFFIC_RESERVED_BYTES += bytes ))
+}
+
+release_budget_reservation() {
+  local bytes=$1
+  if (( bytes >= TRAFFIC_RESERVED_BYTES )); then
+    TRAFFIC_RESERVED_BYTES=0
+  else
+    (( TRAFFIC_RESERVED_BYTES -= bytes ))
+  fi
+}
+
+sanitize_failure_text() {
+  local value=$1
+
+  [[ -z "$TEMP_DIR" ]] || value=${value//"$TEMP_DIR"/<temporary>}
+  value=$(printf '%s' "$value" | LC_ALL=C sed -E \
+    $'s/\033\[[0-9;?]*[ -\/]*[@-~]//g; s#/tmp/[^[:space:]]+#<temporary>#g' |
+    LC_ALL=C tr -cd '[:print:]\t')
+  value=${value//$'\t'/ }
+  while [[ "$value" == *'  '* ]]; do value=${value//'  '/' '}; done
+  value=${value# }
+  value=${value% }
+  printf '%.180s' "$value"
+}
+
+extract_failure_reason() {
+  local json_file=$1
+  local status=$2
+  local reason=''
+  local line
+
+  if jq -e . "$json_file" >/dev/null 2>&1; then
+    reason=$(jq -r '.error // empty' "$json_file" 2>/dev/null || true)
+  fi
+  if [[ -z "$reason" && -r "$json_file.stderr" ]]; then
+    while IFS= read -r line; do
+      line=$(sanitize_failure_text "$line")
+      if [[ -n "$line" ]]; then
+        reason=$line
+        break
+      fi
+    done <"$json_file.stderr"
+  fi
+  reason=$(sanitize_failure_text "$reason")
+  if [[ -z "$reason" ]]; then
+    if ! jq -e . "$json_file" >/dev/null 2>&1; then
+      reason="invalid iperf3 JSON (exit $status)"
+    else
+      reason="iperf3 exited with status $status"
+    fi
+  fi
+  printf '%s\n' "$reason"
+}
+
+failure_bytes_from_json() {
+  local json_file=$1
+  local bytes
+
+  bytes=$(jq -r '
+    .end.sum.bytes // .end.sum_received.bytes // .end.sum_sent.bytes // 0
+  ' "$json_file" 2>/dev/null || printf '0')
+  bytes=${bytes%.*}
+  is_uint "$bytes" || bytes=0
+  printf '%s\n' "$bytes"
+}
+
+failure_has_no_transfer() {
+  local reason=${1,,}
+  [[ "$reason" == *'unable to connect'* ||
+    "$reason" == *'connection refused'* ||
+    "$reason" == *'connection timed out'* ||
+    "$reason" == *'timed out'* ||
+    "$reason" == *'no route to host'* ||
+    "$reason" == *'network is unreachable'* ||
+    "$reason" == *'name or service not known'* ||
+    "$reason" == *'temporary failure in name resolution'* ]]
+}
+
+account_failed_test() {
+  local reserve=$1
+  local json_file=$2
+  local reason=$3
+  local bytes
+
+  release_budget_reservation "$reserve"
+  bytes=$(failure_bytes_from_json "$json_file")
+  if (( bytes > 0 )); then
+    (( TRAFFIC_ACTUAL_BYTES += bytes ))
+    (( TRAFFIC_ACCOUNTED_BYTES += bytes ))
+  elif ! failure_has_no_transfer "$reason"; then
+    (( TRAFFIC_ACCOUNTED_BYTES += reserve ))
+  fi
 }
 
 append_label() {
@@ -604,11 +971,20 @@ append_label() {
 
 record_failure() {
   local protocol=$1
+  local direction=${2:-UNKNOWN}
+  local percent=${3:-0}
+  local status=${4:-1}
+  local reason=${5:-'iperf3 execution failed'}
+
   (( TEST_FAILURES += 1 ))
   if [[ "$protocol" == 'TCP' ]]; then
     (( TCP_FAILURES += 1 ))
   else
     (( UDP_FAILURES += 1 ))
+  fi
+  if [[ -n "$FAILURE_FILE" ]]; then
+    printf '%s\t%s\t%s\t%s\t%s\n' "$protocol" "$direction" \
+      "$percent" "$status" "$reason" >>"$FAILURE_FILE"
   fi
 }
 
@@ -638,11 +1014,12 @@ run_controlled_test() {
   local load_rtt=''
   local load_increase=0
   local error
+  local json_valid=false
   local -a command=(iperf3 -c "$PEER" -p "$PORT" -J -t "$DURATION")
 
   rate_mbps=$(rate_for_percent "$percent")
   reserve=$(planned_bytes "$rate_mbps" "$DURATION")
-  reserve_budget "$reserve" || return 2
+  reserve_budget "$reserve" || return "$TEST_RESULT_BUDGET_DENIED"
   json_file="$TEMP_DIR/${protocol,,}-${direction,,}-${percent}-${streams}.json"
   ping_file="$TEMP_DIR/${protocol,,}-${direction,,}-${percent}-${streams}.ping"
   command+=(-b "${rate_mbps}M" -P "$streams")
@@ -667,18 +1044,21 @@ run_controlled_test() {
   read -r after_total after_idle < <(read_cpu_sample)
   local_cpu=$(cpu_between "$before_total" "$before_idle" "$after_total" "$after_idle")
 
-  if (( status != 0 )) || ! jq -e . "$json_file" >/dev/null 2>&1; then
-    printf 'FAILED\n'
-    record_failure "$protocol"
-    sleep "$COOLDOWN"
-    return 1
+  if jq -e . "$json_file" >/dev/null 2>&1; then
+    json_valid=true
   fi
-  error=$(jq -r '.error // empty' "$json_file")
-  if [[ -n "$error" ]]; then
-    printf 'FAILED (%s)\n' "$error"
-    record_failure "$protocol"
+  if [[ "$json_valid" == true ]]; then
+    error=$(jq -r '.error // empty' "$json_file")
+  else
+    error=''
+  fi
+  if (( status != 0 )) || [[ "$json_valid" == false || -n "$error" ]]; then
+    error=$(extract_failure_reason "$json_file" "$status")
+    printf 'FAILED: %s\n' "$error"
+    account_failed_test "$reserve" "$json_file" "$error"
+    record_failure "$protocol" "$direction" "$percent" "$status" "$error"
     sleep "$COOLDOWN"
-    return 1
+    return "$TEST_RESULT_FAILED"
   fi
 
   if [[ "$protocol" == 'TCP' ]]; then
@@ -711,7 +1091,9 @@ run_controlled_test() {
   fi
   bytes=${bytes%.*}
   is_uint "$bytes" || bytes=0
+  release_budget_reservation "$reserve"
   (( TRAFFIC_ACTUAL_BYTES += bytes ))
+  (( TRAFFIC_ACCOUNTED_BYTES += bytes ))
   printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
     "$protocol" "$direction" "$percent" "$streams" "$rate_mbps" \
     "$achieved" "$ratio" "$retrans" "$loss" "$jitter" \
@@ -728,6 +1110,14 @@ run_controlled_test() {
 
 protocol_count() {
   awk -F '\t' -v protocol="$1" '$1 == protocol {count++} END {print count+0}' "$RESULT_FILE"
+}
+
+protocol_is_evaluable() {
+  awk -F '\t' -v protocol="$1" '
+    $1 == protocol && $2 == "A_TO_B" {forward=1}
+    $1 == protocol && $2 == "B_TO_A" {reverse=1}
+    END {exit !(forward && reverse)}
+  ' "$RESULT_FILE"
 }
 
 tcp_is_severe() {
@@ -780,16 +1170,28 @@ run_direction_pair() {
   local protocol=$1
   local percent=$2
   local streams=${3:-1}
-  local result=0
+  local forward_result=0
+  local reverse_result=0
 
-  run_controlled_test "$protocol" 'A_TO_B' "$percent" "$streams" || result=$?
-  if (( result == 2 )); then
-    return 2
+  if run_controlled_test "$protocol" 'A_TO_B' "$percent" "$streams"; then
+    forward_result=$TEST_RESULT_OK
+  else
+    forward_result=$?
   fi
-  result=0
-  run_controlled_test "$protocol" 'B_TO_A' "$percent" "$streams" || result=$?
-  (( result == 2 )) && return 2
-  return 0
+  if (( forward_result == TEST_RESULT_BUDGET_DENIED )); then
+    return "$TEST_RESULT_BUDGET_DENIED"
+  fi
+  if run_controlled_test "$protocol" 'B_TO_A' "$percent" "$streams"; then
+    reverse_result=$TEST_RESULT_OK
+  else
+    reverse_result=$?
+  fi
+  (( reverse_result != TEST_RESULT_BUDGET_DENIED )) ||
+    return "$TEST_RESULT_BUDGET_DENIED"
+  if (( forward_result != TEST_RESULT_OK || reverse_result != TEST_RESULT_OK )); then
+    return "$TEST_RESULT_FAILED"
+  fi
+  return "$TEST_RESULT_OK"
 }
 
 should_try_two_streams() {
@@ -801,10 +1203,14 @@ should_try_two_streams() {
 
 run_adaptive_matrix() {
   local percent
+  local pair_result
   local tcp_stopped=false
   local udp_stopped=false
   local tcp_healthy=false
   local udp_healthy=false
+  local tcp_execution_failed=false
+  local udp_execution_failed=false
+  local budget_denied=false
   local -a levels=(5 10 20)
 
   TCP_ADAPTIVE_STOP=false
@@ -825,11 +1231,21 @@ run_adaptive_matrix() {
     (( percent <= MAX_PERCENT )) || break
     if [[ "$tcp_stopped" == false &&
       ( "$tcp_healthy" == false || "$DEEP" == true ) ]]; then
-      if ! run_direction_pair 'TCP' "$percent"; then
-        BUDGET_LIMITED=true
-        break
+      if run_direction_pair 'TCP' "$percent"; then
+        pair_result=$TEST_RESULT_OK
+      else
+        pair_result=$?
       fi
-      if tcp_is_severe; then
+      if (( pair_result == TEST_RESULT_BUDGET_DENIED )); then
+        budget_denied=true
+      elif (( pair_result == TEST_RESULT_FAILED )); then
+        tcp_stopped=true
+        tcp_execution_failed=true
+        if (( percent < MAX_PERCENT )); then
+          TCP_ADAPTIVE_STOP=true
+          TCP_STOP_STAGE=$percent
+        fi
+      elif tcp_is_severe; then
         tcp_stopped=true
         append_label 'TCP-DEGRADED'
         if (( percent < MAX_PERCENT )); then
@@ -844,13 +1260,24 @@ run_adaptive_matrix() {
         fi
       fi
     fi
+    [[ "$budget_denied" == false ]] || break
     if [[ "$udp_stopped" == false &&
       ( "$udp_healthy" == false || "$DEEP" == true ) ]]; then
-      if ! run_direction_pair 'UDP' "$percent"; then
-        BUDGET_LIMITED=true
-        break
+      if run_direction_pair 'UDP' "$percent"; then
+        pair_result=$TEST_RESULT_OK
+      else
+        pair_result=$?
       fi
-      if udp_is_severe; then
+      if (( pair_result == TEST_RESULT_BUDGET_DENIED )); then
+        budget_denied=true
+      elif (( pair_result == TEST_RESULT_FAILED )); then
+        udp_stopped=true
+        udp_execution_failed=true
+        if (( percent < MAX_PERCENT )); then
+          UDP_ADAPTIVE_STOP=true
+          UDP_STOP_STAGE=$percent
+        fi
+      elif udp_is_severe; then
         udp_stopped=true
         append_label 'UDP-DEGRADED'
         if (( percent < MAX_PERCENT )); then
@@ -865,12 +1292,28 @@ run_adaptive_matrix() {
         fi
       fi
     fi
+    [[ "$budget_denied" == false ]] || break
+
+    if (( percent == 5 )) && ! protocol_is_evaluable TCP &&
+      ! protocol_is_evaluable UDP; then
+      printf '  Active benchmark stopped: no valid bidirectional 5%% samples.\n'
+      break
+    fi
 
     if [[ "$DEEP" == false && "$tcp_healthy" == true &&
       "$udp_healthy" == true ]]; then
       EARLY_STOP=true
       printf '  Early Stop: %s%% data is sufficient for high-confidence classification.\n' \
         "$percent"
+      break
+    fi
+    if [[
+      ( "$tcp_healthy" == true || "$tcp_stopped" == true ) &&
+      ( "$udp_healthy" == true || "$udp_stopped" == true ) &&
+      ( "$tcp_execution_failed" == true || "$udp_execution_failed" == true )
+    ]]; then
+      EARLY_STOP=true
+      printf '  Early Stop: execution failure prevents further useful escalation.\n'
       break
     fi
     if [[ "$DEEP" == false &&
@@ -885,7 +1328,8 @@ run_adaptive_matrix() {
     fi
   done
 
-  if should_try_two_streams; then
+  if [[ "$tcp_execution_failed" == false ]] && protocol_is_evaluable TCP &&
+    should_try_two_streams; then
     printf '  Diagnostic: one bounded 2-stream TCP confirmation.\n'
     run_controlled_test 'TCP' 'A_TO_B' 10 2 || true
   fi
@@ -1162,14 +1606,51 @@ calculate_results() {
   local load_average
   local cpu_count
 
+  TCP_EVALUABLE=false
+  UDP_EVALUABLE=false
+  protocol_is_evaluable TCP && TCP_EVALUABLE=true
+  protocol_is_evaluable UDP && UDP_EVALUABLE=true
+  if [[ "$TCP_EVALUABLE" == false && "$UDP_EVALUABLE" == false ]]; then
+    RESULT_STATE='FAILED'
+    CONFIDENCE='NONE'
+    STATUS='NO VALID DATA'
+    PREFERRED='INCONCLUSIVE'
+    REASON='Unable to complete controlled iperf3 tests; no link-quality conclusion is available.'
+    append_label 'EXECUTION-FAILED'
+    return 0
+  fi
+
   IFS=$'\t' read -r TCP_RETRANS_DENSITY_A_TO_B \
     TCP_RETRANS_DENSITY_B_TO_A TCP_RETRANS_WORST_DIRECTION \
     TCP_RETRANS_PENALTY TCP_TRANSFERRED_BYTES_A_TO_B \
     TCP_TRANSFERRED_BYTES_B_TO_A TCP_RETRANSMISSIONS_A_TO_B \
     TCP_RETRANSMISSIONS_B_TO_A < <(calculate_tcp_retransmission_metrics)
-  TCP_SCORE=$(calculate_protocol_score 'TCP' "$TCP_FAILURES" \
-    "$TCP_RETRANS_PENALTY")
-  UDP_SCORE=$(calculate_protocol_score 'UDP' "$UDP_FAILURES")
+  TCP_SCORE=0
+  UDP_SCORE=0
+  if [[ "$TCP_EVALUABLE" == true ]]; then
+    TCP_SCORE=$(calculate_protocol_score 'TCP' "$TCP_FAILURES" \
+      "$TCP_RETRANS_PENALTY")
+  fi
+  if [[ "$UDP_EVALUABLE" == true ]]; then
+    UDP_SCORE=$(calculate_protocol_score 'UDP' "$UDP_FAILURES")
+  fi
+  if [[ "$TCP_EVALUABLE" != "$UDP_EVALUABLE" ]]; then
+    RESULT_STATE='PARTIAL'
+    CONFIDENCE='LOW'
+    STATUS='INCOMPLETE'
+    PREFERRED='INCONCLUSIVE'
+    REASON='Only one protocol produced valid bidirectional samples; no combined link-quality score or transport recommendation was produced.'
+    append_label 'PARTIAL-DATA'
+    [[ "$CPU_LIMITED" == false ]] || append_label 'CPU-LIMITED'
+    if [[ "$TCP_EVALUABLE" == true ]] && (( TCP_SCORE < 65 )); then
+      append_label 'TCP-DEGRADED'
+    fi
+    if [[ "$UDP_EVALUABLE" == true ]] && (( UDP_SCORE < 65 )); then
+      append_label 'UDP-DEGRADED'
+    fi
+    return 0
+  fi
+  RESULT_STATE='COMPLETE'
   if [[ -n "$IDLE_LOSS" ]]; then
     idle_penalty=$(awk -v loss="$IDLE_LOSS" -v variation="${IDLE_VARIATION:-0}" '
       BEGIN {
@@ -1297,6 +1778,41 @@ print_results() {
   printf 'Load RTT:      +%s ms max\n' "$MAX_LOAD_INCREASE"
   printf 'Peak CPU:      %s%%\n' "$MAX_CPU"
   printf 'Max load avg:  %s\n' "$MAX_LOAD_AVERAGE"
+  if [[ "$RESULT_STATE" == 'FAILED' ]]; then
+    printf '\nTEST RESULT:   FAILED\n'
+    printf 'CONFIDENCE:    NONE\n'
+    printf 'Budget stop:   %s\n' "$BUDGET_LIMITED"
+    printf '\nNo valid bidirectional TCP or UDP benchmark samples were collected.\n'
+    printf '\nReason:\nUnable to complete controlled iperf3 tests.\n'
+    printf 'Check the temporary server, port, firewall, or connectivity.\n'
+    print_failure_summary
+    printf '\nNo link-quality score or transport recommendation was produced.\n'
+    return 0
+  fi
+  if [[ "$RESULT_STATE" == 'PARTIAL' ]]; then
+    printf '\nTEST RESULT:   INCOMPLETE / PARTIAL DATA\n'
+    printf 'CONFIDENCE:    LOW\n'
+    if [[ "$TCP_EVALUABLE" == true ]]; then
+      printf 'TCP SCORE:     %s / 100\n' "$TCP_SCORE"
+    else
+      printf 'TCP SCORE:     not evaluable\n'
+    fi
+    if [[ "$UDP_EVALUABLE" == true ]]; then
+      printf 'UDP SCORE:     %s / 100\n' "$UDP_SCORE"
+    else
+      printf 'UDP SCORE:     not evaluable\n'
+    fi
+    printf 'LINK HEALTH:   not produced\n'
+    printf 'STATUS:        INCOMPLETE\n'
+    printf '\nPreferred:     INCONCLUSIVE\n'
+    printf '\nReason:\n%s\n' "$REASON"
+    print_failure_summary
+    if [[ "$BUDGET_LIMITED" == true ]]; then
+      printf '\nBudget stop: no further active stages were allowed.\n'
+    fi
+    printf '\nNo combined link-quality conclusion was produced.\n'
+    return 0
+  fi
   printf '\nTCP SCORE:     %s / 100\n' "$TCP_SCORE"
   printf 'TCP retransmissions:\n'
   printf '  A->B:        %s\n' "$TCP_RETRANSMISSIONS_A_TO_B"
@@ -1337,8 +1853,20 @@ print_results() {
   if [[ "$BUDGET_LIMITED" == true ]]; then
     printf '\nBudget stop: no further active stages were allowed.\n'
   fi
+  print_failure_summary
   printf '\nUnderlying VPS<->VPS link appears %s.\n' "${STATUS,,}"
   printf 'This does NOT prove the sing-box/proxy layer is healthy.\n'
+}
+
+print_failure_summary() {
+  local protocol direction percent status reason
+
+  [[ -n "$FAILURE_FILE" && -s "$FAILURE_FILE" ]] || return 0
+  printf '\nExecution failures:\n'
+  while IFS=$'\t' read -r protocol direction percent status reason; do
+    printf '  %s %s %s%% (exit %s): %s\n' "$protocol" \
+      "${direction//_TO_/->}" "$percent" "$status" "$reason"
+  done <"$FAILURE_FILE"
 }
 
 baseline_directory() {
@@ -1582,8 +2110,8 @@ save_history() {
 }
 
 persist_history() {
-  if [[ ! -s "$RESULT_FILE" ]] || (( $(protocol_count TCP) < 2 ||
-    $(protocol_count UDP) < 2 )); then
+  if [[ "$RESULT_STATE" != 'COMPLETE' || ! -s "$RESULT_FILE" ]] ||
+    ! protocol_is_evaluable TCP || ! protocol_is_evaluable UDP; then
     return 0
   fi
   if ! save_history; then
@@ -1754,14 +2282,21 @@ run_client() {
   BUDGET_BYTES=$((BUDGET_MB * 1000 * 1000))
   TEMP_DIR=$(mktemp -d /tmp/protocol-benchmark-client.XXXXXXXX)
   RESULT_FILE="$TEMP_DIR/results.tsv"
+  FAILURE_FILE="$TEMP_DIR/failures.tsv"
   : >"$RESULT_FILE"
+  : >"$FAILURE_FILE"
   collect_idle_baseline
   run_adaptive_matrix
   calculate_results
   print_results
   persist_history
-  [[ "$COMPARE_BASELINE" == false ]] || compare_baseline
-  [[ "$SAVE_BASELINE" == false ]] || save_baseline
+  if [[ "$RESULT_STATE" == 'COMPLETE' ]]; then
+    [[ "$COMPARE_BASELINE" == false ]] || compare_baseline
+    [[ "$SAVE_BASELINE" == false ]] || save_baseline
+  elif [[ "$COMPARE_BASELINE" == true || "$SAVE_BASELINE" == true ]]; then
+    warn 'Baseline operations were skipped because the benchmark result is incomplete.'
+  fi
+  [[ "$RESULT_STATE" != 'FAILED' ]] || return 1
 }
 
 main() {

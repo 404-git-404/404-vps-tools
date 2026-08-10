@@ -46,6 +46,15 @@ assert_contains() {
     fail "$description: missing [$expected]"
 }
 
+assert_not_contains() {
+  local unexpected=$1
+  local actual=$2
+  local description=$3
+  (( TEST_COUNT += 1 ))
+  [[ "$actual" != *"$unexpected"* ]] ||
+    fail "$description: unexpectedly found [$unexpected]"
+}
+
 assert_true() {
   local description=$1
   shift
@@ -69,6 +78,8 @@ process_exists() {
 reset_fixture() {
   RESULT_FILE="$TEST_TEMP_DIR/results.tsv"
   : >"$RESULT_FILE"
+  FAILURE_FILE="$TEST_TEMP_DIR/failures.tsv"
+  : >"$FAILURE_FILE"
   LABELS=''
   TEST_FAILURES=0
   TCP_FAILURES=0
@@ -89,6 +100,7 @@ reset_fixture() {
   MAX_CPU=20
   MAX_LOAD_AVERAGE=0
   TRAFFIC_RESERVED_BYTES=0
+  TRAFFIC_ACCOUNTED_BYTES=0
   TRAFFIC_ACTUAL_BYTES=0
   ASYMMETRY_REASON=''
   TCP_RETRANS_DENSITY_A_TO_B=0
@@ -105,6 +117,13 @@ reset_fixture() {
   NOMINAL_MBPS=''
   HISTORY_LIMIT=$DEFAULT_HISTORY_LIMIT
   HISTORY_LIMIT_SET=false
+  RESULT_STATE='COMPLETE'
+  TCP_EVALUABLE=false
+  UDP_EVALUABLE=false
+  FIREWALL_RULE_ADDED=false
+  FIREWALL_COMMENT=''
+  FIREWALL_STATUS='unchanged'
+  UFW_COMMAND=()
 }
 
 append_result() {
@@ -186,6 +205,15 @@ EOF
   assert_equal '0' "$PING_LOSS" 'ping loss parser'
   assert_equal '37.400' "$PING_AVG" 'ping average parser'
   assert_equal '0.700' "$PING_VARIATION" 'ping variation parser'
+
+  cat >"$ping_file" <<'EOF'
+10 packets transmitted, 8 received, 20% packet loss, time 1842ms
+round-trip min/avg/max/stddev = 10.100/12.300/15.900/1.400 ms
+EOF
+  parse_ping_file "$ping_file"
+  assert_equal '20' "$PING_LOSS" 'iputils partial-loss parser'
+  assert_equal '12.300' "$PING_AVG" 'round-trip IPv4/IPv6 average parser'
+  assert_equal '1.400' "$PING_VARIATION" 'round-trip variation parser'
 }
 
 test_iperf_json_execution() {
@@ -313,6 +341,184 @@ test_independent_adaptive_stop_diagnostics() {
     'forward transferred bytes use raw counter'
   assert_contains 'B->A:        2.3 MB (2345678 bytes)' "$output" \
     'reverse transferred bytes use raw counter'
+}
+
+test_failure_control_flow_and_evaluability() {
+  local output
+  local pair_log="$TEST_TEMP_DIR/failure-pairs.log"
+  local budget_status
+
+  reset_fixture
+  : >"$pair_log"
+  DEEP=false
+  MAX_PERCENT=20
+  BUDGET_MB=200
+  run_direction_pair() {
+    printf '%s:%s\n' "$1" "$2" >>"$pair_log"
+    record_failure "$1" A_TO_B "$2" 1 'connection refused'
+    record_failure "$1" B_TO_A "$2" 1 'connection refused'
+    return "$TEST_RESULT_FAILED"
+  }
+  should_try_two_streams() { return 1; }
+  run_adaptive_matrix >/dev/null
+  assert_equal $'TCP:5\nUDP:5' "$(cat "$pair_log")" \
+    'all failed 5 percent pairs stop before higher stages'
+  assert_equal '0' "$TRAFFIC_ACTUAL_BYTES" 'all immediate failures use zero traffic'
+  assert_equal 'false' "$BUDGET_LIMITED" \
+    'ordinary execution failure is not a budget stop'
+  calculate_results
+  output=$(print_results)
+  assert_equal 'FAILED' "$RESULT_STATE" 'no-data result state'
+  assert_equal 'NONE' "$CONFIDENCE" 'no-data confidence'
+  assert_contains 'TEST RESULT:   FAILED' "$output" 'no-data output state'
+  assert_contains 'Budget stop:   false' "$output" \
+    'no-data output distinguishes execution failure from budget denial'
+  assert_contains 'No valid bidirectional TCP or UDP' "$output" \
+    'no-data output explanation'
+  assert_not_contains 'TCP SCORE:' "$output" 'no-data omits TCP score'
+  assert_not_contains 'UDP SCORE:' "$output" 'no-data omits UDP score'
+  assert_not_contains 'LINK HEALTH:' "$output" 'no-data omits link health'
+  assert_not_contains 'Preferred:     FIX LINK' "$output" \
+    'no-data omits false transport conclusion'
+  assert_not_contains 'link appears poor' "$output" \
+    'no-data omits false poor-link conclusion'
+
+  reset_fixture
+  : >"$pair_log"
+  run_direction_pair() {
+    printf '%s:%s\n' "$1" "$2" >>"$pair_log"
+    if [[ "$1" == 'TCP' ]]; then
+      record_failure TCP A_TO_B "$2" 1 'connection refused'
+      record_failure TCP B_TO_A "$2" 1 'connection refused'
+      return "$TEST_RESULT_FAILED"
+    fi
+    append_healthy_pair UDP "$2" "$2"
+  }
+  run_adaptive_matrix >/dev/null
+  calculate_results
+  output=$(print_results)
+  assert_equal 'PARTIAL' "$RESULT_STATE" 'UDP-only result is partial'
+  assert_equal 'false' "$TCP_EVALUABLE" 'failed TCP is not evaluable'
+  assert_equal 'true' "$UDP_EVALUABLE" 'bidirectional UDP is evaluable'
+  assert_contains 'TCP SCORE:     not evaluable' "$output" \
+    'partial output does not turn missing TCP into zero'
+  assert_contains 'Preferred:     INCONCLUSIVE' "$output" \
+    'partial UDP-only result is inconclusive'
+
+  reset_fixture
+  run_direction_pair() {
+    if [[ "$1" == 'UDP' ]]; then
+      record_failure UDP A_TO_B "$2" 1 'connection timed out'
+      record_failure UDP B_TO_A "$2" 1 'connection timed out'
+      return "$TEST_RESULT_FAILED"
+    fi
+    append_healthy_pair TCP "$2" "$2"
+  }
+  run_adaptive_matrix >/dev/null
+  calculate_results
+  output=$(print_results)
+  assert_equal 'PARTIAL' "$RESULT_STATE" 'TCP-only result is partial'
+  assert_equal 'true' "$TCP_EVALUABLE" 'bidirectional TCP is evaluable'
+  assert_equal 'false' "$UDP_EVALUABLE" 'failed UDP is not evaluable'
+  assert_contains 'UDP SCORE:     not evaluable' "$output" \
+    'partial output does not turn missing UDP into zero'
+  assert_contains 'LINK HEALTH:   not produced' "$output" \
+    'partial output omits combined score'
+
+  reset_fixture
+  : >"$pair_log"
+  run_direction_pair() {
+    printf '%s:%s\n' "$1" "$2" >>"$pair_log"
+    if [[ "$1" == 'TCP' && "$2" != '5' ]]; then
+      record_failure TCP A_TO_B "$2" 1 'server terminated'
+      record_failure TCP B_TO_A "$2" 1 'server terminated'
+      return "$TEST_RESULT_FAILED"
+    fi
+    append_healthy_pair "$1" "$2" "$2"
+  }
+  run_adaptive_matrix >/dev/null
+  calculate_results
+  assert_equal 'COMPLETE' "$RESULT_STATE" \
+    'later stage failure preserves earlier bidirectional data'
+  assert_equal '2' "$TCP_FAILURES" 'later TCP failure count'
+  assert_not_contains 'TCP:20' "$(cat "$pair_log")" \
+    'TCP does not escalate after execution failure'
+  assert_contains 'UDP:10' "$(cat "$pair_log")" \
+    'UDP continues independently after TCP failure'
+  assert_equal 'MEDIUM' "$CONFIDENCE" \
+    'later execution failure reduces confidence'
+
+  reset_fixture
+  BUDGET_BYTES=0
+  set +e
+  reserve_budget 1
+  budget_status=$?
+  set -e
+  assert_equal "$TEST_RESULT_BUDGET_DENIED" "$budget_status" \
+    'budget denial has a distinct return status'
+  assert_equal 'true' "$BUDGET_LIMITED" \
+    'only actual budget denial sets budget limited'
+}
+
+test_failure_reason_and_reservation_lifecycle() {
+  local json_file="$TEST_TEMP_DIR/failure.json"
+  local output_file="$TEST_TEMP_DIR/failure-output.txt"
+  local output
+  local failure_reason
+  local status
+  local long_text
+
+  reset_fixture
+  TEMP_DIR=$TEST_TEMP_DIR
+  NOMINAL_MBPS=100
+  PEER=192.0.2.200
+  PORT=55000
+  DURATION=1
+  COOLDOWN=0
+  BUDGET_BYTES=200000000
+  read_cpu_sample() { printf '1000 500\n'; }
+  ping() {
+    printf '5 packets transmitted, 5 received, 0%% packet loss\n'
+    printf 'rtt min/avg/max/mdev = 30.0/35.0/40.0/1.0 ms\n'
+  }
+  iperf3() {
+    printf 'iperf3: error - unable to connect to server: Connection refused\n' >&2
+    return 1
+  }
+  if run_controlled_test TCP A_TO_B 5 1 >"$output_file" 2>&1; then
+    status=0
+  else
+    status=$?
+  fi
+  output=$(cat "$output_file")
+  assert_equal "$TEST_RESULT_FAILED" "$status" \
+    'connection refusal is an execution failure'
+  assert_contains 'FAILED: iperf3: error - unable to connect' "$output" \
+    'connection refusal is printed directly'
+  assert_equal '0' "$TRAFFIC_RESERVED_BYTES" \
+    'failed reservation is released'
+  assert_equal '0' "$TRAFFIC_ACCOUNTED_BYTES" \
+    'known zero-transfer refusal consumes no budget'
+  assert_equal '0' "$TRAFFIC_ACTUAL_BYTES" \
+    'known zero-transfer refusal reports no traffic'
+  assert_equal 'false' "$BUDGET_LIMITED" \
+    'connection refusal does not create a fake budget stop'
+
+  printf '%s\n' '{"error":"server terminated by policy"}' >"$json_file"
+  printf '%s\n' 'stderr fallback must lose' >"$json_file.stderr"
+  failure_reason=$(extract_failure_reason "$json_file" 1)
+  assert_equal 'server terminated by policy' "$failure_reason" \
+    'iperf JSON error has priority over stderr'
+
+  printf '%s\n' '{invalid' >"$json_file"
+  printf '\033[31mconnection timed out\033[0m\n' >"$json_file.stderr"
+  failure_reason=$(extract_failure_reason "$json_file" 1)
+  assert_equal 'connection timed out' "$failure_reason" \
+    'stderr fallback strips ANSI control sequences'
+
+  printf -v long_text '%0200d' 0
+  failure_reason=$(sanitize_failure_text "$long_text")
+  assert_equal '180' "${#failure_reason}" 'failure reason length is bounded'
 }
 
 test_scores_and_recommendation() {
@@ -650,13 +856,17 @@ test_directional_asymmetry_regressions() {
 
 test_firewall_cleanup_exactness() {
   local log="$TEST_TEMP_DIR/ufw.log"
+  local rules_present=true
   : >"$log"
   ufw() {
     if [[ "$*" == 'status numbered' ]]; then
-      printf '[ 1] 55000/tcp ALLOW IN 192.0.2.9 # protocol-benchmark-test\n'
-      printf '[ 2] 55000/udp ALLOW IN 192.0.2.9 # protocol-benchmark-test\n'
+      if [[ "$rules_present" == true ]]; then
+        printf '[ 1] 55000/tcp ALLOW IN 192.0.2.9 # protocol-benchmark-test\n'
+        printf '[ 2] 55000/udp ALLOW IN 192.0.2.9 # protocol-benchmark-test\n'
+      fi
     else
       printf '%s\n' "$*" >>"$log"
+      [[ "$(wc -l <"$log" | tr -d ' ')" != '2' ]] || rules_present=false
     fi
   }
   FIREWALL_RULE_ADDED=true
@@ -670,6 +880,476 @@ test_firewall_cleanup_exactness() {
     'higher unique rule number removed first'
   assert_equal '--force delete 1' "$(sed -n '2p' "$log")" \
     'lower unique rule number removed second'
+}
+
+test_firewall_server_semantics() {
+  local helper="$TEST_TEMP_DIR/ufw-helper.sh"
+  local case_dir
+  local output
+  local status
+
+  cat >"$helper" <<'EOF'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+benchmark_script=$1
+scenario=$2
+port=$3
+allow_peer=$4
+case_dir=$5
+export PROTOCOL_BENCHMARK_SOURCE_ONLY=1
+# shellcheck disable=SC1090
+source "$benchmark_script"
+rules_file="$case_dir/rules"
+log_file="$case_dir/log"
+: >"$rules_file"
+: >"$log_file"
+if [[ "$scenario" == existing ]]; then
+  printf '[ 1] %s/tcp ALLOW IN Anywhere # user-rule\n' "$port" >>"$rules_file"
+  printf '[ 2] 22/tcp ALLOW IN Anywhere # ssh-rule\n' >>"$rules_file"
+fi
+is_root() { return 0; }
+command_exists() {
+  if [[ "$1" == ufw ]]; then
+    [[ "$scenario" != missing ]]
+  else
+    command -v "$1" >/dev/null 2>&1
+  fi
+}
+EOF
+  test_firewall_server_semantics_continued "$helper"
+}
+
+test_platform_and_dependency_bootstrap() {
+  local os_file="$TEST_TEMP_DIR/os-release"
+  local output
+  local status
+  local install_log="$TEST_TEMP_DIR/install.log"
+
+  for specification in 'debian 12 debian' 'debian 13 debian' \
+    'alpine 3.21 alpine' 'alpine 3.22 alpine' 'alpine 3.23 alpine'; do
+    read -r os_id version family <<<"$specification"
+    printf 'ID=%s\nVERSION_ID=%s\n' "$os_id" "$version" >"$os_file"
+    output=$(OS_RELEASE_FILE="$os_file" check_platform; \
+      printf '%s|%s' "$PLATFORM_FAMILY" "$PLATFORM_VERSION")
+    assert_equal "$family|$version" "$output" \
+      "$os_id $version platform acceptance"
+  done
+  printf 'ID=alpine\nVERSION_ID=3.23.4\n' >"$os_file"
+  output=$(OS_RELEASE_FILE="$os_file" check_platform; \
+    printf '%s|%s' "$PLATFORM_FAMILY" "$PLATFORM_VERSION")
+  assert_equal 'alpine|3.23' "$output" \
+    'Alpine patch release normalizes to supported minor'
+  printf 'ID=alpine\nVERSION_ID=3.20\n' >"$os_file"
+  assert_false 'unsupported Alpine version is rejected' bash -c '
+    export PROTOCOL_BENCHMARK_SOURCE_ONLY=1
+    source "$1"
+    OS_RELEASE_FILE=$2
+    check_platform
+  ' _ "$BENCHMARK_SCRIPT" "$os_file"
+
+  output=$(
+    MODE=history
+    PLATFORM_FAMILY=alpine
+    command_exists() { [[ "$1" == jq ]]; }
+    has_coreutils_sort() { return 1; }
+    collect_missing_dependencies
+    printf '%s|%s' "${MISSING_COMMANDS[*]}" "${MISSING_PACKAGES[*]}"
+  )
+  assert_equal 'coreutils sort|coreutils' "$output" \
+    'history installs only its missing sort capability'
+  assert_not_contains 'iperf3' "$output" 'history avoids iperf3'
+  assert_not_contains 'ping' "$output" 'history avoids ping'
+  assert_not_contains 'timeout' "$output" 'history avoids timeout'
+
+  output=$(
+    MODE=client
+    PLATFORM_FAMILY=debian
+    command_exists() { return 1; }
+    has_gnu_sed() { return 1; }
+    has_coreutils_date() { return 1; }
+    has_coreutils_timeout() { return 1; }
+    has_iputils_ping() { return 1; }
+    collect_missing_dependencies
+    printf '%s' "${MISSING_PACKAGES[*]}"
+  )
+  assert_equal 'mawk sed iperf3 coreutils jq iputils-ping' "$output" \
+    'Debian dependency mapping and package deduplication'
+
+  output=$(
+    MODE=client
+    PLATFORM_FAMILY=alpine
+    command_exists() { return 1; }
+    has_gnu_sed() { return 1; }
+    has_coreutils_date() { return 1; }
+    has_coreutils_timeout() { return 1; }
+    has_iputils_ping() { return 1; }
+    collect_missing_dependencies
+    printf '%s' "${MISSING_PACKAGES[*]}"
+  )
+  assert_equal 'mawk sed iperf3 coreutils jq iputils' "$output" \
+    'Alpine dependency mapping and package deduplication'
+
+  : >"$install_log"
+  (
+    PLATFORM_FAMILY=debian
+    MISSING_COMMANDS=(jq iperf3)
+    MISSING_PACKAGES=(jq iperf3)
+    is_root() { return 0; }
+    apt-get() { printf '%s\n' "$*" >>"$install_log"; }
+    install_runtime_packages
+  )
+  assert_equal '2' "$(wc -l <"$install_log" | tr -d ' ')" \
+    'Debian uses one update and one install transaction'
+  assert_equal 'update' "$(sed -n '1p' "$install_log")" \
+    'Debian bootstrap runs apt-get update once'
+  assert_equal 'install -y --no-install-recommends jq iperf3' \
+    "$(sed -n '2p' "$install_log")" \
+    'Debian bootstrap uses no recommends and one package transaction'
+
+  : >"$install_log"
+  (
+    PLATFORM_FAMILY=debian
+    MISSING_COMMANDS=()
+    MISSING_PACKAGES=()
+    is_root() { return 0; }
+    apt-get() { printf '%s\n' "$*" >>"$install_log"; }
+    install_runtime_packages
+  )
+  assert_equal '0' "$(wc -l <"$install_log" | tr -d ' ')" \
+    'present dependencies perform no apt operation'
+
+  : >"$install_log"
+  (
+    PLATFORM_FAMILY=alpine
+    MISSING_COMMANDS=(jq mawk)
+    MISSING_PACKAGES=(jq mawk)
+    is_root() { return 0; }
+    apk() { printf '%s\n' "$*" >>"$install_log"; }
+    install_runtime_packages
+  )
+  assert_equal 'add --no-cache jq mawk' "$(cat "$install_log")" \
+    'Alpine uses one apk no-cache transaction'
+
+  : >"$install_log"
+  (
+    PLATFORM_FAMILY=debian
+    MISSING_COMMANDS=(jq)
+    MISSING_PACKAGES=(jq)
+    is_root() { return 1; }
+    command_exists() { [[ "$1" == sudo ]]; }
+    sudo() { printf '%s\n' "$*" >>"$install_log"; }
+    install_runtime_packages
+  )
+  assert_equal '2' "$(wc -l <"$install_log" | tr -d ' ')" \
+    'sudo Debian bootstrap still uses two transactions'
+  assert_contains 'env DEBIAN_FRONTEND=noninteractive apt-get update' \
+    "$(sed -n '1p' "$install_log")" 'sudo preserves noninteractive apt environment'
+
+  : >"$install_log"
+  (
+    PLATFORM_FAMILY=alpine
+    MISSING_COMMANDS=(jq)
+    MISSING_PACKAGES=(jq)
+    is_root() { return 1; }
+    command_exists() { [[ "$1" == doas ]]; }
+    doas() { printf '%s\n' "$*" >>"$install_log"; }
+    install_runtime_packages
+  )
+  assert_equal 'apk add --no-cache jq' "$(cat "$install_log")" \
+    'Alpine non-root bootstrap uses doas'
+
+  output=$(
+    PLATFORM_FAMILY=alpine
+    is_root() { return 1; }
+    command_exists() { [[ "$1" == doas || "$1" == sudo ]]; }
+    choose_privilege_helper
+    printf '%s' "$PRIVILEGE_HELPER"
+  )
+  assert_equal 'doas' "$output" 'Alpine prefers doas over sudo'
+  output=$(
+    PLATFORM_FAMILY=alpine
+    is_root() { return 1; }
+    command_exists() { [[ "$1" == sudo ]]; }
+    choose_privilege_helper
+    printf '%s' "$PRIVILEGE_HELPER"
+  )
+  assert_equal 'sudo' "$output" 'Alpine falls back to sudo'
+  set +e
+  output=$( (
+    PLATFORM_FAMILY=alpine
+    MISSING_COMMANDS=(jq)
+    MISSING_PACKAGES=(jq)
+    is_root() { return 1; }
+    command_exists() { return 1; }
+    install_runtime_packages
+  ) 2>&1)
+  status=$?
+  set -e
+  assert_false 'missing privilege helper is fatal' test "$status" -eq 0
+  assert_contains 'apk add --no-cache jq' "$output" \
+    'privilege failure prints manual Alpine command'
+
+  set +e
+  (
+    PLATFORM_FAMILY=debian
+    MISSING_COMMANDS=(jq)
+    MISSING_PACKAGES=(jq)
+    is_root() { return 0; }
+    apt-get() { return 1; }
+    install_runtime_packages
+  ) >/dev/null 2>&1
+  status=$?
+  set -e
+  assert_false 'apt update failure is fatal' test "$status" -eq 0
+  set +e
+  (
+    local_calls=0
+    PLATFORM_FAMILY=debian
+    MISSING_COMMANDS=(jq)
+    MISSING_PACKAGES=(jq)
+    is_root() { return 0; }
+    apt-get() {
+      (( local_calls += 1 ))
+      (( local_calls == 1 ))
+    }
+    install_runtime_packages
+  ) >/dev/null 2>&1
+  status=$?
+  set -e
+  assert_false 'apt install failure is fatal' test "$status" -eq 0
+  set +e
+  (
+    PLATFORM_FAMILY=alpine
+    MISSING_COMMANDS=(jq)
+    MISSING_PACKAGES=(jq)
+    is_root() { return 0; }
+    apk() { return 1; }
+    install_runtime_packages
+  ) >/dev/null 2>&1
+  status=$?
+  set -e
+  assert_false 'apk failure is fatal' test "$status" -eq 0
+
+  set +e
+  (
+    MODE=history
+    PLATFORM_FAMILY=alpine
+    command_exists() { return 0; }
+    collect_missing_dependencies() {
+      MISSING_COMMANDS=('coreutils sort')
+      MISSING_PACKAGES=(coreutils)
+    }
+    install_runtime_packages() { :; }
+    check_dependencies
+  ) >/dev/null 2>&1
+  status=$?
+  set -e
+  assert_false 'post-install capability recheck is fatal' test "$status" -eq 0
+
+  : >"$install_log"
+  (
+    PLATFORM_FAMILY=debian
+    IPERF3_INSTALLED_NOW=false
+    systemctl() { printf '%s\n' "$*" >>"$install_log"; return 0; }
+    ensure_new_iperf3_daemon_disabled
+  )
+  assert_equal '0' "$(wc -l <"$install_log" | tr -d ' ')" \
+    'pre-existing iperf3 service is untouched'
+  : >"$install_log"
+  (
+    PLATFORM_FAMILY=debian
+    IPERF3_INSTALLED_NOW=true
+    run_privileged() { "$@"; }
+    systemctl() {
+      printf '%s\n' "$*" >>"$install_log"
+      case "$1" in
+        is-active) return 1 ;;
+        is-enabled) printf 'disabled\n'; return 1 ;;
+      esac
+    }
+    ensure_new_iperf3_daemon_disabled
+  )
+  assert_contains 'stop iperf3.service' "$(cat "$install_log")" \
+    'new Debian iperf3 service is stopped'
+  assert_contains 'disable iperf3.service' "$(cat "$install_log")" \
+    'new Debian iperf3 service is disabled'
+  assert_false 'Alpine bootstrap never enables OpenRC iperf3 service' \
+    grep -Eq 'iperf3-openrc|rc-update[[:space:]]+add|rc-service[[:space:]]+iperf3' \
+    "$BENCHMARK_SCRIPT"
+}
+
+test_firewall_server_semantics_continued() {
+  local helper=$1
+  local case_dir
+  local output
+  local status
+
+  cat >>"$helper" <<'EOF'
+ufw() {
+  local argument
+  local protocol=''
+  local marker=''
+  local peer='Anywhere'
+  local number
+  if [[ "$*" == status ]]; then
+    if [[ "$scenario" == inactive ]]; then
+      printf 'Status: inactive\n'
+    else
+      printf 'Status: active\n'
+    fi
+    return 0
+  fi
+  if [[ "$*" == 'status numbered' ]]; then
+    [[ "$scenario" == verify-fail ]] || cat "$rules_file"
+    return 0
+  fi
+  if [[ "$1" == --force && "$2" == delete ]]; then
+    if [[ "$3" =~ ^[0-9]+$ ]]; then
+      number=$3
+      awk -v drop="$number" 'NR != drop' "$rules_file" >"$rules_file.tmp"
+    else
+      marker=${*: -1}
+      awk -v marker="$marker" 'index($0, "# " marker) == 0' \
+        "$rules_file" >"$rules_file.tmp"
+    fi
+    mv -- "$rules_file.tmp" "$rules_file"
+    printf '%s\n' "$*" >>"$log_file"
+    return 0
+  fi
+  printf '%s\n' "$*" >>"$log_file"
+  for argument in "$@"; do
+    [[ "$argument" != tcp && "$argument" != udp ]] || protocol=$argument
+  done
+  if [[ "$*" == *' from '* ]]; then
+    while (( $# > 0 )); do
+      if [[ "$1" == from ]]; then peer=$2; break; fi
+      shift
+    done
+  fi
+  marker=${*: -1}
+  if [[ "$scenario" == udp-fail && "$protocol" == udp ]]; then
+    return 1
+  fi
+  number=$(( $(wc -l <"$rules_file") + 1 ))
+  printf '[ %s] %s/%s ALLOW IN %s # %s\n' \
+    "$number" "$port" "$protocol" "$peer" "$marker" >>"$rules_file"
+}
+MODE=server
+PORT=$port
+[[ "$port" != RANDOM ]] || PORT=$(random_port)
+ALLOW_PEER=$allow_peer
+setup_firewall
+printf 'PORT=%s\nSTATUS=%s\nCOMMENT=%s\n' \
+  "$PORT" "$FIREWALL_STATUS" "$FIREWALL_COMMENT"
+if [[ "$scenario" == signal ]]; then
+  printf 'ready\n' >"$case_dir/ready"
+  while true; do sleep 1; done
+fi
+cleanup_firewall
+printf 'ADDED=%s\n' "$FIREWALL_RULE_ADDED"
+EOF
+  chmod +x "$helper"
+
+  case_dir="$TEST_TEMP_DIR/ufw-active"
+  mkdir -p "$case_dir"
+  output=$(bash "$helper" "$BENCHMARK_SCRIPT" active 55010 '' "$case_dir")
+  assert_contains 'STATUS=temporary TCP/UDP allow added' "$output" \
+    'plain server automatically opens active UFW'
+  assert_contains 'allow to any port 55010 proto tcp' "$(cat "$case_dir/log")" \
+    'plain server adds Anywhere TCP rule'
+  assert_contains 'allow to any port 55010 proto udp' "$(cat "$case_dir/log")" \
+    'plain server adds Anywhere UDP rule'
+  assert_not_contains 'protocol-benchmark-' "$(cat "$case_dir/rules")" \
+    'normal cleanup removes all benchmark comments'
+
+  case_dir="$TEST_TEMP_DIR/ufw-peer"
+  mkdir -p "$case_dir"
+  output=$(bash "$helper" "$BENCHMARK_SCRIPT" active 55011 192.0.2.8 "$case_dir")
+  assert_contains 'STATUS=temporary TCP/UDP allow from 192.0.2.8' "$output" \
+    'allow-peer reports restricted rule'
+  assert_contains 'allow from 192.0.2.8 to any port 55011 proto tcp' \
+    "$(cat "$case_dir/log")" 'allow-peer restricts TCP source'
+  assert_contains 'allow from 192.0.2.8 to any port 55011 proto udp' \
+    "$(cat "$case_dir/log")" 'allow-peer restricts UDP source'
+
+  case_dir="$TEST_TEMP_DIR/ufw-random"
+  mkdir -p "$case_dir"
+  output=$(bash "$helper" "$BENCHMARK_SCRIPT" active RANDOM '' "$case_dir")
+  assert_true 'random server port is high and numeric' bash -c \
+    'value=${1#PORT=}; [[ $value =~ ^[0-9]+$ ]] && (( value >= 49152 && value <= 65535 ))' \
+    _ "$(printf '%s\n' "$output" | sed -n '1p')"
+  assert_contains "port $(printf '%s\n' "$output" | sed -n '1s/PORT=//p')" \
+    "$(cat "$case_dir/log")" 'UFW uses the generated random port'
+
+  for scenario in inactive missing; do
+    case_dir="$TEST_TEMP_DIR/ufw-$scenario"
+    mkdir -p "$case_dir"
+    output=$(bash "$helper" "$BENCHMARK_SCRIPT" "$scenario" 55012 '' \
+      "$case_dir" 2>&1)
+    assert_contains 'STATUS=unchanged' "$output" \
+      "plain server continues when UFW is $scenario"
+    assert_equal '0' "$(wc -l <"$case_dir/log" | tr -d ' ')" \
+      "plain server does not modify $scenario UFW"
+    set +e
+    bash "$helper" "$BENCHMARK_SCRIPT" "$scenario" 55012 192.0.2.8 \
+      "$case_dir" >/dev/null 2>&1
+    status=$?
+    set -e
+    assert_false "allow-peer fails when UFW is $scenario" test "$status" -eq 0
+  done
+
+  for scenario in udp-fail verify-fail; do
+    case_dir="$TEST_TEMP_DIR/ufw-$scenario"
+    mkdir -p "$case_dir"
+    set +e
+    bash "$helper" "$BENCHMARK_SCRIPT" "$scenario" 55013 '' "$case_dir" \
+      >/dev/null 2>&1
+    status=$?
+    set -e
+    assert_false "$scenario is a hard setup failure" test "$status" -eq 0
+    assert_not_contains 'protocol-benchmark-' "$(cat "$case_dir/rules")" \
+      "$scenario rolls back every script-owned rule"
+  done
+
+  case_dir="$TEST_TEMP_DIR/ufw-existing"
+  mkdir -p "$case_dir"
+  bash "$helper" "$BENCHMARK_SCRIPT" existing 55014 '' "$case_dir" >/dev/null
+  assert_contains '55014/tcp ALLOW IN Anywhere # user-rule' \
+    "$(cat "$case_dir/rules")" 'same-port user rule is preserved'
+  assert_contains '22/tcp ALLOW IN Anywhere # ssh-rule' \
+    "$(cat "$case_dir/rules")" 'unrelated UFW rule is preserved'
+  assert_not_contains 'protocol-benchmark-' "$(cat "$case_dir/rules")" \
+    'existing-rule cleanup leaves no benchmark comment'
+
+  if [[ ${OSTYPE:-} != msys* && ${OSTYPE:-} != cygwin* ]]; then
+    case_dir="$TEST_TEMP_DIR/ufw-signal"
+    mkdir -p "$case_dir"
+    set +e
+    timeout --preserve-status --signal=INT 2 \
+      bash "$helper" "$BENCHMARK_SCRIPT" signal 55015 '' "$case_dir" \
+      >/dev/null 2>&1
+    status=$?
+    set -e
+    assert_equal '130' "$status" 'Ctrl+C preserves interrupt exit status'
+    assert_not_contains 'protocol-benchmark-' "$(cat "$case_dir/rules")" \
+      'Ctrl+C removes temporary UFW rules'
+  fi
+
+  output=$(bash -c '
+    export PROTOCOL_BENCHMARK_SOURCE_ONLY=1
+    source "$1"
+    MODE=server; PORT=""; SERVER_WAIT=30
+    random_port() { printf "54036\\n"; }
+    setup_firewall() { FIREWALL_STATUS="temporary TCP/UDP allow added"; }
+    timeout() { return 124; }
+    run_server
+  ' _ "$BENCHMARK_SCRIPT")
+  assert_contains 'Port:         54036 (TCP and UDP)' "$output" \
+    'server output shows generated port'
+  assert_contains 'Firewall:     temporary TCP/UDP allow added' "$output" \
+    'server output shows firewall lifecycle'
+  assert_contains 'SERVER_IP --port 54036' "$output" \
+    'server output gives copyable placeholder command'
 }
 
 test_listener_cleanup_traps() {
@@ -1043,6 +1723,16 @@ test_repository_invariants() {
   assert_contains "'B_TO_A'" "$content" 'reverse direction'
   assert_contains 'trap signal_exit INT TERM HUP' "$content" \
     'listener cleanup signal traps'
+  assert_contains "PLATFORM_FAMILY='debian'" "$content" \
+    'Debian platform family is explicit'
+  assert_contains "PLATFORM_FAMILY='alpine'" "$content" \
+    'Alpine platform family is explicit'
+  assert_contains 'apk add --no-cache' "$content" \
+    'Alpine dependency bootstrap is bounded'
+  assert_contains 'apt-get install -y' "$content" \
+    'Debian dependency bootstrap is noninteractive and bounded'
+  assert_contains 'temporary TCP/UDP allow added' "$content" \
+    'plain server active-UFW behavior is explicit'
   assert_contains 'This does NOT prove the sing-box/proxy layer is healthy.' \
     "$content" 'layer distinction'
   assert_false 'must not query ASN' grep -Eqi 'whois|ipinfo|asn' "$BENCHMARK_SCRIPT"
@@ -1050,6 +1740,12 @@ test_repository_invariants() {
     grep -Eqi 'sysctl|mtu|congestion|bbr|sing-box.*(install|config)' "$BENCHMARK_SCRIPT"
   assert_false 'must not run route probing' \
     grep -Eqi 'traceroute|mtr|nexttrace' "$BENCHMARK_SCRIPT"
+  assert_false 'dependency bootstrap must not upgrade the OS' \
+    grep -Eqi '(apt(-get)?|apk)[[:space:]]+(dist-upgrade|full-upgrade|upgrade)' \
+    "$BENCHMARK_SCRIPT"
+  assert_false 'dependency bootstrap must not install firewall packages' \
+    grep -Eqi '(apt-get install|apk add).*(ufw|nftables|iptables)' \
+    "$BENCHMARK_SCRIPT"
 }
 
 test_limits_and_scaling
@@ -1059,11 +1755,15 @@ test_iperf_json_execution
 test_adaptive_healthy_early_stop
 test_udp_degradation_early_stop
 test_independent_adaptive_stop_diagnostics
+test_failure_control_flow_and_evaluability
+test_failure_reason_and_reservation_lifecycle
 test_scores_and_recommendation
 test_preferred_transport_model
 test_tcp_retransmission_scoring_model
 test_directional_asymmetry_regressions
 test_firewall_cleanup_exactness
+test_firewall_server_semantics
+test_platform_and_dependency_bootstrap
 test_listener_cleanup_traps
 test_baseline_save_and_compare
 test_history_persistence_and_schema

@@ -30,6 +30,7 @@ jobs:
             request-cloudflare-certificate.sh
             tests/domain-check-test.sh
             tests/node-config-wizard-test.sh
+            tests/protocol-benchmark-container-test.sh
             tests/protocol-benchmark-test.sh
             tests/smartdns-test.sh
           )
@@ -47,6 +48,7 @@ jobs:
             scripts/update-smartdns.sh \
             tests/domain-check-test.sh \
             tests/node-config-wizard-test.sh \
+            tests/protocol-benchmark-container-test.sh \
             tests/smartdns-test.sh; do
             test -x "$executable_script"
           done
@@ -143,6 +145,9 @@ jobs:
           PATH="$RUNNER_TEMP/mawk-bin:$PATH" bash tests/protocol-benchmark-test.sh
           PATH="$RUNNER_TEMP/mawk-bin:$PATH" bash tests/smartdns-test.sh
 
+      - name: Run Debian and Alpine protocol containers
+        run: bash tests/protocol-benchmark-container-test.sh
+
       - name: Run ShellCheck
         run: |
           shellcheck \
@@ -154,6 +159,7 @@ jobs:
             request-cloudflare-certificate.sh \
             tests/domain-check-test.sh \
             tests/node-config-wizard-test.sh \
+            tests/protocol-benchmark-container-test.sh \
             tests/protocol-benchmark-test.sh \
             tests/smartdns-test.sh \
             /tmp/update-cloudflare-ufw
