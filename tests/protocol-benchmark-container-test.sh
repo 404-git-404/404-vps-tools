@@ -10,9 +10,11 @@ readonly RUN_ID="protocol-benchmark-${RANDOM}-$$"
 readonly NETWORK_NAME="$RUN_ID-network"
 TEMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/protocol-container-tests.XXXXXXXX")
 readonly TEMP_DIR
+FINAL_STATUS=0
 declare -a CONTAINERS=()
 
 fail() {
+  FINAL_STATUS=1
   printf 'FAIL: %s\n' "$*" >&2
   exit 1
 }
@@ -21,6 +23,7 @@ cleanup() {
   local container
   local status=$?
 
+  (( FINAL_STATUS == 0 )) || status=$FINAL_STATUS
   trap - EXIT INT TERM HUP
   for container in "${CONTAINERS[@]}"; do
     docker rm -f "$container" >/dev/null 2>&1 || true
@@ -73,7 +76,8 @@ run_closed_port_failure() {
   ! grep -Fq 'UDP SCORE:' "$log" || fail "$label produced a false UDP score."
   ! grep -Fq 'LINK HEALTH:' "$log" || fail "$label produced a false link score."
   ! grep -Fq 'FIX LINK' "$log" || fail "$label produced a false transport recommendation."
-  ! grep -Fq ' 10%' "$log" || fail "$label escalated after every 5 percent test failed."
+  ! grep -Eq '^  (TCP|UDP)[[:space:]]+[^[:space:]]+[[:space:]]+10%' "$log" ||
+    fail "$label escalated after every 5 percent test failed."
   printf 'PASS: %s closed-port failure semantics\n' "$label"
 }
 
