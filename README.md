@@ -18,3 +18,15 @@ domain-check domain1.com/domain2.com
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/404-git-404/404notfound/main/node-config-wizard.sh)
 ```
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/404-git-404/404notfound/main/protocol-benchmark.sh) --server
+```
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/404-git-404/404notfound/main/protocol-benchmark.sh) <server-IP> --port <PORT>
+```
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/404-git-404/404notfound/main/protocol-benchmark.sh) --history <peer-IP>
+```

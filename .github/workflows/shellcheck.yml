@@ -25,10 +25,12 @@ jobs:
             404notfound.sh
             domain-check.sh
             node-config-wizard.sh
+            protocol-benchmark.sh
             scripts/update-smartdns.sh
             request-cloudflare-certificate.sh
             tests/domain-check-test.sh
             tests/node-config-wizard-test.sh
+            tests/protocol-benchmark-test.sh
             tests/smartdns-test.sh
           )
           for script in "${scripts[@]}"; do
@@ -111,6 +113,18 @@ jobs:
           ```bash
           bash <(curl -fsSL https://raw.githubusercontent.com/404-git-404/404notfound/main/node-config-wizard.sh)
           ```
+
+          ```bash
+          bash <(curl -fsSL https://raw.githubusercontent.com/404-git-404/404notfound/main/protocol-benchmark.sh) --server
+          ```
+
+          ```bash
+          bash <(curl -fsSL https://raw.githubusercontent.com/404-git-404/404notfound/main/protocol-benchmark.sh) <server-IP> --port <PORT>
+          ```
+
+          ```bash
+          bash <(curl -fsSL https://raw.githubusercontent.com/404-git-404/404notfound/main/protocol-benchmark.sh) --history <peer-IP>
+          ```
           EOF
           cmp -s README.md /tmp/expected-readme
 
@@ -126,6 +140,7 @@ jobs:
           PATH="$RUNNER_TEMP/mawk-bin:$PATH" awk -W version
           PATH="$RUNNER_TEMP/mawk-bin:$PATH" bash tests/domain-check-test.sh
           PATH="$RUNNER_TEMP/mawk-bin:$PATH" bash tests/node-config-wizard-test.sh
+          PATH="$RUNNER_TEMP/mawk-bin:$PATH" bash tests/protocol-benchmark-test.sh
           PATH="$RUNNER_TEMP/mawk-bin:$PATH" bash tests/smartdns-test.sh
 
       - name: Run ShellCheck
@@ -134,9 +149,11 @@ jobs:
             404notfound.sh \
             domain-check.sh \
             node-config-wizard.sh \
+            protocol-benchmark.sh \
             scripts/update-smartdns.sh \
             request-cloudflare-certificate.sh \
             tests/domain-check-test.sh \
             tests/node-config-wizard-test.sh \
+            tests/protocol-benchmark-test.sh \
             tests/smartdns-test.sh \
             /tmp/update-cloudflare-ufw
