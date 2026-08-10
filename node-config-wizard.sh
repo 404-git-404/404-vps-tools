@@ -15,6 +15,12 @@ WORKING_CONFIG_JSON=''
 OUTBOUND_TAGS=()
 MODULE_INPUT_ACTIVE=false
 NETWORK_STACK='ipv4'
+VIRTUALIZATION='unknown'
+CONTAINER_VIRTUALIZATION='none'
+ENVIRONMENT_LABEL='Unknown environment'
+KERNEL_ENFORCEMENT='unavailable'
+APPLICATION_ENFORCEMENT='enabled'
+NETWORK_RESULT='SUCCESS'
 
 RED=''
 GREEN=''
@@ -93,6 +99,64 @@ check_environment() {
     if ! command -v jq >/dev/null 2>&1; then
         die '未找到 jq，请先手动安装 jq。'
     fi
+}
+
+detect_runtime_environment() {
+    local detected=''
+    local container=''
+
+    if command -v systemd-detect-virt >/dev/null 2>&1; then
+        detected="$(systemd-detect-virt 2>/dev/null || true)"
+        container="$(systemd-detect-virt --container 2>/dev/null || true)"
+    fi
+    [[ -n "$detected" && "$detected" != 'none' ]] || detected='none'
+    [[ -n "$container" && "$container" != 'none' ]] || container='none'
+    VIRTUALIZATION="$detected"
+    CONTAINER_VIRTUALIZATION="$container"
+    if [[ "$container" != 'none' ]]; then
+        ENVIRONMENT_LABEL="$container container"
+        info "Virtualization: $detected"
+        info "Container environment detected: $container."
+    elif [[ "$detected" == 'none' ]]; then
+        ENVIRONMENT_LABEL='Bare metal'
+        info 'Virtualization: none'
+    else
+        ENVIRONMENT_LABEL="$detected virtual machine"
+        info "Virtualization: $detected"
+    fi
+}
+
+inspect_kernel_enforcement() {
+    local all_value='unknown'
+    local default_value='unknown'
+    local loopback_value='unknown'
+    local desired_value=0
+
+    [[ "$NETWORK_STACK" == 'ipv4' ]] && desired_value=1
+    if command -v sysctl >/dev/null 2>&1; then
+        all_value="$(sysctl -n net.ipv6.conf.all.disable_ipv6 2>/dev/null || printf unknown)"
+        default_value="$(sysctl -n net.ipv6.conf.default.disable_ipv6 2>/dev/null || printf unknown)"
+        loopback_value="$(sysctl -n net.ipv6.conf.lo.disable_ipv6 2>/dev/null || printf unknown)"
+    fi
+    if [[ "$all_value" == "$desired_value" &&
+        "$default_value" == "$desired_value" &&
+        "$loopback_value" == "$desired_value" ]]; then
+        KERNEL_ENFORCEMENT='enabled'
+        return 0
+    fi
+    KERNEL_ENFORCEMENT='unavailable'
+    NETWORK_RESULT='SUCCESS_WITH_WARNINGS'
+    warn "Kernel enforcement is unavailable for requested mode $NETWORK_STACK; application enforcement will be used."
+}
+
+print_network_result() {
+    printf '\nRequested mode: %s\n' "$NETWORK_STACK"
+    printf 'Kernel enforcement: %s\n' "$KERNEL_ENFORCEMENT"
+    printf 'Application enforcement: %s\n' "$APPLICATION_ENFORCEMENT"
+    printf 'Environment: %s\n' "$ENVIRONMENT_LABEL"
+    printf 'Virtualization: %s\n' "$VIRTUALIZATION"
+    printf 'Container: %s\n' "$CONTAINER_VIRTUALIZATION"
+    printf 'Result: %s\n' "$NETWORK_RESULT"
 }
 
 read_line() {
@@ -785,6 +849,8 @@ select_network_stack() {
         2) NETWORK_STACK='ipv6' ;;
         3) NETWORK_STACK='dual' ;;
     esac
+    info "Applying application-level $NETWORK_STACK configuration."
+    inspect_kernel_enforcement
 }
 
 get_listen_address() {
@@ -1777,6 +1843,7 @@ apply_config_to_path() {
     fi
 
     success "sing-box 当前状态：${service_status}；开机自启状态：${enable_status}"
+    print_network_result
     return 0
 }
 
@@ -1840,6 +1907,7 @@ main() {
 
     init_colors
     check_environment
+    detect_runtime_environment
     select_network_stack
 
     while true; do

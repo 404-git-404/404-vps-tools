@@ -266,12 +266,20 @@ set -Eeuo pipefail
 IPV6_DISABLE_CONFIG="$CASE_DIR/etc/99-disable-ipv6.conf"
 NETWORK_STACK_UNIT="$CASE_DIR/etc/404-network-stack.service"
 NETWORK_STACK_UNIT_NAME='404-network-stack.service'
+NETWORK_STACK_HELPER="$CASE_DIR/404-network-stack"
 TMP_DIR="$CASE_DIR"
 NETWORK_STACK='ipv4'
+KERNEL_IPV6_DISABLED='UNAVAILABLE'
+KERNEL_ENFORCEMENT='unavailable'
+APPLICATION_IPV4_ONLY='NO'
+WARNING_COUNT=0
 printf '0\n' >"$CASE_DIR/all"
 printf '0\n' >"$CASE_DIR/default"
 printf '0\n' >"$CASE_DIR/lo"
 log() { :; }
+warn() { :; }
+degrade() { KERNEL_ENFORCEMENT='unavailable'; ((WARNING_COUNT += 1)); }
+shorten_line() { printf '%s' "$1"; }
 fail_with_recovery() { printf '%s\n' "$1" >&2; exit 1; }
 install() {
   local source=${*: -2:1}
@@ -315,6 +323,9 @@ remove_ipv4_network_stack_unit() {
   rm -f -- "$NETWORK_STACK_UNIT" "$IPV6_DISABLE_CONFIG"
 }
 DRIVER
+    extract_function "$UPDATER" sysctl_restriction_error
+    extract_function "$UPDATER" read_ipv6_kernel_state
+    extract_function "$UPDATER" apply_ipv6_sysctl_capability_aware
     extract_function "$UPDATER" configure_network_stack
     cat <<'DRIVER'
 configure_network_stack
@@ -394,9 +405,14 @@ test_delayed_ipv6_disable_unit() {
 set -Eeuo pipefail
 NETWORK_STACK_UNIT="$CASE_DIR/etc/systemd/system/404-network-stack.service"
 NETWORK_STACK_UNIT_NAME='404-network-stack.service'
+NETWORK_STACK_HELPER="$CASE_DIR/usr/local/libexec/404-network-stack"
 IPV6_DISABLE_CONFIG="$CASE_DIR/99-disable-ipv6.conf"
 TMP_DIR="$CASE_DIR"
 NETWORK_STACK='ipv4'
+KERNEL_IPV6_DISABLED='UNAVAILABLE'
+KERNEL_ENFORCEMENT='unavailable'
+APPLICATION_IPV4_ONLY='NO'
+WARNING_COUNT=0
 printf '0\n' >"$CASE_DIR/all"
 printf '0\n' >"$CASE_DIR/default"
 printf '0\n' >"$CASE_DIR/lo"
@@ -405,6 +421,8 @@ printf 'inactive\n' >"$CASE_DIR/unit-active"
 printf 'legacy\n' >"$IPV6_DISABLE_CONFIG"
 log() { :; }
 warn() { :; }
+degrade() { KERNEL_ENFORCEMENT='unavailable'; ((WARNING_COUNT += 1)); }
+shorten_line() { printf '%s' "$1"; }
 fail_with_recovery() { printf '%s\n' "$1" >&2; exit 1; }
 install() {
   local source=${*: -2:1}
@@ -450,7 +468,11 @@ systemctl() {
   esac
 }
 restore_ipv6_network_configuration() { :; }
+write_network_stack_helper() { printf 'helper\n' >"$1"; }
 DRIVER
+    extract_function "$UPDATER" sysctl_restriction_error
+    extract_function "$UPDATER" read_ipv6_kernel_state
+    extract_function "$UPDATER" apply_ipv6_sysctl_capability_aware
     extract_function "$UPDATER" install_ipv4_network_stack_unit
     extract_function "$UPDATER" remove_ipv4_network_stack_unit
     extract_function "$UPDATER" configure_network_stack
@@ -508,12 +530,14 @@ CONFIG_TARGET="$CASE_DIR/smartdns.conf"
 IPV6_DISABLE_CONFIG="$CASE_DIR/99-disable-ipv6.conf"
 NETWORK_STACK_UNIT="$CASE_DIR/404-network-stack.service"
 NETWORK_STACK_UNIT_NAME='404-network-stack.service'
+NETWORK_STACK_HELPER="$CASE_DIR/404-network-stack"
 RESOLV_CONF="$CASE_DIR/resolv.conf"
 CONFIG_PREEXISTED=false
 IPV6_CONFIG_PREEXISTED=false
 NETWORK_STACK_UNIT_PREEXISTED=false
 NETWORK_STACK_UNIT_WAS_ENABLED=false
 NETWORK_STACK_UNIT_WAS_ACTIVE=false
+NETWORK_STACK_HELPER_PREEXISTED=false
 RESOLV_CONF_PREEXISTED=false
 SMARTDNS_WAS_ENABLED=false
 SMARTDNS_WAS_ACTIVE=false
@@ -531,6 +555,8 @@ printf '1\n' >"$CASE_DIR/default"
 printf '1\n' >"$CASE_DIR/lo"
 : >"$CASE_DIR/systemctl-trace"
 warn() { :; }
+sysctl_restriction_error() { return 1; }
+mountpoint() { return 1; }
 apt-mark() { :; }
 sysctl() {
   local key=${3%%=*}
@@ -878,6 +904,7 @@ readonly CONFIG_TARGET="$MOCK_CASE_DIR/etc/smartdns/smartdns.conf"
 readonly IPV6_DISABLE_CONFIG="$MOCK_CASE_DIR/etc/sysctl.d/99-disable-ipv6.conf"
 readonly NETWORK_STACK_UNIT="$MOCK_CASE_DIR/etc/systemd/system/404-network-stack.service"
 readonly NETWORK_STACK_UNIT_NAME='404-network-stack.service'
+readonly NETWORK_STACK_HELPER="$MOCK_CASE_DIR/usr/local/libexec/404-network-stack"
 readonly RESOLV_CONF="$MOCK_RESOLV_CONF"
 readonly SMARTDNS_RELEASE_TAG='smartdns-debian-pinned-2026-07'
 TMP_DIR="$MOCK_CASE_DIR/work"
@@ -918,12 +945,24 @@ IPV6_CONFIG_PREEXISTED=false
 NETWORK_STACK_UNIT_PREEXISTED=false
 NETWORK_STACK_UNIT_WAS_ENABLED=false
 NETWORK_STACK_UNIT_WAS_ACTIVE=false
+NETWORK_STACK_HELPER_PREEXISTED=false
 RESOLV_CONF_PREEXISTED=false
 IPV6_ALL_WAS_DISABLED='0'
 IPV6_DEFAULT_WAS_DISABLED='0'
 IPV6_LOOPBACK_WAS_DISABLED='0'
 SYSTEMD_RESOLVED_WAS_ENABLED=false
 SYSTEMD_RESOLVED_WAS_ACTIVE=false
+SYSTEMD_RESOLVED_UNIT_PRESENT=false
+VIRTUALIZATION='none'
+CONTAINER_VIRTUALIZATION='none'
+ENVIRONMENT_LABEL='Bare metal'
+KERNEL_IPV6_DISABLED='YES'
+KERNEL_ENFORCEMENT='enabled'
+APPLICATION_IPV4_ONLY='YES'
+RESOLV_CONF_STATUS='MANAGED'
+SYSTEM_RESOLUTION_STATUS='PASS'
+RESULT_STATUS='SUCCESS'
+WARNING_COUNT=0
 
 mock_step() {
   printf 'step %s\n' "$1" >>"$MOCK_TRACE"
@@ -948,6 +987,10 @@ install_dependencies() {
 
 verify_required_commands() {
   mock_step verify-required-commands
+}
+
+detect_runtime_environment() {
+  mock_step detect-runtime-environment
 }
 
 select_platform() {
@@ -1001,6 +1044,7 @@ validate_network_stack_health() {
 configure_system_resolver() {
   printf 'nameserver 127.0.0.1\noptions timeout:2 attempts:2\n' >"$TMP_DIR/resolv.conf"
   cp "$TMP_DIR/resolv.conf" "$MOCK_RESOLV_CONF"
+  RESOLV_CONF_STATUS='MANAGED'
   mock_step configure-system-resolver
 }
 DRIVER_PREAMBLE
@@ -1204,6 +1248,176 @@ test_updater_full_regression_flow() {
   log 'Debian 12 已安装且 hold 的完整更新路径、三模式接入、resolver、配置失败 rollback 和服务恢复测试通过。'
 }
 
+test_capability_aware_sysctl() {
+  local case_dir="$TMP_DIR/capability-aware-sysctl"
+  local driver="$case_dir/driver.sh"
+  local output
+  local status
+
+  mkdir -p "$case_dir"
+  {
+    cat <<'DRIVER'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+KERNEL_ENFORCEMENT='enabled'
+WARNING_COUNT=0
+degrade() { KERNEL_ENFORCEMENT='unavailable'; ((WARNING_COUNT += 1)); }
+shorten_line() { printf '%s' "$1"; }
+fail_with_recovery() { printf 'FATAL:%s\n' "$1" >&2; exit 91; }
+sysctl() {
+  if [[ "$1" == '-q' && "$2" == '-w' ]]; then
+    if [[ "$SYSCTL_MODE" == restricted ]]; then
+      printf 'sysctl: permission denied on key "%s"\n' "${3%%=*}" >&2
+    else
+      printf 'sysctl: invalid argument on key "%s"\n' "${3%%=*}" >&2
+    fi
+    return 1
+  fi
+  return 2
+}
+DRIVER
+    extract_function "$UPDATER" sysctl_restriction_error
+    extract_function "$UPDATER" apply_ipv6_sysctl_capability_aware
+    cat <<'DRIVER'
+apply_ipv6_sysctl_capability_aware 1
+printf '%s|%s\n' "$KERNEL_ENFORCEMENT" "$WARNING_COUNT"
+DRIVER
+  } >"$driver"
+
+  output=$(SYSCTL_MODE=restricted bash "$driver")
+  assert_eq 'unavailable|1' "$output" \
+    'permission denied sysctl 必须降级为 unavailable 且继续成功'
+  set +e
+  SYSCTL_MODE=unexpected bash "$driver" >"$case_dir/unexpected-output" 2>&1
+  status=$?
+  set -e
+  assert_eq '91' "$status" '真正异常的 sysctl 错误必须进入 fatal 恢复路径'
+  grep -Fq 'FATAL:修改 net.ipv6.conf.all.disable_ipv6 时发生异常' \
+    "$case_dir/unexpected-output" || fail '异常 sysctl 缺少明确 fatal 诊断。'
+  ((TESTS_RUN += 1))
+  log 'capability-aware sysctl 的受限降级与真正异常 fatal 分类测试通过。'
+}
+
+test_virtualization_detection() {
+  local driver="$TMP_DIR/virtualization-detection.sh"
+  local output
+
+  {
+    cat <<'DRIVER'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+VIRTUALIZATION='unknown'
+CONTAINER_VIRTUALIZATION='none'
+ENVIRONMENT_LABEL='Unknown environment'
+CONTAINER_ENVIRONMENT=false
+log() { :; }
+systemd-detect-virt() {
+  if [[ "${1:-}" == --container ]]; then
+    [[ "$DETECTED_CONTAINER" != none ]] || return 1
+    printf '%s\n' "$DETECTED_CONTAINER"
+  else
+    [[ "$DETECTED_VIRT" != none ]] || return 1
+    printf '%s\n' "$DETECTED_VIRT"
+  fi
+}
+DRIVER
+    extract_function "$UPDATER" detect_runtime_environment
+    cat <<'DRIVER'
+detect_runtime_environment
+printf '%s|%s|%s|%s\n' "$VIRTUALIZATION" "$CONTAINER_VIRTUALIZATION" \
+  "$ENVIRONMENT_LABEL" "$CONTAINER_ENVIRONMENT"
+DRIVER
+  } >"$driver"
+
+  output=$(DETECTED_VIRT=kvm DETECTED_CONTAINER=none bash "$driver")
+  assert_eq 'kvm|none|kvm virtual machine|false' "$output" \
+    'KVM 必须识别为完整虚拟机而非容器'
+  output=$(DETECTED_VIRT=podman DETECTED_CONTAINER=podman bash "$driver")
+  assert_eq 'podman|podman|podman container|true' "$output" \
+    'Podman 必须通过通用 container 检测路径识别'
+  output=$(DETECTED_VIRT=none DETECTED_CONTAINER=none bash "$driver")
+  assert_eq 'none|none|Bare metal|false' "$output" \
+    '无虚拟化标记必须识别为 bare metal'
+  ((TESTS_RUN += 1))
+  log 'bare metal、KVM 与 Podman 的统一虚拟化检测测试通过。'
+}
+
+run_resolv_conf_case() {
+  local mode=$1
+  local case_dir="$TMP_DIR/resolv-$mode"
+  local driver="$case_dir/driver.sh"
+  local output
+
+  mkdir -p "$case_dir/work"
+  case "$mode" in
+    symlink)
+      printf 'nameserver 192.0.2.1\n' >"$case_dir/runtime-resolv.conf"
+      ln -s runtime-resolv.conf "$case_dir/resolv.conf"
+      ;;
+    *) printf 'nameserver 192.0.2.1\n' >"$case_dir/resolv.conf" ;;
+  esac
+  {
+    cat <<'DRIVER'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+TMP_DIR="$CASE_DIR/work"
+RESOLV_CONF="$CASE_DIR/resolv.conf"
+RESOLV_CONF_STATUS='UNMANAGED'
+SYSTEM_RESOLUTION_STATUS='PASS'
+WARNING_COUNT=0
+log() { :; }
+degrade() { ((WARNING_COUNT += 1)); }
+fail_with_recovery() { printf 'FATAL:%s\n' "$1" >&2; exit 92; }
+systemctl() {
+  [[ "$1" != is-active ]]
+}
+mountpoint() {
+  [[ "$RESOLV_MODE" == rw-mount || "$RESOLV_MODE" == ro-mount ]]
+}
+findmnt() {
+  if [[ " $* " == *' -M '* ]]; then
+    mountpoint
+    return
+  fi
+  if [[ " $* " == *' OPTIONS '* ]]; then
+    [[ "$RESOLV_MODE" == ro-mount ]] && printf 'ro\n' || printf 'rw\n'
+  else
+    printf 'runtime tmpfs rw\n'
+  fi
+}
+install() {
+  local source=${*: -2:1}
+  local target=${*: -1}
+  cp -- "$source" "$target"
+}
+DRIVER
+    extract_function "$UPDATER" resolv_conf_is_mountpoint
+    extract_function "$UPDATER" resolv_conf_mount_is_read_only
+    extract_function "$UPDATER" configure_system_resolver
+    cat <<'DRIVER'
+configure_system_resolver
+content=$(tr '\n' ';' <"$RESOLV_CONF")
+printf '%s|%s|%s|%s\n' "$RESOLV_CONF_STATUS" "$WARNING_COUNT" \
+  "$content" "$([[ -L "$RESOLV_CONF" ]] && printf symlink || printf regular)"
+DRIVER
+  } >"$driver"
+  output=$(CASE_DIR="$case_dir" RESOLV_MODE="$mode" bash "$driver")
+  printf '%s' "$output"
+}
+
+test_resolv_conf_types() {
+  assert_eq 'MANAGED|0|nameserver 127.0.0.1;options timeout:2 attempts:2;|regular' \
+    "$(run_resolv_conf_case ordinary)" '普通 resolv.conf 必须原子替换为受管文件'
+  assert_eq 'MANAGED|0|nameserver 127.0.0.1;options timeout:2 attempts:2;|regular' \
+    "$(run_resolv_conf_case symlink)" 'symlink resolv.conf 必须安全解析后替换为受管文件'
+  assert_eq 'CONTAINER_MANAGED_IN_PLACE|1|nameserver 127.0.0.1;options timeout:2 attempts:2;|regular' \
+    "$(run_resolv_conf_case rw-mount)" 'rw mount point 必须原地更新并报告非持久 warning'
+  assert_eq 'CONTAINER_MANAGED_UNCHANGED|1|nameserver 192.0.2.1;|regular' \
+    "$(run_resolv_conf_case ro-mount)" 'ro mount point 必须保留内容且不得 fatal'
+  ((TESTS_RUN += 1))
+  log '普通文件、symlink、rw/ro mount point 的 resolv.conf 分流测试通过。'
+}
+
 test_static_safety_guards() {
   local script
 
@@ -1248,6 +1462,9 @@ main() {
   test_fixed_mapping
   test_configurations
   test_network_stack_switches
+  test_capability_aware_sysctl
+  test_virtualization_detection
+  test_resolv_conf_types
   test_retry_logic
   test_updater_full_regression_flow
   test_static_safety_guards
