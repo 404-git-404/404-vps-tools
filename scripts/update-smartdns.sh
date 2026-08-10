@@ -16,6 +16,7 @@ readonly SMARTDNS_RELEASE_BASE='https://github.com/404-git-404/404notfound/relea
 readonly IPV6_DISABLE_CONFIG='/etc/sysctl.d/99-disable-ipv6.conf'
 readonly NETWORK_STACK_UNIT='/etc/systemd/system/404-network-stack.service'
 readonly NETWORK_STACK_UNIT_NAME='404-network-stack.service'
+readonly NETWORK_STACK_HELPER='/usr/local/libexec/404-network-stack'
 readonly RESOLV_CONF='/etc/resolv.conf'
 
 TMP_DIR=''
@@ -55,6 +56,7 @@ IPV6_CONFIG_PREEXISTED=false
 NETWORK_STACK_UNIT_PREEXISTED=false
 NETWORK_STACK_UNIT_WAS_ENABLED=false
 NETWORK_STACK_UNIT_WAS_ACTIVE=false
+NETWORK_STACK_HELPER_PREEXISTED=false
 RESOLV_CONF_PREEXISTED=false
 IPV6_ALL_WAS_DISABLED=''
 IPV6_DEFAULT_WAS_DISABLED=''
@@ -62,6 +64,17 @@ IPV6_LOOPBACK_WAS_DISABLED=''
 SYSTEMD_RESOLVED_WAS_ENABLED=false
 SYSTEMD_RESOLVED_WAS_ACTIVE=false
 SYSTEMD_RESOLVED_UNIT_PRESENT=false
+VIRTUALIZATION='unknown'
+CONTAINER_VIRTUALIZATION='none'
+ENVIRONMENT_LABEL='Unknown environment'
+CONTAINER_ENVIRONMENT=false
+KERNEL_IPV6_DISABLED='UNAVAILABLE'
+KERNEL_ENFORCEMENT='unavailable'
+APPLICATION_IPV4_ONLY='NO'
+RESOLV_CONF_STATUS='UNMANAGED'
+SYSTEM_RESOLUTION_STATUS='PASS'
+RESULT_STATUS='SUCCESS'
+WARNING_COUNT=0
 
 log() {
   printf '[INFO] %s\n' "$*"
@@ -69,6 +82,12 @@ log() {
 
 warn() {
   printf '[WARN] %s\n' "$*" >&2
+}
+
+degrade() {
+  warn "$*"
+  ((WARNING_COUNT += 1))
+  RESULT_STATUS='SUCCESS_WITH_WARNINGS'
 }
 
 die() {
@@ -108,6 +127,86 @@ parse_args() {
 shorten_line() {
   local value=${1//$'\n'/ }
   printf '%.300s' "$value"
+}
+
+detect_runtime_environment() {
+  local detected=''
+  local container=''
+
+  detected=$(systemd-detect-virt 2>/dev/null || true)
+  container=$(systemd-detect-virt --container 2>/dev/null || true)
+  [[ -n "$detected" && "$detected" != none ]] || detected='none'
+  [[ -n "$container" && "$container" != none ]] || container='none'
+  VIRTUALIZATION=$detected
+  CONTAINER_VIRTUALIZATION=$container
+  if [[ "$container" != none ]]; then
+    CONTAINER_ENVIRONMENT=true
+    ENVIRONMENT_LABEL="$container container"
+  elif [[ "$detected" == none ]]; then
+    CONTAINER_ENVIRONMENT=false
+    ENVIRONMENT_LABEL='Bare metal'
+  else
+    CONTAINER_ENVIRONMENT=false
+    ENVIRONMENT_LABEL="$detected virtual machine"
+  fi
+
+  log "Virtualization: $VIRTUALIZATION"
+  if [[ "$CONTAINER_ENVIRONMENT" == true ]]; then
+    log "Container environment detected: $CONTAINER_VIRTUALIZATION."
+  else
+    log "Environment: $ENVIRONMENT_LABEL."
+  fi
+}
+
+sysctl_restriction_error() {
+  local message=${1,,}
+  [[ "$message" == *'permission denied'* ||
+    "$message" == *'operation not permitted'* ||
+    "$message" == *'read-only file system'* ||
+    "$message" == *'readonly file system'* ]]
+}
+
+read_ipv6_kernel_state() {
+  local all_value=''
+  local default_value=''
+  local loopback_value=''
+
+  all_value=$(sysctl -n net.ipv6.conf.all.disable_ipv6 2>/dev/null) || return 1
+  default_value=$(sysctl -n net.ipv6.conf.default.disable_ipv6 2>/dev/null) || return 1
+  loopback_value=$(sysctl -n net.ipv6.conf.lo.disable_ipv6 2>/dev/null) || return 1
+  if [[ "$all_value" == 1 && "$default_value" == 1 && "$loopback_value" == 1 ]]; then
+    KERNEL_IPV6_DISABLED='YES'
+  elif [[ "$all_value" == 0 && "$default_value" == 0 && "$loopback_value" == 0 ]]; then
+    KERNEL_IPV6_DISABLED='NO'
+  else
+    KERNEL_IPV6_DISABLED='UNAVAILABLE'
+  fi
+  printf '%s/%s/%s' "$all_value" "$default_value" "$loopback_value"
+}
+
+apply_ipv6_sysctl_capability_aware() {
+  local desired_value=$1
+  local output=''
+  local restricted=false
+  local scope
+
+  for scope in all default lo; do
+    if output=$(sysctl -q -w "net.ipv6.conf.$scope.disable_ipv6=$desired_value" 2>&1); then
+      continue
+    fi
+    if sysctl_restriction_error "$output"; then
+      restricted=true
+      continue
+    fi
+    fail_with_recovery "修改 net.ipv6.conf.$scope.disable_ipv6 时发生异常：$(shorten_line "$output")"
+  done
+
+  if [[ "$restricted" == true ]]; then
+    KERNEL_ENFORCEMENT='unavailable'
+    degrade '容器/宿主限制禁止修改 IPv6 sysctl，将继续使用应用层网络栈配置。'
+    return 0
+  fi
+  KERNEL_ENFORCEMENT='enabled'
 }
 
 cleanup() {
@@ -157,8 +256,9 @@ verify_required_commands() {
   local command_name
   local -a required_commands=(
     apt-get apt-mark awk cat cmp cp curl date dig dpkg dpkg-deb dpkg-query
-    getent grep install ip journalctl kill mktemp pgrep pkill readlink rm sed
-    sha256sum sleep ss stat sysctl systemctl timeout tr
+    findmnt getent grep install ip journalctl kill mktemp mountpoint pgrep pkill
+    readlink rm sed sha256sum sleep ss stat sysctl systemctl systemd-detect-virt
+    timeout tr
   )
 
   for command_name in "${required_commands[@]}"; do
@@ -374,9 +474,12 @@ capture_existing_state() {
   if systemctl cat systemd-resolved.service >/dev/null 2>&1; then
     SYSTEMD_RESOLVED_UNIT_PRESENT=true
   fi
-  IPV6_ALL_WAS_DISABLED=$(sysctl -n net.ipv6.conf.all.disable_ipv6)
-  IPV6_DEFAULT_WAS_DISABLED=$(sysctl -n net.ipv6.conf.default.disable_ipv6)
-  IPV6_LOOPBACK_WAS_DISABLED=$(sysctl -n net.ipv6.conf.lo.disable_ipv6)
+  IPV6_ALL_WAS_DISABLED=$(sysctl -n net.ipv6.conf.all.disable_ipv6 2>/dev/null) ||
+    IPV6_ALL_WAS_DISABLED='unavailable'
+  IPV6_DEFAULT_WAS_DISABLED=$(sysctl -n net.ipv6.conf.default.disable_ipv6 2>/dev/null) ||
+    IPV6_DEFAULT_WAS_DISABLED='unavailable'
+  IPV6_LOOPBACK_WAS_DISABLED=$(sysctl -n net.ipv6.conf.lo.disable_ipv6 2>/dev/null) ||
+    IPV6_LOOPBACK_WAS_DISABLED='unavailable'
   return 0
 }
 
@@ -406,6 +509,10 @@ create_backup() {
     cp -a -- "$NETWORK_STACK_UNIT" "$BACKUP_DIR/404-network-stack.service"
     NETWORK_STACK_UNIT_PREEXISTED=true
   fi
+  if [[ -e "$NETWORK_STACK_HELPER" || -L "$NETWORK_STACK_HELPER" ]]; then
+    cp -a -- "$NETWORK_STACK_HELPER" "$BACKUP_DIR/404-network-stack"
+    NETWORK_STACK_HELPER_PREEXISTED=true
+  fi
   if [[ -e "$RESOLV_CONF" || -L "$RESOLV_CONF" ]]; then
     cp -a -- "$RESOLV_CONF" "$BACKUP_DIR/resolv.conf"
     RESOLV_CONF_PREEXISTED=true
@@ -432,7 +539,11 @@ create_backup() {
 }
 
 restore_previous_state() {
+  local restore_entry
+  local restore_output
+  local restore_scope
   local restore_status=0
+  local restore_value
 
   [[ "$BACKUP_READY" == true ]] || return 1
   warn '正在恢复升级前的 SmartDNS 配置、服务状态和 hold 状态。'
@@ -454,16 +565,31 @@ restore_previous_state() {
     cp -a -- "$BACKUP_DIR/404-network-stack.service" "$NETWORK_STACK_UNIT" ||
       restore_status=1
   fi
+  rm -f -- "$NETWORK_STACK_HELPER" || restore_status=1
+  if [[ "$NETWORK_STACK_HELPER_PREEXISTED" == true ]]; then
+    cp -a -- "$BACKUP_DIR/404-network-stack" "$NETWORK_STACK_HELPER" ||
+      restore_status=1
+  fi
   rm -f -- "$IPV6_DISABLE_CONFIG" || restore_status=1
   if [[ "$IPV6_CONFIG_PREEXISTED" == true ]]; then
     cp -a -- "$BACKUP_DIR/99-disable-ipv6.conf" "$IPV6_DISABLE_CONFIG" ||
       restore_status=1
   fi
-  sysctl -q -w "net.ipv6.conf.all.disable_ipv6=$IPV6_ALL_WAS_DISABLED" || restore_status=1
-  sysctl -q -w "net.ipv6.conf.default.disable_ipv6=$IPV6_DEFAULT_WAS_DISABLED" || restore_status=1
-  sysctl -q -w "net.ipv6.conf.lo.disable_ipv6=$IPV6_LOOPBACK_WAS_DISABLED" || restore_status=1
+  for restore_entry in \
+    "all:$IPV6_ALL_WAS_DISABLED" \
+    "default:$IPV6_DEFAULT_WAS_DISABLED" \
+    "lo:$IPV6_LOOPBACK_WAS_DISABLED"; do
+    restore_scope=${restore_entry%%:*}
+    restore_value=${restore_entry#*:}
+    [[ "$restore_value" == 0 || "$restore_value" == 1 ]] || continue
+    if ! restore_output=$(sysctl -q -w \
+      "net.ipv6.conf.$restore_scope.disable_ipv6=$restore_value" 2>&1); then
+      sysctl_restriction_error "$restore_output" || restore_status=1
+    fi
+  done
 
   systemctl daemon-reload >/dev/null 2>&1 || restore_status=1
+  systemctl reset-failed "$NETWORK_STACK_UNIT_NAME" >/dev/null 2>&1 || true
   if [[ "$NETWORK_STACK_UNIT_PREEXISTED" == true ]]; then
     if [[ "$NETWORK_STACK_UNIT_WAS_ENABLED" == true ]]; then
       systemctl enable "$NETWORK_STACK_UNIT_NAME" >/dev/null 2>&1 ||
@@ -507,9 +633,15 @@ restore_previous_state() {
       systemctl stop systemd-resolved.service >/dev/null 2>&1 || restore_status=1
     fi
   fi
-  rm -f -- "$RESOLV_CONF" || restore_status=1
-  if [[ "$RESOLV_CONF_PREEXISTED" == true ]]; then
-    cp -a -- "$BACKUP_DIR/resolv.conf" "$RESOLV_CONF" || restore_status=1
+  if mountpoint -q -- "$RESOLV_CONF" 2>/dev/null; then
+    if [[ "$RESOLV_CONF_PREEXISTED" == true ]]; then
+      cp -- "$BACKUP_DIR/resolv.conf" "$RESOLV_CONF" 2>/dev/null || true
+    fi
+  else
+    rm -f -- "$RESOLV_CONF" || restore_status=1
+    if [[ "$RESOLV_CONF_PREEXISTED" == true ]]; then
+      cp -a -- "$BACKUP_DIR/resolv.conf" "$RESOLV_CONF" || restore_status=1
+    fi
   fi
   return "$restore_status"
 }
@@ -745,8 +877,109 @@ deploy_configuration() {
     fail_with_recovery "SmartDNS 配置权限异常：$config_owner $config_mode。"
 }
 
+write_network_stack_helper() {
+  local target=$1
+  local candidate
+  local script_dir
+
+  if ! script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" 2>/dev/null && pwd); then
+    script_dir=''
+  fi
+  for candidate in "$script_dir/404-network-stack" "$script_dir/scripts/404-network-stack"; do
+    if [[ -f "$candidate" && -r "$candidate" ]]; then
+      cp -- "$candidate" "$target"
+      return 0
+    fi
+  done
+
+  cat >"$target" <<'EOF'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+IFS=$'\n\t'
+
+readonly STATUS_FILE='/run/404-network-stack.status'
+
+info() { printf '[INFO] %s\n' "$*"; }
+warn() { printf '[WARN] %s\n' "$*" >&2; }
+
+is_restricted_error() {
+  local message=${1,,}
+  [[ "$message" == *'permission denied'* ||
+    "$message" == *'operation not permitted'* ||
+    "$message" == *'read-only file system'* ||
+    "$message" == *'readonly file system'* ]]
+}
+
+network_stack_main() {
+  local mode=${1:-}
+  local desired_value
+  local detected=''
+  local container=''
+  local output=''
+  local restricted=false
+  local scope
+  local all_value='unknown'
+  local default_value='unknown'
+  local loopback_value='unknown'
+  local kernel_state='UNAVAILABLE'
+  local enforcement='enabled'
+
+  case "$mode" in
+    ipv4) desired_value=1 ;;
+    ipv6|dual) desired_value=0 ;;
+    *) printf '[FAIL] 未知网络栈：%s。\n' "$mode" >&2; return 2 ;;
+  esac
+
+  detected=$(systemd-detect-virt 2>/dev/null || true)
+  container=$(systemd-detect-virt --container 2>/dev/null || true)
+  [[ -n "$detected" && "$detected" != none ]] || detected='none'
+  [[ -n "$container" && "$container" != none ]] || container='none'
+  info "Virtualization: $detected"
+  if [[ "$container" != none ]]; then
+    info "Container environment detected: $container."
+  fi
+
+  for scope in all default lo; do
+    if output=$(sysctl -q -w "net.ipv6.conf.$scope.disable_ipv6=$desired_value" 2>&1); then
+      continue
+    fi
+    if is_restricted_error "$output"; then
+      restricted=true
+      warn "Kernel IPv6 sysctl net.ipv6.conf.$scope.disable_ipv6 is controlled by the host."
+      continue
+    fi
+    printf '[FAIL] sysctl net.ipv6.conf.%s.disable_ipv6: %s\n' \
+      "$scope" "$output" >&2
+    return 1
+  done
+
+  all_value=$(sysctl -n net.ipv6.conf.all.disable_ipv6 2>/dev/null || printf unknown)
+  default_value=$(sysctl -n net.ipv6.conf.default.disable_ipv6 2>/dev/null || printf unknown)
+  loopback_value=$(sysctl -n net.ipv6.conf.lo.disable_ipv6 2>/dev/null || printf unknown)
+  if [[ "$all_value" == 1 && "$default_value" == 1 && "$loopback_value" == 1 ]]; then
+    kernel_state='YES'
+  elif [[ "$all_value" == 0 && "$default_value" == 0 && "$loopback_value" == 0 ]]; then
+    kernel_state='NO'
+  fi
+  if [[ "$restricted" == true ]]; then
+    enforcement='unavailable'
+    warn 'Kernel IPv6 sysctl is controlled by host; application-level enforcement remains active.'
+  fi
+  install -d -m 0755 /run
+  printf 'MODE=%s\nKERNEL_ENFORCEMENT=%s\nKERNEL_IPV6_DISABLED=%s\nVIRTUALIZATION=%s\nCONTAINER=%s\n' \
+    "$mode" "$enforcement" "$kernel_state" "$detected" "$container" >"$STATUS_FILE"
+  info "Kernel IPv6 disabled: $kernel_state"
+}
+
+network_stack_main "$@"
+EOF
+}
+
 install_ipv4_network_stack_unit() {
+  local staged_helper="$TMP_DIR/404-network-stack"
   local staged_unit="$TMP_DIR/404-network-stack.service"
+
+  write_network_stack_helper "$staged_helper"
 
   cat >"$staged_unit" <<'EOF'
 [Unit]
@@ -757,9 +990,7 @@ Before=smartdns.service sing-box.service
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=/usr/sbin/sysctl -q -w net.ipv6.conf.all.disable_ipv6=1
-ExecStart=/usr/sbin/sysctl -q -w net.ipv6.conf.default.disable_ipv6=1
-ExecStart=/usr/sbin/sysctl -q -w net.ipv6.conf.lo.disable_ipv6=1
+ExecStart=/usr/local/libexec/404-network-stack ipv4
 
 [Install]
 WantedBy=multi-user.target
@@ -767,6 +998,10 @@ EOF
 
   rm -f -- "$IPV6_DISABLE_CONFIG" ||
     fail_with_recovery "无法删除早期 IPv6 禁用配置：$IPV6_DISABLE_CONFIG。"
+  install -D -o root -g root -m 0755 "$staged_helper" "$NETWORK_STACK_HELPER" ||
+    fail_with_recovery '无法安装 network-stack 兼容 helper。'
+  cmp -s "$staged_helper" "$NETWORK_STACK_HELPER" ||
+    fail_with_recovery 'network-stack helper 部署后内容不一致。'
   if ! install -D -o root -g root -m 0644 "$staged_unit" "$NETWORK_STACK_UNIT"; then
     fail_with_recovery '无法安装 IPv4-only network-stack unit。'
   fi
@@ -792,10 +1027,13 @@ remove_ipv4_network_stack_unit() {
   fi
   rm -f -- "$NETWORK_STACK_UNIT" ||
     fail_with_recovery '无法删除 IPv4-only network-stack unit。'
+  rm -f -- "$NETWORK_STACK_HELPER" ||
+    fail_with_recovery '无法删除 network-stack helper。'
   rm -f -- "$IPV6_DISABLE_CONFIG" ||
     fail_with_recovery "无法删除早期 IPv6 禁用配置：$IPV6_DISABLE_CONFIG。"
   systemctl daemon-reload ||
     fail_with_recovery '删除 network-stack unit 后 daemon-reload 失败。'
+  systemctl reset-failed "$NETWORK_STACK_UNIT_NAME" >/dev/null 2>&1 || true
   [[ ! -e "$NETWORK_STACK_UNIT" && ! -L "$NETWORK_STACK_UNIT" ]] ||
     fail_with_recovery 'IPv4-only network-stack unit 删除后仍然存在。'
 }
@@ -831,44 +1069,49 @@ restore_ipv6_network_configuration() {
 }
 
 configure_network_stack() {
-  local current_value
-  local default_value
-  local loopback_value
+  local kernel_values=''
 
   case "$NETWORK_STACK" in
     ipv4)
       install_ipv4_network_stack_unit
+      apply_ipv6_sysctl_capability_aware 1
+      APPLICATION_IPV4_ONLY='YES'
       ;;
     ipv6|dual)
       remove_ipv4_network_stack_unit
-      sysctl -q -w net.ipv6.conf.all.disable_ipv6=0 ||
-        fail_with_recovery '无法恢复 net.ipv6.conf.all.disable_ipv6=0。'
-      sysctl -q -w net.ipv6.conf.default.disable_ipv6=0 ||
-        fail_with_recovery '无法恢复 net.ipv6.conf.default.disable_ipv6=0。'
-      sysctl -q -w net.ipv6.conf.lo.disable_ipv6=0 ||
-        fail_with_recovery '无法恢复 net.ipv6.conf.lo.disable_ipv6=0。'
+      apply_ipv6_sysctl_capability_aware 0
+      APPLICATION_IPV4_ONLY='NO'
       restore_ipv6_network_configuration
       ;;
   esac
 
-  current_value=$(sysctl -n net.ipv6.conf.all.disable_ipv6) ||
-    fail_with_recovery '无法读取 disable_ipv6。'
-  default_value=$(sysctl -n net.ipv6.conf.default.disable_ipv6) ||
-    fail_with_recovery '无法读取 default.disable_ipv6。'
-  loopback_value=$(sysctl -n net.ipv6.conf.lo.disable_ipv6) ||
-    fail_with_recovery '无法读取 lo.disable_ipv6。'
+  if ! kernel_values=$(read_ipv6_kernel_state); then
+    KERNEL_ENFORCEMENT='unavailable'
+    KERNEL_IPV6_DISABLED='UNAVAILABLE'
+    degrade '无法读取内核 IPv6 sysctl；继续使用应用层网络栈配置。'
+    return 0
+  fi
+  case "$kernel_values" in
+    1/1/1) KERNEL_IPV6_DISABLED='YES' ;;
+    0/0/0) KERNEL_IPV6_DISABLED='NO' ;;
+    *) KERNEL_IPV6_DISABLED='UNAVAILABLE' ;;
+  esac
   if [[ "$NETWORK_STACK" == ipv4 ]]; then
-    [[ "$current_value" == 1 && "$default_value" == 1 && "$loopback_value" == 1 ]] ||
+    if [[ "$KERNEL_IPV6_DISABLED" != YES && "$KERNEL_ENFORCEMENT" != unavailable ]]; then
       fail_with_recovery 'IPv4-only 验证失败：all/default/lo 的 disable_ipv6 未全部设为 1。'
+    fi
     [[ ! -e "$IPV6_DISABLE_CONFIG" && ! -L "$IPV6_DISABLE_CONFIG" ]] ||
       fail_with_recovery "IPv4-only 验证失败：仍残留早期配置 $IPV6_DISABLE_CONFIG。"
   else
-    [[ "$current_value" == 0 && "$default_value" == 0 && "$loopback_value" == 0 ]] ||
+    if [[ "$KERNEL_IPV6_DISABLED" != NO && "$KERNEL_ENFORCEMENT" != unavailable ]]; then
       fail_with_recovery "$NETWORK_STACK 验证失败：all/default/lo 的 disable_ipv6 未全部恢复为 0。"
+    fi
     [[ ! -e "$IPV6_DISABLE_CONFIG" && ! -L "$IPV6_DISABLE_CONFIG" ]] ||
       fail_with_recovery "$NETWORK_STACK 验证失败：IPv6 禁用配置仍存在。"
   fi
-  log "网络栈已应用并验证：$NETWORK_STACK，disable_ipv6=$current_value/$default_value/$loopback_value。"
+  log "网络栈已应用：$NETWORK_STACK，disable_ipv6=$kernel_values。"
+  log "Kernel IPv6 disabled: $KERNEL_IPV6_DISABLED"
+  log "Application IPv4-only: $APPLICATION_IPV4_ONLY"
 }
 
 listener_present() {
@@ -965,8 +1208,12 @@ validate_network_stack_health() {
   local aaaa_output=''
   local disable_ipv6
 
-  disable_ipv6=$(sysctl -n net.ipv6.conf.all.disable_ipv6) ||
-    fail_with_recovery '无法读取 net.ipv6.conf.all.disable_ipv6。'
+  if ! disable_ipv6=$(sysctl -n net.ipv6.conf.all.disable_ipv6 2>/dev/null); then
+    disable_ipv6='unknown'
+    KERNEL_ENFORCEMENT='unavailable'
+    KERNEL_IPV6_DISABLED='UNAVAILABLE'
+    degrade '无法读取 net.ipv6.conf.all.disable_ipv6；跳过内核级健康检查。'
+  fi
   if [[ "$NETWORK_STACK" == ipv6 ]]; then
     a_output=$(query_smartdns_short A) ||
       fail_with_recovery "SmartDNS A 查询失败：$(shorten_line "$a_output")"
@@ -980,7 +1227,7 @@ validate_network_stack_health() {
 
   case "$NETWORK_STACK" in
     ipv4)
-      [[ "$disable_ipv6" == 1 ]] ||
+      [[ "$disable_ipv6" == 1 || "$KERNEL_ENFORCEMENT" == unavailable ]] ||
         fail_with_recovery 'IPv4-only 健康检查失败：disable_ipv6 不是 1。'
       first_valid_ipv4 <<<"$a_output" >/dev/null ||
         fail_with_recovery "IPv4-only 健康检查失败：A 没有结果：$(shorten_line "$a_output")"
@@ -991,7 +1238,7 @@ validate_network_stack_health() {
         fail_with_recovery 'IPv4-only 健康检查失败：curl -4 HTTPS 失败。'
       ;;
     ipv6)
-      [[ "$disable_ipv6" == 0 ]] ||
+      [[ "$disable_ipv6" == 0 || "$KERNEL_ENFORCEMENT" == unavailable ]] ||
         fail_with_recovery 'IPv6-only 健康检查失败：disable_ipv6 不是 0。'
       [[ -z "$a_output" ]] ||
         fail_with_recovery "IPv6-only 健康检查失败：A 应为空：$(shorten_line "$a_output")"
@@ -1004,7 +1251,7 @@ validate_network_stack_health() {
         fail_with_recovery 'IPv6-only 健康检查失败：curl -6 HTTPS 失败。'
       ;;
     dual)
-      [[ "$disable_ipv6" == 0 ]] ||
+      [[ "$disable_ipv6" == 0 || "$KERNEL_ENFORCEMENT" == unavailable ]] ||
         fail_with_recovery 'Dual-stack 健康检查失败：disable_ipv6 不是 0。'
       first_valid_ipv4 <<<"$a_output" >/dev/null ||
         fail_with_recovery "Dual-stack 健康检查失败：A 没有结果：$(shorten_line "$a_output")"
@@ -1018,7 +1265,11 @@ validate_network_stack_health() {
         fail_with_recovery 'Dual-stack 健康检查失败：curl -6 HTTPS 失败。'
       ;;
   esac
-  log "$NETWORK_STACK 的 DNS 记录、sysctl、路由与 HTTPS 健康检查通过。"
+  if [[ "$KERNEL_ENFORCEMENT" == unavailable ]]; then
+    log "$NETWORK_STACK 的应用层 DNS、路由与 HTTPS 健康检查通过；内核 sysctl 不可用。"
+  else
+    log "$NETWORK_STACK 的 DNS 记录、sysctl、路由与 HTTPS 健康检查通过。"
+  fi
 }
 
 valid_system_ipv4_answer() {
@@ -1088,20 +1339,59 @@ start_and_validate_service() {
   log 'smartdns 已设置为 hold。'
 }
 
+resolv_conf_is_mountpoint() {
+  mountpoint -q -- "$RESOLV_CONF" 2>/dev/null ||
+    findmnt -rn -M "$RESOLV_CONF" >/dev/null 2>&1
+}
+
+resolv_conf_mount_is_read_only() {
+  local options=''
+
+  options=$(findmnt -rn -T "$RESOLV_CONF" -o OPTIONS 2>/dev/null || true)
+  [[ ",$options," == *,ro,* ]]
+}
+
 configure_system_resolver() {
+  local mount_description=''
+  local resolved_stop_failed=false
   local staged_resolv="$TMP_DIR/resolv.conf"
 
   cat >"$staged_resolv" <<'EOF'
 nameserver 127.0.0.1
 options timeout:2 attempts:2
 EOF
-  if ! systemctl disable --now systemd-resolved.service >/dev/null 2>&1; then
-    if systemctl is-active --quiet systemd-resolved.service; then
-      fail_with_recovery '无法停止 systemd-resolved，拒绝切换 /etc/resolv.conf。'
-    fi
+  if ! systemctl disable --now systemd-resolved.service >/dev/null 2>&1 &&
+    systemctl is-active --quiet systemd-resolved.service; then
+    resolved_stop_failed=true
   fi
-  systemctl is-active --quiet systemd-resolved.service &&
-    fail_with_recovery 'systemd-resolved 仍处于 active 状态。'
+
+  if resolv_conf_is_mountpoint; then
+    mount_description=$(findmnt -rn -T "$RESOLV_CONF" \
+      -o SOURCE,FSTYPE,OPTIONS 2>/dev/null || true)
+    log "/etc/resolv.conf mount: ${mount_description:-unknown}."
+    [[ "$resolved_stop_failed" == false ]] ||
+      degrade 'systemd-resolved 仍处于 active；容器运行时管理 resolv.conf，将继续。'
+    if resolv_conf_mount_is_read_only; then
+      RESOLV_CONF_STATUS='CONTAINER_MANAGED_UNCHANGED'
+      degrade '/etc/resolv.conf 是只读的容器/运行时挂载点；已保留原内容，未能持久接管。'
+      return 0
+    fi
+    if cp -- "$staged_resolv" "$RESOLV_CONF" 2>/dev/null &&
+      cmp -s -- "$staged_resolv" "$RESOLV_CONF"; then
+      RESOLV_CONF_STATUS='CONTAINER_MANAGED_IN_PLACE'
+      degrade '/etc/resolv.conf 是容器管理的挂载点；已原地更新，但容器重启后可能被运行时重新生成。'
+      return 0
+    fi
+    RESOLV_CONF_STATUS='CONTAINER_MANAGED_UNCHANGED'
+    degrade '/etc/resolv.conf 由容器运行时管理且无法原地覆盖；已保留原内容，SmartDNS 不回滚。'
+    return 0
+  fi
+
+  [[ "$resolved_stop_failed" == false ]] ||
+    fail_with_recovery '无法停止 systemd-resolved，拒绝切换 /etc/resolv.conf。'
+  if [[ -L "$RESOLV_CONF" ]]; then
+    log "/etc/resolv.conf symlink: $(readlink "$RESOLV_CONF") -> $(readlink -f "$RESOLV_CONF" 2>/dev/null || printf unknown)."
+  fi
   rm -f -- "$RESOLV_CONF" ||
     fail_with_recovery '无法移除旧 /etc/resolv.conf。'
   install -o root -g root -m 0644 "$staged_resolv" "$RESOLV_CONF" ||
@@ -1110,25 +1400,39 @@ EOF
     fail_with_recovery '/etc/resolv.conf 仍是符号链接。'
   cmp -s -- "$staged_resolv" "$RESOLV_CONF" ||
     fail_with_recovery '/etc/resolv.conf 内容验证失败。'
+  RESOLV_CONF_STATUS='MANAGED'
   log 'systemd-resolved 已停用；/etc/resolv.conf 已切换为 SmartDNS 受管普通文件。'
 }
 
 check_debian_system_dns() {
   local expected_resolv="$TMP_DIR/resolv.conf"
 
-  [[ -f "$RESOLV_CONF" && ! -L "$RESOLV_CONF" ]] ||
-    fail_with_recovery '/etc/resolv.conf 不是普通文件。'
-  cmp -s -- "$expected_resolv" "$RESOLV_CONF" ||
-    fail_with_recovery '/etc/resolv.conf 不是要求的 SmartDNS 两行配置。'
-  systemctl is-active --quiet systemd-resolved.service &&
-    fail_with_recovery 'systemd-resolved 健康检查失败：服务仍 active。'
-  if ! SYSTEM_LOOKUP_OUTPUT=$(getent hosts cloudflare.com 2>&1); then
-    fail_with_recovery "Debian 系统默认解析失败：$(shorten_line "$SYSTEM_LOOKUP_OUTPUT")"
+  if [[ "$RESOLV_CONF_STATUS" == MANAGED ]]; then
+    [[ -f "$RESOLV_CONF" && ! -L "$RESOLV_CONF" ]] ||
+      fail_with_recovery '/etc/resolv.conf 不是普通文件。'
+    cmp -s -- "$expected_resolv" "$RESOLV_CONF" ||
+      fail_with_recovery '/etc/resolv.conf 不是要求的 SmartDNS 两行配置。'
+    systemctl is-active --quiet systemd-resolved.service &&
+      fail_with_recovery 'systemd-resolved 健康检查失败：服务仍 active。'
+  elif [[ "$RESOLV_CONF_STATUS" == CONTAINER_MANAGED_IN_PLACE ]]; then
+    cmp -s -- "$expected_resolv" "$RESOLV_CONF" ||
+      degrade '容器管理的 /etc/resolv.conf 在验证前已变化；运行时可能已重新生成。'
   fi
   dig @127.0.0.1 cloudflare.com +time=4 +tries=1 >/dev/null 2>&1 ||
     fail_with_recovery '通过 127.0.0.1 的 dig 健康检查失败。'
-  log 'Debian 系统 DNS 验证通过：仅 127.0.0.1，systemd-resolved inactive。'
-  log 'Debian 系统默认解析验证通过。'
+  if SYSTEM_LOOKUP_OUTPUT=$(getent hosts cloudflare.com 2>&1); then
+    log 'Debian 系统默认解析验证通过。'
+  elif [[ "$RESOLV_CONF_STATUS" == MANAGED ]]; then
+    fail_with_recovery "Debian 系统默认解析失败：$(shorten_line "$SYSTEM_LOOKUP_OUTPUT")"
+  else
+    SYSTEM_RESOLUTION_STATUS='DEGRADED'
+    degrade "容器管理的系统 resolver 当前解析失败；SmartDNS 本地查询正常：$(shorten_line "$SYSTEM_LOOKUP_OUTPUT")"
+  fi
+  if [[ "$RESOLV_CONF_STATUS" == MANAGED ]]; then
+    log 'Debian 系统 DNS 验证通过：仅 127.0.0.1，systemd-resolved inactive。'
+  fi
+  log "SmartDNS configuration validation: PASS"
+  log "SmartDNS service: ACTIVE"
 }
 
 print_summary() {
@@ -1137,6 +1441,13 @@ print_summary() {
   printf 'Debian / 架构：%s / %s\n' "$OS_VERSION" "$ARCH"
   printf '配置变体：%s\n' "$CONFIG_VARIANT"
   printf '网络栈：%s\n' "$NETWORK_STACK"
+  printf 'Environment: %s\n' "$ENVIRONMENT_LABEL"
+  printf 'Virtualization: %s\n' "$VIRTUALIZATION"
+  printf 'Container: %s\n' "$CONTAINER_VIRTUALIZATION"
+  printf 'Requested mode: %s\n' "$NETWORK_STACK"
+  printf 'Kernel enforcement: %s\n' "$KERNEL_ENFORCEMENT"
+  printf 'Kernel IPv6 disabled: %s\n' "$KERNEL_IPV6_DISABLED"
+  printf 'Application IPv4-only: %s\n' "$APPLICATION_IPV4_ONLY"
   printf 'Release 资产：%s\n' "$ASSET_NAME"
   printf 'SmartDNS 当前版本：%s\n' "$SMARTDNS_VERSION_TEXT"
   printf 'Debian 软件包版本：%s\n' "$PACKAGE_VERSION"
@@ -1148,8 +1459,16 @@ print_summary() {
   printf 'UDP 53：正常\n'
   printf '网络栈 DNS / HTTPS：正常\n'
   printf 'APT hold：smartdns\n'
-  printf '系统 DNS：仅 127.0.0.1\n'
-  printf '系统解析：正常\n'
+  case "$RESOLV_CONF_STATUS" in
+    MANAGED) printf '系统 DNS：仅 127.0.0.1（持久受管）\n' ;;
+    CONTAINER_MANAGED_IN_PLACE)
+      printf '系统 DNS：容器运行时管理；本次已原地更新，重启后可能重建\n'
+      ;;
+    *) printf '系统 DNS：容器运行时管理，未能持久接管\n' ;;
+  esac
+  printf '系统解析：%s\n' "$SYSTEM_RESOLUTION_STATUS"
+  printf 'Warnings: %d\n' "$WARNING_COUNT"
+  printf 'Result: %s\n' "$RESULT_STATUS"
   printf '旧配置备份路径：%s\n' "$BACKUP_DIR"
 }
 
@@ -1158,6 +1477,7 @@ main() {
   require_root_and_debian
   install_dependencies
   verify_required_commands
+  detect_runtime_environment
   select_platform
   create_temporary_directory
   write_smartdns_configuration "$STAGED_CONFIG" "$CONFIG_VARIANT"

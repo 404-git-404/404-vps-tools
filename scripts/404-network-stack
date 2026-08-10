@@ -1,0 +1,97 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+IFS=$'\n\t'
+
+readonly STATUS_FILE='/run/404-network-stack.status'
+
+info() {
+  printf '[INFO] %s\n' "$*"
+}
+
+warn() {
+  printf '[WARN] %s\n' "$*" >&2
+}
+
+is_restricted_error() {
+  local message=${1,,}
+  [[ "$message" == *'permission denied'* ||
+    "$message" == *'operation not permitted'* ||
+    "$message" == *'read-only file system'* ||
+    "$message" == *'readonly file system'* ]]
+}
+
+detect_environment() {
+  local detected=''
+  local container=''
+
+  detected=$(systemd-detect-virt 2>/dev/null || true)
+  container=$(systemd-detect-virt --container 2>/dev/null || true)
+  [[ -n "$detected" && "$detected" != none ]] || detected='none'
+  [[ -n "$container" && "$container" != none ]] || container='none'
+  printf '%s|%s' "$detected" "$container"
+}
+
+main() {
+  local mode=${1:-}
+  local desired_value
+  local environment=''
+  local detected='none'
+  local container='none'
+  local output=''
+  local restricted=false
+  local scope
+  local all_value='unknown'
+  local default_value='unknown'
+  local loopback_value='unknown'
+  local kernel_state='UNAVAILABLE'
+  local enforcement='enabled'
+
+  case "$mode" in
+    ipv4) desired_value=1 ;;
+    ipv6|dual) desired_value=0 ;;
+    *) printf '[FAIL] 未知网络栈：%s。\n' "$mode" >&2; return 2 ;;
+  esac
+
+  environment=$(detect_environment)
+  detected=${environment%%|*}
+  container=${environment#*|}
+  info "Virtualization: $detected"
+  if [[ "$container" != none ]]; then
+    info "Container environment detected: $container."
+  fi
+
+  for scope in all default lo; do
+    if output=$(sysctl -q -w "net.ipv6.conf.$scope.disable_ipv6=$desired_value" 2>&1); then
+      continue
+    fi
+    if is_restricted_error "$output"; then
+      restricted=true
+      warn "Kernel IPv6 sysctl net.ipv6.conf.$scope.disable_ipv6 is controlled by the host."
+      continue
+    fi
+    printf '[FAIL] sysctl net.ipv6.conf.%s.disable_ipv6: %s\n' \
+      "$scope" "$output" >&2
+    return 1
+  done
+
+  all_value=$(sysctl -n net.ipv6.conf.all.disable_ipv6 2>/dev/null || printf unknown)
+  default_value=$(sysctl -n net.ipv6.conf.default.disable_ipv6 2>/dev/null || printf unknown)
+  loopback_value=$(sysctl -n net.ipv6.conf.lo.disable_ipv6 2>/dev/null || printf unknown)
+  if [[ "$all_value" == 1 && "$default_value" == 1 && "$loopback_value" == 1 ]]; then
+    kernel_state='YES'
+  elif [[ "$all_value" == 0 && "$default_value" == 0 && "$loopback_value" == 0 ]]; then
+    kernel_state='NO'
+  fi
+  if [[ "$restricted" == true ]]; then
+    enforcement='unavailable'
+    warn 'Kernel IPv6 sysctl is controlled by host; application-level enforcement remains active.'
+  fi
+
+  install -d -m 0755 /run
+  printf 'MODE=%s\nKERNEL_ENFORCEMENT=%s\nKERNEL_IPV6_DISABLED=%s\nVIRTUALIZATION=%s\nCONTAINER=%s\n' \
+    "$mode" "$enforcement" "$kernel_state" "$detected" "$container" >"$STATUS_FILE"
+  info "Kernel IPv6 disabled: $kernel_state"
+}
+
+main "$@"
