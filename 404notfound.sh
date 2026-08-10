@@ -2348,7 +2348,9 @@ write_network_stack_helper() {
   local candidate
   local script_dir
 
-  script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" 2>/dev/null && pwd || true)
+  if ! script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" 2>/dev/null && pwd); then
+    script_dir=''
+  fi
   for candidate in "$script_dir/404-network-stack" "$script_dir/scripts/404-network-stack"; do
     if [[ -f "$candidate" && -r "$candidate" ]]; then
       cp -- "$candidate" "$target"
