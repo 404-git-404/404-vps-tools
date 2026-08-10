@@ -30,6 +30,8 @@ cleanup() {
   done
   docker network rm "$NETWORK_NAME" >/dev/null 2>&1 || true
   if [[ "$TEMP_DIR" == "${TMPDIR:-/tmp}"/* && -d "$TEMP_DIR" ]]; then
+    docker run --rm --mount "type=bind,src=$TEMP_DIR,dst=/cleanup" \
+      alpine:3.22 sh -ec 'chmod -R a+rwx /cleanup' >/dev/null 2>&1 || true
     rm -rf -- "$TEMP_DIR"
   fi
   exit "$status"
@@ -93,6 +95,7 @@ run_real_pair() {
   local port=''
   local status
   local attempt
+  local history_permissions
 
   bootstrap=$(bootstrap_command "$image") || return 1
   mkdir -p "$state_dir"
@@ -135,9 +138,14 @@ run_real_pair() {
     grep -Fq "$expected" "$client_log" ||
       fail "$label output is missing: $expected"
   done
-  [[ -d "$state_dir/history" ]] || fail "$label did not create history state."
-  find "$state_dir/history" -type f -name '*.json' -print -quit |
-    grep -q . || fail "$label did not persist compatible history."
+  history_permissions=$(docker run --rm \
+    --mount "type=bind,src=$state_dir,dst=/state" "$image" sh -ec '
+      file=$(find /state/history -type f -name "*.json" -print -quit)
+      test -n "$file"
+      printf "%s|%s\n" "$(stat -c %a "${file%/*}")" "$(stat -c %a "$file")"
+    ') || fail "$label did not persist compatible history."
+  [[ "$history_permissions" == '700|600' ]] ||
+    fail "$label history permissions changed: $history_permissions"
 
   set +e
   timeout 60 docker wait "$server" >"$TEMP_DIR/$label-server-status"
