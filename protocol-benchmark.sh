@@ -9,7 +9,8 @@ readonly DEFAULT_COOLDOWN=1
 readonly DEFAULT_BUDGET_MB=200
 readonly DEEP_BUDGET_MB=600
 readonly DEFAULT_SERVER_WAIT=600
-readonly SERVER_SESSION_IDLE=15
+readonly SERVER_SESSION_IDLE=120
+readonly SERVER_ERROR_LIMIT=3
 readonly DEFAULT_MAX_PERCENT=20
 readonly DEEP_MAX_PERCENT=35
 readonly MIN_PORT=49152
@@ -716,6 +717,9 @@ cleanup() {
 }
 
 signal_exit() {
+  if [[ "$MODE" == 'server' ]]; then
+    printf '\nServer stopped: manual signal; listener and firewall cleanup are automatic.\n' >&2
+  fi
   exit 130
 }
 
@@ -782,6 +786,9 @@ setup_firewall() {
 }
 
 run_server() {
+  local consecutive_errors=0
+  local deadline
+  local now
   local wait_seconds
   local status
   local server_log
@@ -800,39 +807,60 @@ run_server() {
   printf 'bash <(curl -fsSL https://raw.githubusercontent.com/404-git-404/404notfound/main/protocol-benchmark.sh) SERVER_IP --port %s\n' "$PORT"
   printf '\nStop: Ctrl+C (cleanup is automatic)\n\n'
 
+  now=$(date +%s)
+  deadline=$((now + SERVER_WAIT))
   while true; do
-    if (( SERVER_TESTS == 0 )); then
-      wait_seconds=$SERVER_WAIT
-    else
-      wait_seconds=$SERVER_SESSION_IDLE
+    now=$(date +%s)
+    if (( now >= deadline )); then
+      if (( SERVER_TESTS == 0 )); then
+        printf 'Server closed: idle timeout before the first client session; no listener retained.\n'
+      else
+        printf 'Server closed: idle timeout after the last test (%ss, %d completed); no listener retained.\n' \
+          "$SERVER_SESSION_IDLE" "$SERVER_TESTS"
+      fi
+      return 0
     fi
-    set +e
+    wait_seconds=$((deadline - now))
     timeout --foreground "$wait_seconds" iperf3 -s -1 -J -p "$PORT" \
       >"$server_log" 2>&1 &
     ACTIVE_IPERF_PID=$!
-    wait "$ACTIVE_IPERF_PID"
-    status=$?
+    if wait "$ACTIVE_IPERF_PID"; then
+      status=0
+    else
+      status=$?
+    fi
     ACTIVE_IPERF_PID=''
-    set -e
     if (( status == 124 )); then
-      break
+      if (( SERVER_TESTS == 0 )); then
+        printf 'Server closed: idle timeout before the first client session; no listener retained.\n'
+      else
+        printf 'Server closed: idle timeout after the last test (%ss, %d completed); no listener retained.\n' \
+          "$SERVER_SESSION_IDLE" "$SERVER_TESTS"
+      fi
+      return 0
     fi
     if (( status == 0 )); then
       (( SERVER_TESTS += 1 ))
+      consecutive_errors=0
+      now=$(date +%s)
+      deadline=$((now + SERVER_SESSION_IDLE))
       printf 'Completed test %d; waiting %ss for the next stage.\n' \
         "$SERVER_TESTS" "$SERVER_SESSION_IDLE"
       continue
     fi
     if (( status == 130 || status == 143 )); then
-      exit "$status"
+      printf 'Server stopped: manual signal; listener and firewall cleanup are automatic.\n' >&2
+      return "$status"
     fi
-    warn "iperf3 server session exited with status $status."
-    if (( SERVER_TESTS == 0 )); then
-      die "iperf3 could not listen on port $PORT."
+    (( consecutive_errors += 1 ))
+    warn "iperf3 server session exited with status $status; retrying listener ($consecutive_errors/$SERVER_ERROR_LIMIT)."
+    if (( consecutive_errors >= SERVER_ERROR_LIMIT )); then
+      printf 'Server stopped: unrecoverable iperf3 server failure after %d consecutive error(s); cleanup is automatic.\n' \
+        "$consecutive_errors" >&2
+      return 1
     fi
-    break
+    sleep 1
   done
-  printf 'Server closed after %d completed test(s); no listener retained.\n' "$SERVER_TESTS"
 }
 
 float_max() {
@@ -989,6 +1017,32 @@ failure_has_no_transfer() {
     "$reason" == *'network is unreachable'* ||
     "$reason" == *'name or service not known'* ||
     "$reason" == *'temporary failure in name resolution'* ]]
+}
+
+failure_indicates_server_unavailable() {
+  local reason=${1,,}
+
+  failure_has_no_transfer "$reason" ||
+    [[ "$reason" == *'unable to read from stream socket'* ||
+      "$reason" == *'unable to receive control message'* ||
+      "$reason" == *'control socket has closed unexpectedly'* ]]
+}
+
+benchmark_server_became_unavailable() {
+  local protocol direction percent status reason
+  local tcp_connection_failure=false
+  local udp_connection_failure=false
+
+  [[ -n "$RESULT_FILE" && -s "$RESULT_FILE" &&
+    -n "$FAILURE_FILE" && -s "$FAILURE_FILE" ]] || return 1
+  while IFS=$'\t' read -r protocol direction percent status reason; do
+    failure_indicates_server_unavailable "$reason" || continue
+    case "$protocol" in
+      TCP) tcp_connection_failure=true ;;
+      UDP) udp_connection_failure=true ;;
+    esac
+  done <"$FAILURE_FILE"
+  [[ "$tcp_connection_failure" == true && "$udp_connection_failure" == true ]]
 }
 
 account_failed_test() {
@@ -1653,6 +1707,15 @@ calculate_results() {
   UDP_EVALUABLE=false
   protocol_is_evaluable TCP && TCP_EVALUABLE=true
   protocol_is_evaluable UDP && UDP_EVALUABLE=true
+  if benchmark_server_became_unavailable; then
+    RESULT_STATE='INFRASTRUCTURE_FAILURE'
+    CONFIDENCE='NONE'
+    STATUS='INCOMPLETE'
+    PREFERRED='INCONCLUSIVE'
+    REASON='Benchmark server became unavailable during the test; protocol classification is invalid/incomplete.'
+    append_label 'INFRASTRUCTURE-FAILURE'
+    return 0
+  fi
   if [[ "$TCP_EVALUABLE" == false && "$UDP_EVALUABLE" == false ]]; then
     RESULT_STATE='FAILED'
     CONFIDENCE='NONE'
@@ -1821,6 +1884,20 @@ print_results() {
   printf 'Load RTT:      +%s ms max\n' "$MAX_LOAD_INCREASE"
   printf 'Peak CPU:      %s%%\n' "$MAX_CPU"
   printf 'Max load avg:  %s\n' "$MAX_LOAD_AVERAGE"
+  if [[ "$RESULT_STATE" == 'INFRASTRUCTURE_FAILURE' ]]; then
+    printf '\nTEST RESULT:   INCOMPLETE / INFRASTRUCTURE FAILURE\n'
+    printf 'CONFIDENCE:    NONE\n'
+    printf 'TCP SCORE:     not produced\n'
+    printf 'UDP SCORE:     not produced\n'
+    printf 'LINK HEALTH:   not produced\n'
+    printf 'STATUS:        INCOMPLETE\n'
+    printf '\nPreferred:     INCONCLUSIVE\n'
+    printf '\nReason:\n%s\n' "$REASON"
+    print_successful_sample_summary
+    print_failure_summary
+    printf '\nEarlier successful samples are retained for diagnosis but were not used for protocol classification.\n'
+    return 0
+  fi
   if [[ "$RESULT_STATE" == 'FAILED' ]]; then
     printf '\nTEST RESULT:   FAILED\n'
     printf 'CONFIDENCE:    NONE\n'
@@ -1899,6 +1976,24 @@ print_results() {
   print_failure_summary
   printf '\nUnderlying VPS<->VPS link appears %s.\n' "${STATUS,,}"
   printf 'This does NOT prove the sing-box/proxy layer is healthy.\n'
+}
+
+print_successful_sample_summary() {
+  local protocol direction percent streams _offered achieved ratio retrans loss
+  local jitter load_increase bytes
+
+  [[ -n "$RESULT_FILE" && -s "$RESULT_FILE" ]] || return 0
+  printf '\nSuccessful samples retained (not scored):\n'
+  while IFS=$'\t' read -r protocol direction percent streams _offered achieved \
+    ratio retrans loss jitter load_increase bytes; do
+    if [[ "$protocol" == 'TCP' ]]; then
+      printf '  TCP %s %s%%: %s Mbps, retrans=%s\n' \
+        "${direction//_TO_/->}" "$percent" "$achieved" "$retrans"
+    else
+      printf '  UDP %s %s%%: %s Mbps, loss=%s%%, jitter=%sms\n' \
+        "${direction//_TO_/->}" "$percent" "$achieved" "$loss" "$jitter"
+    fi
+  done <"$RESULT_FILE"
 }
 
 print_failure_summary() {
@@ -2339,7 +2434,8 @@ run_client() {
   elif [[ "$COMPARE_BASELINE" == true || "$SAVE_BASELINE" == true ]]; then
     warn 'Baseline operations were skipped because the benchmark result is incomplete.'
   fi
-  [[ "$RESULT_STATE" != 'FAILED' ]] || return 1
+  [[ "$RESULT_STATE" != 'FAILED' &&
+    "$RESULT_STATE" != 'INFRASTRUCTURE_FAILURE' ]] || return 1
 }
 
 main() {
