@@ -182,7 +182,9 @@ run_real_pair() {
     fail "$label history permissions changed: $history_permissions"
 
   set +e
-  timeout 60 docker wait "$server" >"$TEMP_DIR/$label-server-status"
+  # The production idle watchdog is 120 seconds; retain scheduling margin while
+  # still requiring the temporary server to close itself.
+  timeout 150 docker wait "$server" >"$TEMP_DIR/$label-server-status"
   status=$?
   set -e
   (( status == 0 )) || fail "$label server did not auto-close after idle timeout."
