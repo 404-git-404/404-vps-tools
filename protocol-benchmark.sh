@@ -227,7 +227,7 @@ check_platform() {
   local version_id=''
 
   [[ -r "$OS_RELEASE_FILE" ]] ||
-    die 'Debian 12/13 or Alpine 3.21-3.23 is required.'
+    die 'Debian 12/13 or Alpine 3.21-3.24 is required.'
   # shellcheck disable=SC1090
   source "$OS_RELEASE_FILE"
   os_id=${ID:-}
@@ -235,18 +235,18 @@ check_platform() {
   case "$os_id" in
     debian)
       [[ "$version_id" == '12' || "$version_id" == '13' ]] ||
-        die 'Debian 12/13 or Alpine 3.21-3.23 is required.'
+        die 'Debian 12/13 or Alpine 3.21-3.24 is required.'
       PLATFORM_FAMILY='debian'
       PLATFORM_VERSION=$version_id
       ;;
     alpine)
-      [[ "$version_id" =~ ^3[.](21|22|23)([.][0-9]+)*$ ]] ||
-        die 'Debian 12/13 or Alpine 3.21-3.23 is required.'
+      [[ "$version_id" =~ ^3[.](21|22|23|24)([.][0-9]+)*$ ]] ||
+        die 'Debian 12/13 or Alpine 3.21-3.24 is required.'
       PLATFORM_FAMILY='alpine'
       PLATFORM_VERSION="3.${BASH_REMATCH[1]}"
       ;;
     *)
-      die 'Debian 12/13 or Alpine 3.21-3.23 is required.'
+      die 'Debian 12/13 or Alpine 3.21-3.24 is required.'
       ;;
   esac
   [[ -n "$PLATFORM_FAMILY" && -n "$PLATFORM_VERSION" ]] ||
@@ -266,7 +266,11 @@ add_missing_dependency() {
 }
 
 has_gnu_sed() {
-  command_exists sed && sed --version 2>/dev/null | grep -q 'GNU sed'
+  local version
+
+  command_exists sed || return 1
+  version=$(sed --version 2>/dev/null) || return 1
+  [[ "$version" == 'sed (GNU sed) '* ]]
 }
 
 has_coreutils_date() {
@@ -277,16 +281,27 @@ has_coreutils_date() {
 }
 
 has_coreutils_timeout() {
-  command_exists timeout &&
-    timeout --version 2>/dev/null | grep -q 'GNU coreutils'
+  local version
+
+  command_exists timeout || return 1
+  version=$(timeout --version 2>/dev/null) || return 1
+  [[ "$version" == *'GNU coreutils'* ]]
 }
 
 has_coreutils_sort() {
-  command_exists sort && sort --version 2>/dev/null | grep -q 'GNU coreutils'
+  local version
+
+  command_exists sort || return 1
+  version=$(sort --version 2>/dev/null) || return 1
+  [[ "$version" == *'GNU coreutils'* ]]
 }
 
 has_iputils_ping() {
-  command_exists ping && ping -V 2>&1 | grep -qi 'iputils'
+  local version
+
+  command_exists ping || return 1
+  version=$(ping -V 2>&1) || return 1
+  [[ "${version,,}" == *iputils* ]]
 }
 
 collect_missing_dependencies() {
@@ -320,7 +335,20 @@ manual_install_command() {
       "$packages"
   else
     printf 'apk add --no-cache %s' "$packages"
+    if alpine_iperf3_constraint_needed; then
+      printf " '%s'" '!iperf3-openrc'
+    fi
   fi
+}
+
+alpine_iperf3_constraint_needed() {
+  local package
+
+  [[ "$PLATFORM_FAMILY" == 'alpine' ]] || return 1
+  for package in "${MISSING_PACKAGES[@]}"; do
+    [[ "$package" != 'iperf3' ]] || return 0
+  done
+  return 1
 }
 
 choose_privilege_helper() {
@@ -337,6 +365,7 @@ choose_privilege_helper() {
 
 install_runtime_packages() {
   local package_manager
+  local -a alpine_packages=()
 
   (( ${#MISSING_PACKAGES[@]} > 0 )) || return 0
   choose_privilege_helper || die "Missing runtime capabilities: ${MISSING_COMMANDS[*]}. Required packages: ${MISSING_PACKAGES[*]}. Run as root: $(manual_install_command)"
@@ -358,8 +387,21 @@ install_runtime_packages() {
   else
     package_manager=(apk)
     [[ -z "$PRIVILEGE_HELPER" ]] || package_manager=("$PRIVILEGE_HELPER" apk)
-    "${package_manager[@]}" add --no-cache "${MISSING_PACKAGES[@]}" ||
+    alpine_packages=("${MISSING_PACKAGES[@]}")
+    if alpine_iperf3_constraint_needed; then
+      alpine_packages+=('!iperf3-openrc')
+    fi
+    "${package_manager[@]}" add --no-cache "${alpine_packages[@]}" ||
       die 'apk add failed; no benchmark was started.'
+  fi
+}
+
+ensure_alpine_iperf3_service_absent() {
+  [[ "$PLATFORM_FAMILY" == 'alpine' &&
+    "$IPERF3_INSTALLED_NOW" == true ]] || return 0
+  if apk info -e iperf3-openrc >/dev/null 2>&1 ||
+    [[ -e /etc/init.d/iperf3 ]]; then
+    die 'The Alpine iperf3 OpenRC service package was not excluded.'
   fi
 }
 
@@ -411,6 +453,7 @@ check_dependencies() {
 
   if [[ "$iperf3_was_missing" == true && "$MODE" != 'history' ]]; then
     IPERF3_INSTALLED_NOW=true
+    ensure_alpine_iperf3_service_absent
     ensure_new_iperf3_daemon_disabled
   fi
 }

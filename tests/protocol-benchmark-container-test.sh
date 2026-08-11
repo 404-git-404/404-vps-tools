@@ -83,6 +83,40 @@ run_closed_port_failure() {
   printf 'PASS: %s closed-port failure semantics\n' "$label"
 }
 
+run_alpine324_dependency_probe() {
+  local log="$TEMP_DIR/alpine324-dependencies.log"
+
+  docker run --rm --network "$NETWORK_NAME" \
+    --mount "type=bind,src=$REPO_ROOT,dst=/work,readonly" \
+    alpine:3.24 sh -ec '
+      apk add --no-cache bash openrc >/dev/null
+      set +e
+      bash /work/protocol-benchmark.sh 127.0.0.1 \
+        --port 65534 --bandwidth 10 >/tmp/benchmark.log 2>&1
+      benchmark_status=$?
+      set -e
+      test "$benchmark_status" -ne 0
+      grep -Fq "TEST RESULT:   FAILED" /tmp/benchmark.log
+      for package in jq mawk sed iperf3 iputils coreutils; do
+        apk info -e "$package"
+      done
+      command -v jq >/dev/null
+      command -v mawk >/dev/null
+      sed --version 2>/dev/null | head -n 1 | grep -Fq "sed (GNU sed)"
+      iperf3 --version >/dev/null
+      ping -V 2>&1 | grep -qi "iputils"
+      timeout --version 2>/dev/null | grep -Fq "GNU coreutils"
+      ! apk info -e iperf3-openrc
+      test ! -e /etc/init.d/iperf3
+      ! pidof iperf3 >/dev/null 2>&1
+      printf "PASS: Alpine 3.24 dependency capabilities and service state\\n"
+    ' >"$log" 2>&1 || {
+      cat "$log" >&2
+      fail 'Alpine 3.24 dependency capability probe failed.'
+    }
+  cat "$log"
+}
+
 run_real_pair() {
   local image=$1
   local label=$2
@@ -165,7 +199,9 @@ run_real_pair() {
 run_closed_port_failure 'debian:13-slim' 'debian13'
 run_closed_port_failure 'alpine:3.21' 'alpine321'
 run_closed_port_failure 'alpine:3.22' 'alpine322'
+run_alpine324_dependency_probe
 run_real_pair 'debian:12-slim' 'debian12'
 run_real_pair 'alpine:3.23' 'alpine323'
+run_real_pair 'alpine:3.24' 'alpine324'
 
-printf 'PASS: Debian 12/13 and Alpine 3.21-3.23 container validation\n'
+printf 'PASS: Debian 12/13 and Alpine 3.21-3.24 container validation\n'

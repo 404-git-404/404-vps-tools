@@ -925,8 +925,47 @@ test_platform_and_dependency_bootstrap() {
   local status
   local install_log="$TEST_TEMP_DIR/install.log"
 
+  output=$(
+    command_exists() { return 0; }
+    sed() { printf 'This is not GNU sed version 4.0\n'; }
+    if has_gnu_sed; then printf true; else printf false; fi
+  )
+  assert_equal 'false' "$output" \
+    'BusyBox sed version text is not accepted as GNU sed'
+  output=$(
+    command_exists() { return 0; }
+    sed() { printf 'sed (GNU sed) 4.9\n'; }
+    if has_gnu_sed; then printf true; else printf false; fi
+  )
+  assert_equal 'true' "$output" 'GNU sed capability is accepted'
+  output=$(
+    command_exists() { return 0; }
+    timeout() { printf 'timeout (GNU coreutils) 9.11\nadditional text\n'; }
+    if has_coreutils_timeout; then printf true; else printf false; fi
+  )
+  assert_equal 'true' "$output" 'GNU timeout capability is accepted'
+  output=$(
+    command_exists() { return 0; }
+    timeout() { printf 'BusyBox timeout\n'; }
+    if has_coreutils_timeout; then printf true; else printf false; fi
+  )
+  assert_equal 'false' "$output" 'BusyBox timeout is rejected'
+  output=$(
+    command_exists() { return 0; }
+    sort() { printf 'sort (GNU coreutils) 9.11\nadditional text\n'; }
+    if has_coreutils_sort; then printf true; else printf false; fi
+  )
+  assert_equal 'true' "$output" 'GNU sort capability is accepted'
+  output=$(
+    command_exists() { return 0; }
+    ping() { printf 'ping from iputils 20250605\n'; }
+    if has_iputils_ping; then printf true; else printf false; fi
+  )
+  assert_equal 'true' "$output" 'iputils ping capability is accepted'
+
   for specification in 'debian 12 debian' 'debian 13 debian' \
-    'alpine 3.21 alpine' 'alpine 3.22 alpine' 'alpine 3.23 alpine'; do
+    'alpine 3.21 alpine' 'alpine 3.22 alpine' 'alpine 3.23 alpine' \
+    'alpine 3.24 alpine'; do
     read -r os_id version family <<<"$specification"
     printf 'ID=%s\nVERSION_ID=%s\n' "$os_id" "$version" >"$os_file"
     output=$(OS_RELEASE_FILE="$os_file" check_platform; \
@@ -939,13 +978,22 @@ test_platform_and_dependency_bootstrap() {
     printf '%s|%s' "$PLATFORM_FAMILY" "$PLATFORM_VERSION")
   assert_equal 'alpine|3.23' "$output" \
     'Alpine patch release normalizes to supported minor'
-  printf 'ID=alpine\nVERSION_ID=3.20\n' >"$os_file"
-  assert_false 'unsupported Alpine version is rejected' bash -c '
-    export PROTOCOL_BENCHMARK_SOURCE_ONLY=1
-    source "$1"
-    OS_RELEASE_FILE=$2
-    check_platform
-  ' _ "$BENCHMARK_SCRIPT" "$os_file"
+  for version in 3.24.0 3.24.1 3.24.999; do
+    printf 'ID=alpine\nVERSION_ID=%s\n' "$version" >"$os_file"
+    output=$(OS_RELEASE_FILE="$os_file" check_platform; \
+      printf '%s|%s' "$PLATFORM_FAMILY" "$PLATFORM_VERSION")
+    assert_equal 'alpine|3.24' "$output" \
+      "Alpine $version normalizes to supported minor"
+  done
+  for version in 3.20 3.25 edge; do
+    printf 'ID=alpine\nVERSION_ID=%s\n' "$version" >"$os_file"
+    assert_false "unsupported Alpine $version is rejected" bash -c '
+      export PROTOCOL_BENCHMARK_SOURCE_ONLY=1
+      source "$1"
+      OS_RELEASE_FILE=$2
+      check_platform
+    ' _ "$BENCHMARK_SCRIPT" "$os_file"
+  done
 
   output=$(
     MODE=history
@@ -1029,6 +1077,19 @@ test_platform_and_dependency_bootstrap() {
   )
   assert_equal 'add --no-cache jq mawk' "$(cat "$install_log")" \
     'Alpine uses one apk no-cache transaction'
+
+  : >"$install_log"
+  (
+    PLATFORM_FAMILY=alpine
+    MISSING_COMMANDS=(iperf3)
+    MISSING_PACKAGES=(iperf3)
+    is_root() { return 0; }
+    apk() { printf '%s\n' "$*" >>"$install_log"; }
+    install_runtime_packages
+  )
+  assert_equal 'add --no-cache iperf3 !iperf3-openrc' \
+    "$(cat "$install_log")" \
+    'Alpine excludes the iperf3 OpenRC auto-install subpackage'
 
   : >"$install_log"
   (
@@ -1173,8 +1234,11 @@ test_platform_and_dependency_bootstrap() {
     'new Debian iperf3 service is stopped'
   assert_contains 'disable iperf3.service' "$(cat "$install_log")" \
     'new Debian iperf3 service is disabled'
+  assert_contains "alpine_packages+=('!iperf3-openrc')" \
+    "$(cat "$BENCHMARK_SCRIPT")" \
+    'Alpine bootstrap blocks the OpenRC subpackage'
   assert_false 'Alpine bootstrap never enables OpenRC iperf3 service' \
-    grep -Eq 'iperf3-openrc|rc-update[[:space:]]+add|rc-service[[:space:]]+iperf3' \
+    grep -Eq 'rc-update[[:space:]]+add|rc-service[[:space:]]+iperf3' \
     "$BENCHMARK_SCRIPT"
 }
 
