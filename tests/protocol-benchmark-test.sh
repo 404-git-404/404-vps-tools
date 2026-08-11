@@ -460,6 +460,48 @@ test_failure_control_flow_and_evaluability() {
     'only actual budget denial sets budget limited'
 }
 
+test_server_disappearance_classification() {
+  local output
+
+  reset_fixture
+  append_healthy_pair TCP 5 50
+  record_failure TCP A_TO_B 10 1 'unable to connect to server: Connection refused'
+  record_failure UDP A_TO_B 5 1 'unable to read from stream socket'
+  record_failure UDP B_TO_A 5 1 'connection timed out'
+  calculate_results
+  output=$(print_results)
+  assert_equal 'INFRASTRUCTURE_FAILURE' "$RESULT_STATE" \
+    'server disappearance overrides otherwise evaluable early samples'
+  assert_equal 'NONE' "$CONFIDENCE" 'infrastructure failure has no confidence'
+  assert_equal 'INCOMPLETE' "$STATUS" 'infrastructure failure status'
+  assert_equal 'INCONCLUSIVE' "$PREFERRED" \
+    'infrastructure failure produces no transport recommendation'
+  assert_contains 'INFRASTRUCTURE-FAILURE' "$LABELS" \
+    'infrastructure failure diagnostic label'
+  assert_contains 'INCOMPLETE / INFRASTRUCTURE FAILURE' "$output" \
+    'infrastructure failure report heading'
+  assert_contains 'Benchmark server became unavailable during the test' "$output" \
+    'infrastructure failure report explains server disappearance'
+  assert_contains 'Successful samples retained (not scored)' "$output" \
+    'early successful samples remain visible'
+  assert_contains 'TCP SCORE:     not produced' "$output" \
+    'infrastructure failure does not score TCP'
+  assert_contains 'UDP SCORE:     not produced' "$output" \
+    'infrastructure failure does not score UDP'
+  assert_contains 'Preferred:     INCONCLUSIVE' "$output" \
+    'infrastructure failure report is inconclusive'
+  assert_not_contains 'Underlying VPS<->VPS link appears' "$output" \
+    'infrastructure failure does not classify link quality'
+
+  reset_fixture
+  append_healthy_pair TCP 5 50
+  append_healthy_pair UDP 5 50
+  record_failure TCP A_TO_B 10 1 'connection refused'
+  calculate_results
+  assert_equal 'COMPLETE' "$RESULT_STATE" \
+    'one-protocol connection failure alone does not claim server disappearance'
+}
+
 test_failure_reason_and_reservation_lifecycle() {
   local json_file="$TEST_TEMP_DIR/failure.json"
   local output_file="$TEST_TEMP_DIR/failure-output.txt"
@@ -1414,6 +1456,108 @@ EOF
     'server output shows firewall lifecycle'
   assert_contains 'SERVER_IP --port 54036' "$output" \
     'server output gives copyable placeholder command'
+  assert_contains 'idle timeout before the first client session' "$output" \
+    'server distinguishes first-client idle timeout'
+}
+
+test_server_supervisor_lifecycle() {
+  local helper="$TEST_TEMP_DIR/server-supervisor-helper.sh"
+  local case_dir
+  local output
+  local status
+  local index
+
+  cat >"$helper" <<'EOF'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+benchmark_script=$1
+case_dir=$2
+export PROTOCOL_BENCHMARK_SOURCE_ONLY=1
+# shellcheck disable=SC1090
+source "$benchmark_script"
+
+next_value() {
+  local value_file=$1
+  local index_file="$value_file.index"
+  local current=0
+  [[ ! -s "$index_file" ]] || current=$(cat "$index_file")
+  (( current += 1 ))
+  printf '%s\n' "$current" >"$index_file"
+  sed -n "${current}p" "$value_file"
+}
+
+date() {
+  [[ "${1:-}" == '+%s' ]] || command date "$@"
+  next_value "$case_dir/times"
+}
+
+timeout() {
+  local result
+  printf '%s\n' "$2" >>"$case_dir/waits"
+  result=$(next_value "$case_dir/statuses")
+  return "$result"
+}
+
+sleep() { :; }
+setup_firewall() { FIREWALL_STATUS='unchanged (test)'; }
+MODE=server
+PORT=55120
+SERVER_WAIT=600
+run_server
+EOF
+  chmod +x "$helper"
+
+  case_dir="$TEST_TEMP_DIR/server-complete"
+  mkdir -p "$case_dir"
+  : >"$case_dir/statuses"
+  for (( index=1; index<=8; index++ )); do printf '0\n' >>"$case_dir/statuses"; done
+  printf '124\n' >>"$case_dir/statuses"
+  printf '1000\n1000\n' >"$case_dir/times"
+  for (( index=1; index<=8; index++ )); do
+    printf '%s\n%s\n' "$((1000 + index))" "$((1000 + index))" \
+      >>"$case_dir/times"
+  done
+  output=$(bash "$helper" "$BENCHMARK_SCRIPT" "$case_dir" 2>&1)
+  assert_contains 'Completed test 8; waiting 120s for the next stage.' "$output" \
+    'complete multi-stage benchmark keeps restarting one-shot listener'
+  assert_contains 'idle timeout after the last test (120s, 8 completed)' "$output" \
+    'server reports last-test idle timeout explicitly'
+  assert_equal '9' "$(wc -l <"$case_dir/waits" | tr -d ' ')" \
+    'eight sessions plus final idle watchdog are supervised'
+
+  case_dir="$TEST_TEMP_DIR/server-gap"
+  mkdir -p "$case_dir"
+  printf '0\n0\n124\n' >"$case_dir/statuses"
+  printf '1000\n1000\n1002\n1027\n1029\n1029\n' >"$case_dir/times"
+  output=$(bash "$helper" "$BENCHMARK_SCRIPT" "$case_dir" 2>&1)
+  assert_equal $'600\n95\n120' "$(cat "$case_dir/waits")" \
+    '25-second inter-test gap remains inside the 120-second watchdog'
+  assert_contains 'Completed test 2' "$output" \
+    'server remains available after a 25-second logical gap'
+
+  case_dir="$TEST_TEMP_DIR/server-recoverable-error"
+  mkdir -p "$case_dir"
+  printf '0\n1\n0\n124\n' >"$case_dir/statuses"
+  printf '1000\n1000\n1001\n1002\n1003\n1004\n1004\n' >"$case_dir/times"
+  output=$(bash "$helper" "$BENCHMARK_SCRIPT" "$case_dir" 2>&1)
+  assert_contains 'retrying listener (1/3)' "$output" \
+    'one failed iperf3 session is recoverable'
+  assert_contains 'Completed test 2' "$output" \
+    'successful session after an error resets the error counter'
+  assert_not_contains 'unrecoverable iperf3 server failure' "$output" \
+    'single session error does not terminate supervisor'
+
+  case_dir="$TEST_TEMP_DIR/server-unrecoverable-error"
+  mkdir -p "$case_dir"
+  printf '1\n1\n1\n' >"$case_dir/statuses"
+  printf '1000\n1000\n1001\n1002\n' >"$case_dir/times"
+  set +e
+  output=$(bash "$helper" "$BENCHMARK_SCRIPT" "$case_dir" 2>&1)
+  status=$?
+  set -e
+  assert_equal '1' "$status" 'three consecutive server errors are fatal'
+  assert_contains 'unrecoverable iperf3 server failure after 3 consecutive error(s)' \
+    "$output" 'unrecoverable server failure has a distinct exit reason'
 }
 
 test_listener_cleanup_traps() {
@@ -1787,6 +1931,8 @@ test_repository_invariants() {
   assert_contains "'B_TO_A'" "$content" 'reverse direction'
   assert_contains 'trap signal_exit INT TERM HUP' "$content" \
     'listener cleanup signal traps'
+  assert_contains 'Server stopped: manual signal' "$content" \
+    'server reports manual signal as a distinct exit reason'
   assert_contains "PLATFORM_FAMILY='debian'" "$content" \
     'Debian platform family is explicit'
   assert_contains "PLATFORM_FAMILY='alpine'" "$content" \
@@ -1820,6 +1966,7 @@ test_adaptive_healthy_early_stop
 test_udp_degradation_early_stop
 test_independent_adaptive_stop_diagnostics
 test_failure_control_flow_and_evaluability
+test_server_disappearance_classification
 test_failure_reason_and_reservation_lifecycle
 test_scores_and_recommendation
 test_preferred_transport_model
@@ -1828,6 +1975,7 @@ test_directional_asymmetry_regressions
 test_firewall_cleanup_exactness
 test_firewall_server_semantics
 test_platform_and_dependency_bootstrap
+test_server_supervisor_lifecycle
 test_listener_cleanup_traps
 test_baseline_save_and_compare
 test_history_persistence_and_schema
