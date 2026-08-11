@@ -269,7 +269,7 @@ has_gnu_sed() {
   local version
 
   command_exists sed || return 1
-  version=$(sed --version 2>/dev/null | head -n 1) || return 1
+  version=$(sed --version 2>/dev/null) || return 1
   [[ "$version" == 'sed (GNU sed) '* ]]
 }
 
@@ -281,16 +281,27 @@ has_coreutils_date() {
 }
 
 has_coreutils_timeout() {
-  command_exists timeout &&
-    timeout --version 2>/dev/null | grep -q 'GNU coreutils'
+  local version
+
+  command_exists timeout || return 1
+  version=$(timeout --version 2>/dev/null) || return 1
+  [[ "$version" == *'GNU coreutils'* ]]
 }
 
 has_coreutils_sort() {
-  command_exists sort && sort --version 2>/dev/null | grep -q 'GNU coreutils'
+  local version
+
+  command_exists sort || return 1
+  version=$(sort --version 2>/dev/null) || return 1
+  [[ "$version" == *'GNU coreutils'* ]]
 }
 
 has_iputils_ping() {
-  command_exists ping && ping -V 2>&1 | grep -qi 'iputils'
+  local version
+
+  command_exists ping || return 1
+  version=$(ping -V 2>&1) || return 1
+  [[ "${version,,}" == *iputils* ]]
 }
 
 collect_missing_dependencies() {

@@ -938,6 +938,30 @@ test_platform_and_dependency_bootstrap() {
     if has_gnu_sed; then printf true; else printf false; fi
   )
   assert_equal 'true' "$output" 'GNU sed capability is accepted'
+  output=$(
+    command_exists() { return 0; }
+    timeout() { printf 'timeout (GNU coreutils) 9.11\nadditional text\n'; }
+    if has_coreutils_timeout; then printf true; else printf false; fi
+  )
+  assert_equal 'true' "$output" 'GNU timeout capability is accepted'
+  output=$(
+    command_exists() { return 0; }
+    timeout() { printf 'BusyBox timeout\n'; }
+    if has_coreutils_timeout; then printf true; else printf false; fi
+  )
+  assert_equal 'false' "$output" 'BusyBox timeout is rejected'
+  output=$(
+    command_exists() { return 0; }
+    sort() { printf 'sort (GNU coreutils) 9.11\nadditional text\n'; }
+    if has_coreutils_sort; then printf true; else printf false; fi
+  )
+  assert_equal 'true' "$output" 'GNU sort capability is accepted'
+  output=$(
+    command_exists() { return 0; }
+    ping() { printf 'ping from iputils 20250605\n'; }
+    if has_iputils_ping; then printf true; else printf false; fi
+  )
+  assert_equal 'true' "$output" 'iputils ping capability is accepted'
 
   for specification in 'debian 12 debian' 'debian 13 debian' \
     'alpine 3.21 alpine' 'alpine 3.22 alpine' 'alpine 3.23 alpine' \
