@@ -9,7 +9,7 @@ readonly DOMAIN_HARD_TIMEOUT=90
 readonly DOMAIN_TERMINATE_GRACE=2
 readonly DNS_TIMEOUT=6
 readonly TCP_TIMEOUT=6
-readonly TLS_TIMEOUT=10
+readonly TLS_TIMEOUT=4
 readonly HTTP_TIMEOUT=10
 readonly HTTP_USER_AGENT='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0 Safari/537.36'
 
@@ -47,6 +47,9 @@ CDN_DETAIL=''
 CERTIFICATE_EXPIRY_STATUS='PASS'
 CERTIFICATE_DAYS='-'
 CERTIFICATE_WARNING=''
+HTML_LOG_PATH=''
+HTML_ESCAPED_VALUE=''
+HTML_CSS_CLASS=''
 BORDER_HORIZONTAL='-'
 BORDER_VERTICAL='|'
 BORDER_TOP_LEFT='+'
@@ -354,6 +357,15 @@ classify_http_result() {
       HTTP_RESULT_REASON="HTTP $status"
       ;;
   esac
+}
+
+curl_failure_is_deterministic() {
+  case ${1:-} in
+    1|2|3|4|35|51|58|59|60|77|90|91)
+      return 0
+      ;;
+  esac
+  return 1
 }
 
 append_reason() {
@@ -778,8 +790,13 @@ check_domain() {
   local http_code=''
   local location=''
   local http_5xx_count=0
-  local curl_command_ok=false
+  local http_command_ok=false
+  local http_command_status=0
+  local http_check_attempted=false
+  local ready_command_status=0
+  local ready_check_attempted=false
   local tls_command_ok=false
+  local tls_handshake_available=false
   local x25519_command_ok=false
   local openssl_target=''
   local curl_resolve=''
@@ -796,6 +813,9 @@ check_domain() {
   local expiry_epoch=''
   local current_epoch=''
   local -a ready_samples=()
+  local -a curl_common_args=()
+  local -a curl_address_family=()
+  local ready_output_file
   local dns_a_file="$TEMP_DIR/dns-a-$index"
   local dns_aaaa_file="$TEMP_DIR/dns-aaaa-$index"
   local dns_cname_file="$TEMP_DIR/dns-cname-$index"
@@ -839,106 +859,158 @@ check_domain() {
     append_reason 'DNS 无法解析'
   fi
 
+  reset_http_retry_state
   if [[ "$dns_status" == 'PASS' ]]; then
-    openssl_target=$(openssl_target_for_ip "$ip")
-    curl_resolve=$(curl_resolve_for_ip "$domain" "$ip")
-
     if run_network_command "$tcp_file" "$TCP_TIMEOUT" \
       bash -c "exec 3<>\"/dev/tcp/\$1/443\"; exec 3<&-; exec 3>&-" \
         bash "$ip"; then
       tcp_status='PASS'
     fi
 
-    if run_network_command "$tls_file" "$TLS_TIMEOUT" \
-      openssl s_client -connect "$openssl_target" -servername "$domain" \
-        -tls1_3 -alpn h2 -verify_hostname "$domain" -verify_return_error \
-        -showcerts; then
-      tls_command_ok=true
-    fi
-    if run_network_command "$x25519_file" "$TLS_TIMEOUT" \
-      openssl s_client -connect "$openssl_target" -servername "$domain" \
-        -tls1_3 -groups X25519; then
-      x25519_command_ok=true
-    fi
-
-    reset_http_retry_state
-    acquire_ready_sample_lock
-    for attempt in 1 2 3; do
-      attempt_request_ok=false
-      attempt_http_code=''
-      attempt_http_status='-'
-      attempt_location=''
-      attempt_time_connect=''
-      attempt_time_appconnect=''
-      curl_command_ok=false
-      http_output_file="$TEMP_DIR/http-output-$index-$attempt"
-      http_header_file="$TEMP_DIR/http-header-$index-$attempt"
-      if run_network_command "$http_output_file" "$HTTP_TIMEOUT" \
-        curl --silent --show-error --output /dev/null \
-          --dump-header "$http_header_file" \
-          --write-out 'DOMAIN_CHECK_METRICS\t%{http_code}\t%{time_connect}\t%{time_appconnect}\n' \
-          --connect-timeout 5 --max-time 9 --no-keepalive \
-          --header 'Connection: close' --noproxy '*' --proto '=https' \
-          --tlsv1.3 --tls-max 1.3 --resolve "$curl_resolve" \
-          --user-agent "$HTTP_USER_AGENT" "https://$domain/"; then
-        curl_command_ok=true
-      fi
-
-      attempt_http_code=$(extract_http_code "$http_output_file")
-      attempt_time_connect=$(extract_curl_metric "$http_output_file" 3)
-      attempt_time_appconnect=$(extract_curl_metric "$http_output_file" 4)
-      if positive_seconds "$attempt_time_connect"; then
-        tcp_status='PASS'
-      fi
-      if positive_seconds "$attempt_time_appconnect" &&
-        attempt_ready_ms=$(seconds_to_milliseconds \
-          "$attempt_time_appconnect"); then
-        ready_samples+=("$attempt_ready_ms")
-      fi
-      if [[ "$curl_command_ok" == true &&
-        "$attempt_http_code" =~ ^[0-9]{3}$ &&
-        "$attempt_http_code" != '000' ]]; then
-        attempt_request_ok=true
-        tcp_status='PASS'
-        attempt_http_status=$attempt_http_code
-        attempt_location=$(extract_location "$http_header_file")
-      fi
-      record_http_attempt "$attempt" "$attempt_request_ok" \
-        "$attempt_http_status" "$attempt_location" "$http_header_file"
-    done
-    release_ready_sample_lock
-
-    if [[ "$tls_command_ok" == true ]] &&
-      tls13_evidence_present "$tls_file"; then
-      tls_status='PASS'
-      tcp_status='PASS'
-    fi
-    if [[ "$tls_command_ok" == true ]] &&
-      h2_evidence_present "$tls_file"; then
-      h2_status='PASS'
-    fi
-    if [[ "$x25519_command_ok" == true ]] &&
-      x25519_evidence_present "$x25519_file"; then
-      x25519_status='PASS'
-      tcp_status='PASS'
-    fi
-    if [[ "$tls_command_ok" == true ]] &&
-      certificate_verified_evidence_present "$tls_file"; then
-      certificate_status='PASS'
-      if extract_leaf_certificate "$tls_file" "$leaf_certificate_file" &&
-        certificate_enddate=$(openssl x509 -noout -enddate \
-          -in "$leaf_certificate_file" 2>/dev/null) &&
-        [[ "$certificate_enddate" == notAfter=* ]] &&
-        expiry_epoch=$(date -u -d "${certificate_enddate#notAfter=}" +%s \
-          2>/dev/null) &&
-        current_epoch=$(date -u +%s); then
-        evaluate_certificate_expiry "$expiry_epoch" "$current_epoch"
+    if [[ "$tcp_status" == 'PASS' ]]; then
+      openssl_target=$(openssl_target_for_ip "$ip")
+      curl_resolve=$(curl_resolve_for_ip "$domain" "$ip")
+      if [[ "$ip" == *:* ]]; then
+        curl_address_family=(--ipv6)
       else
-        evaluate_certificate_expiry
+        curl_address_family=(--ipv4)
       fi
-      certificate_status=$CERTIFICATE_EXPIRY_STATUS
-      certificate_days=$CERTIFICATE_DAYS
-      certificate_warning=$CERTIFICATE_WARNING
+      curl_common_args=(
+        "${curl_address_family[@]}"
+        --silent --show-error --output /dev/null
+        --connect-timeout 5 --max-time 9 --no-keepalive
+        --header 'Connection: close' --noproxy '*' --proto '=https'
+        --tlsv1.3 --tls-max 1.3 --resolve "$curl_resolve"
+        --user-agent "$HTTP_USER_AGENT" "https://$domain/"
+      )
+
+      if run_network_command "$tls_file" "$TLS_TIMEOUT" \
+        openssl s_client -connect "$openssl_target" -servername "$domain" \
+          -tls1_3 -alpn h2 -verify_hostname "$domain" -verify_return_error \
+          -showcerts; then
+        tls_command_ok=true
+      fi
+
+      if tls13_evidence_present "$tls_file"; then
+        tls_handshake_available=true
+        tcp_status='PASS'
+      fi
+      if [[ "$tls_command_ok" == true &&
+        "$tls_handshake_available" == true ]]; then
+        tls_status='PASS'
+        tcp_status='PASS'
+      fi
+      if [[ "$tls_command_ok" == true ]] &&
+        h2_evidence_present "$tls_file"; then
+        h2_status='PASS'
+      fi
+      if [[ "$tls_command_ok" == true ]] &&
+        certificate_verified_evidence_present "$tls_file"; then
+        certificate_status='PASS'
+        if extract_leaf_certificate "$tls_file" "$leaf_certificate_file" &&
+          certificate_enddate=$(openssl x509 -noout -enddate \
+            -in "$leaf_certificate_file" 2>/dev/null) &&
+          [[ "$certificate_enddate" == notAfter=* ]] &&
+          expiry_epoch=$(date -u -d "${certificate_enddate#notAfter=}" +%s \
+            2>/dev/null) &&
+          current_epoch=$(date -u +%s); then
+          evaluate_certificate_expiry "$expiry_epoch" "$current_epoch"
+        else
+          evaluate_certificate_expiry
+        fi
+        certificate_status=$CERTIFICATE_EXPIRY_STATUS
+        certificate_days=$CERTIFICATE_DAYS
+        certificate_warning=$CERTIFICATE_WARNING
+      fi
+
+      if [[ "$tls_handshake_available" == true ]]; then
+        if run_network_command "$x25519_file" "$TLS_TIMEOUT" \
+          openssl s_client -connect "$openssl_target" -servername "$domain" \
+            -tls1_3 -groups X25519; then
+          x25519_command_ok=true
+        fi
+        if [[ "$x25519_command_ok" == true ]] &&
+          x25519_evidence_present "$x25519_file"; then
+          x25519_status='PASS'
+          tcp_status='PASS'
+        fi
+
+        # READY deliberately skips CA verification for timing purposes.
+        # Certificate trust, hostname, and expiry are validated separately by
+        # the strict OpenSSL check above. Acquire the global lock per sample so
+        # a failing target cannot monopolize it across three timeouts.
+        ready_check_attempted=true
+        for attempt in 1 2 3; do
+          attempt_time_appconnect=''
+          ready_command_status=0
+          ready_output_file="$TEMP_DIR/ready-output-$index-$attempt"
+          acquire_ready_sample_lock
+          if run_network_command "$ready_output_file" "$HTTP_TIMEOUT" \
+            curl --insecure \
+              --write-out 'DOMAIN_CHECK_METRICS\t%{http_code}\t%{time_connect}\t%{time_appconnect}\n' \
+              "${curl_common_args[@]}"; then
+            ready_command_status=0
+          else
+            ready_command_status=$?
+          fi
+          release_ready_sample_lock
+          attempt_time_appconnect=$(extract_curl_metric \
+            "$ready_output_file" 4)
+          if positive_seconds "$attempt_time_appconnect" &&
+            attempt_ready_ms=$(seconds_to_milliseconds \
+              "$attempt_time_appconnect"); then
+            ready_samples+=("$attempt_ready_ms")
+            tcp_status='PASS'
+          elif curl_failure_is_deterministic "$ready_command_status"; then
+            break
+          fi
+        done
+
+        # HTTP checks use strict certificate verification. Retry transport
+        # failures that may be transient and retain the existing 5xx policy,
+        # but stop immediately for deterministic curl/TLS configuration errors.
+        http_check_attempted=true
+        for attempt in 1 2 3; do
+          attempt_request_ok=false
+          attempt_http_code=''
+          attempt_http_status='-'
+          attempt_location=''
+          attempt_time_connect=''
+          http_command_ok=false
+          http_command_status=0
+          http_output_file="$TEMP_DIR/http-output-$index-$attempt"
+          http_header_file="$TEMP_DIR/http-header-$index-$attempt"
+          if run_network_command "$http_output_file" "$HTTP_TIMEOUT" \
+            curl --dump-header "$http_header_file" \
+              --write-out 'DOMAIN_CHECK_METRICS\t%{http_code}\t%{time_connect}\t%{time_appconnect}\n' \
+              "${curl_common_args[@]}"; then
+            http_command_ok=true
+          else
+            http_command_status=$?
+          fi
+
+          attempt_http_code=$(extract_http_code "$http_output_file")
+          attempt_time_connect=$(extract_curl_metric "$http_output_file" 3)
+          if positive_seconds "$attempt_time_connect"; then
+            tcp_status='PASS'
+          fi
+          if [[ "$http_command_ok" == true &&
+            "$attempt_http_code" =~ ^[0-9]{3}$ &&
+            "$attempt_http_code" != '000' ]]; then
+            attempt_request_ok=true
+            tcp_status='PASS'
+            attempt_http_status=$attempt_http_code
+            attempt_location=$(extract_location "$http_header_file")
+          fi
+          record_http_attempt "$attempt" "$attempt_request_ok" \
+            "$attempt_http_status" "$attempt_location" "$http_header_file"
+          if [[ "$HTTP_FINALIZED" == true ]] ||
+            curl_failure_is_deterministic "$http_command_status"; then
+            HTTP_FINALIZED=true
+            break
+          fi
+        done
+      fi
     fi
 
     aggregate_ready_samples "${ready_samples[@]}"
@@ -949,7 +1021,6 @@ check_domain() {
     cdn_status=$CDN_STATUS
     cdn_detail=$CDN_DETAIL
   else
-    reset_http_retry_state
     aggregate_ready_samples
   fi
 
@@ -992,12 +1063,15 @@ check_domain() {
     [[ "$final_status" == 'FAIL' ]] || final_status='WARN'
   fi
 
-  classify_http_result "$http_request_ok" "$http_status" "$http_5xx_count"
-  if [[ "$HTTP_RESULT_STATUS" == 'WARN' ]]; then
-    append_reason "$HTTP_RESULT_REASON"
-    [[ "$final_status" == 'FAIL' ]] || final_status='WARN'
+  if [[ "$http_check_attempted" == true ]]; then
+    classify_http_result "$http_request_ok" "$http_status" "$http_5xx_count"
+    if [[ "$HTTP_RESULT_STATUS" == 'WARN' ]]; then
+      append_reason "$HTTP_RESULT_REASON"
+      [[ "$final_status" == 'FAIL' ]] || final_status='WARN'
+    fi
   fi
-  if (( ready_sample_count < 3 )); then
+  if [[ "$ready_check_attempted" == true ]] &&
+    (( ready_sample_count < 3 )); then
     append_reason "连接就绪计时样本不足（${ready_sample_count}/3）"
     [[ "$final_status" == 'FAIL' ]] || final_status='WARN'
   fi
@@ -1642,6 +1716,273 @@ print_results() {
   print_table
 }
 
+set_html_escaped_value() {
+  local value=$1
+  local character
+  local escaped=''
+  local position
+
+  for (( position = 0; position < ${#value}; position += 1 )); do
+    character=${value:position:1}
+    case "$character" in
+      '&') escaped+='&amp;' ;;
+      '<') escaped+='&lt;' ;;
+      '>') escaped+='&gt;' ;;
+      '"') escaped+='&quot;' ;;
+      "'") escaped+='&#39;' ;;
+      *) escaped+=$character ;;
+    esac
+  done
+  HTML_ESCAPED_VALUE=$escaped
+}
+
+escape_html() {
+  set_html_escaped_value "$1"
+  printf '%s' "$HTML_ESCAPED_VALUE"
+}
+
+set_status_css_class() {
+  case ${1:-} in
+    PASS) HTML_CSS_CLASS='status status-pass' ;;
+    WARN) HTML_CSS_CLASS='status status-warn' ;;
+    FAIL) HTML_CSS_CLASS='status status-fail' ;;
+    HIGH) HTML_CSS_CLASS='status status-high' ;;
+    -|'') HTML_CSS_CLASS='muted' ;;
+    *) HTML_CSS_CLASS='value' ;;
+  esac
+}
+
+set_http_css_class() {
+  case ${1:-} in
+    2??) HTML_CSS_CLASS='http http-2xx' ;;
+    3??) HTML_CSS_CLASS='http http-3xx' ;;
+    4??) HTML_CSS_CLASS='http http-4xx' ;;
+    5??) HTML_CSS_CLASS='http http-5xx' ;;
+    -|'') HTML_CSS_CLASS='muted' ;;
+    *) HTML_CSS_CLASS='http' ;;
+  esac
+}
+
+set_detail_css_class() {
+  local final_status=$1
+  local reason=$2
+
+  if [[ "$reason" == CDN\ * ]]; then
+    HTML_CSS_CLASS='detail-info'
+  elif [[ "$final_status" == 'FAIL' ]]; then
+    HTML_CSS_CLASS='detail-fail'
+  elif [[ "$final_status" == 'WARN' ]]; then
+    HTML_CSS_CLASS='detail-warn'
+  else
+    HTML_CSS_CLASS='detail-info'
+  fi
+}
+
+render_html_report() {
+  local generated_at=$1
+  local index
+  local domain
+  local ip
+  local tls_status
+  local x25519_status
+  local h2_status
+  local ready_ms
+  local certificate_days
+  local cdn_status
+  local http_status
+  local redirect_code
+  local final_status
+  local reasons
+  local reason_part
+  local input_targets=''
+  local pass_count=0
+  local warn_count=0
+  local fail_count=0
+  local domain_class
+  local ip_class
+  local tls_class
+  local x25519_class
+  local h2_class
+  local ready_class
+  local certificate_class
+  local cdn_class
+  local http_class
+  local redirect_class
+  local result_class
+  local detail_class
+  local -a reason_parts=()
+
+  for index in "${!DOMAIN_INPUTS[@]}"; do
+    IFS=$'\t' read -r domain _ _ _ _ _ _ _ _ _ final_status _ \
+      <"$TEMP_DIR/result-$index"
+    [[ -z "$input_targets" ]] || input_targets+='/'
+    input_targets+=$domain
+    case "$final_status" in
+      PASS) (( pass_count += 1 )) ;;
+      WARN) (( warn_count += 1 )) ;;
+      FAIL) (( fail_count += 1 )) ;;
+    esac
+  done
+  set_html_escaped_value "$generated_at"
+  generated_at=$HTML_ESCAPED_VALUE
+  set_html_escaped_value "$input_targets"
+  input_targets=$HTML_ESCAPED_VALUE
+
+  printf '%s\n' \
+    '<!doctype html>' \
+    '<html lang="en">' \
+    '<head>' \
+    '<meta charset="utf-8">' \
+    '<meta name="viewport" content="width=device-width, initial-scale=1">' \
+    '<title>Domain Check Report</title>' \
+    '<style>' \
+    ':root{color-scheme:dark light;--bg:#0b0f14;--panel:#111820;--text:#d7e0e8;--muted:#74808b;--border:#33404c;--head:#17212b;--domain:#54d6e8;--ip:#e08cff;--pass:#53d769;--warn:#f6bd4b;--fail:#ff626e;--high:#4fc3f7;--ready:#8bd5ff;--row:#0e151c}' \
+    '*{box-sizing:border-box}' \
+    'body{margin:0;background:var(--bg);color:var(--text);font-family:ui-monospace,SFMono-Regular,Consolas,"Liberation Mono",monospace;font-size:13px;line-height:1.35}' \
+    'main{max-width:1600px;margin:0 auto;padding:18px}' \
+    'h1{margin:0 0 10px;font-size:21px;color:var(--domain)}' \
+    '.meta{display:grid;grid-template-columns:max-content 1fr;gap:3px 10px;margin-bottom:10px}.meta dt{color:var(--muted)}.meta dd{margin:0;overflow-wrap:anywhere}' \
+    '.summary{display:flex;flex-wrap:wrap;gap:6px;margin:8px 0 12px}.summary-item{border:1px solid var(--border);background:var(--panel);padding:3px 8px;border-radius:4px}.summary-item strong{margin-left:6px}' \
+    '.table-wrap{overflow-x:auto;border:1px solid var(--border)}' \
+    'table{width:100%;border-collapse:collapse;white-space:nowrap;background:var(--panel)}' \
+    'th,td{border-right:1px solid var(--border);border-bottom:1px solid var(--border);padding:4px 7px;text-align:left}th:last-child,td:last-child{border-right:0}tbody tr:last-child td{border-bottom:0}' \
+    'th{background:var(--head);color:var(--text);font-weight:700}tbody tr:nth-child(even){background:var(--row)}' \
+    '.domain{color:var(--domain)}.ip{color:var(--ip)}.muted{color:var(--muted)}.ready{color:var(--ready)}' \
+    '.status,.result,.http{font-weight:700}.status-pass,.http-2xx{color:var(--pass)}.status-warn,.http-4xx{color:var(--warn)}.status-fail,.http-5xx{color:var(--fail)}.status-high,.http-3xx{color:var(--high)}' \
+    '.result{font-weight:800;text-shadow:0 0 8px color-mix(in srgb,currentColor 30%,transparent)}' \
+    '.details{margin-top:14px}.details h2{font-size:16px;margin:0 0 7px}.detail-card{border-left:3px solid var(--border);background:var(--panel);padding:6px 9px;margin:0 0 6px}.detail-card h3{font-size:13px;color:var(--domain);margin:0 0 3px}.detail-card ul{margin:0;padding-left:18px}.detail-card li{margin:1px 0}.detail-fail{color:var(--fail)}.detail-warn{color:var(--warn)}.detail-info{color:var(--high)}' \
+    '@media (prefers-color-scheme:dark){:root{color-scheme:dark}}' \
+    '@media (prefers-color-scheme:light){:root{--bg:#f6f8fa;--panel:#fff;--text:#20262d;--muted:#69737d;--border:#b8c1ca;--head:#e8edf2;--domain:#007c91;--ip:#a11bb8;--pass:#187c2f;--warn:#a96100;--fail:#c51f32;--high:#006ea6;--ready:#006b9e;--row:#f3f6f8}}' \
+    '</style>' \
+    '</head>' \
+    '<body>' \
+    '<main>' \
+    '<h1>Domain Check Report</h1>'
+  printf '<dl class="meta"><dt>Time</dt><dd>%s</dd><dt>Input</dt><dd>%s</dd></dl>\n' \
+    "$generated_at" "$input_targets"
+  printf '<div class="summary"><span class="summary-item"><span>Targets</span><strong>%d</strong></span>' \
+    "${#DOMAIN_INPUTS[@]}"
+  printf '<span class="summary-item status-pass"><span>PASS</span><strong>%d</strong></span>' "$pass_count"
+  printf '<span class="summary-item status-warn"><span>WARN</span><strong>%d</strong></span>' "$warn_count"
+  printf '<span class="summary-item status-fail"><span>FAIL</span><strong>%d</strong></span></div>\n' "$fail_count"
+  printf '%s\n' \
+    '<div class="table-wrap"><table>' \
+    '<thead><tr><th>DOMAIN</th><th>IP</th><th>TLS1.3</th><th>X25519</th><th>H2</th><th>READY(ms)</th><th>CERT(d)</th><th>CDN</th><th>HTTP</th><th>REDIRECT</th><th>RESULT</th></tr></thead>' \
+    '<tbody>'
+
+  for index in "${!DOMAIN_INPUTS[@]}"; do
+    IFS=$'\t' read -r domain ip tls_status x25519_status h2_status \
+      ready_ms certificate_days cdn_status http_status redirect_code \
+      final_status reasons <"$TEMP_DIR/result-$index"
+    set_html_escaped_value "$domain"; domain=$HTML_ESCAPED_VALUE
+    set_html_escaped_value "$ip"; ip=$HTML_ESCAPED_VALUE
+    set_html_escaped_value "$tls_status"; tls_status=$HTML_ESCAPED_VALUE
+    set_html_escaped_value "$x25519_status"; x25519_status=$HTML_ESCAPED_VALUE
+    set_html_escaped_value "$h2_status"; h2_status=$HTML_ESCAPED_VALUE
+    set_html_escaped_value "$ready_ms"; ready_ms=$HTML_ESCAPED_VALUE
+    set_html_escaped_value "$certificate_days"; certificate_days=$HTML_ESCAPED_VALUE
+    set_html_escaped_value "$cdn_status"; cdn_status=$HTML_ESCAPED_VALUE
+    set_html_escaped_value "$http_status"; http_status=$HTML_ESCAPED_VALUE
+    set_html_escaped_value "$redirect_code"; redirect_code=$HTML_ESCAPED_VALUE
+    set_html_escaped_value "$final_status"; final_status=$HTML_ESCAPED_VALUE
+    domain_class='domain'
+    ip_class='ip'
+    set_status_css_class "$tls_status"; tls_class=$HTML_CSS_CLASS
+    set_status_css_class "$x25519_status"; x25519_class=$HTML_CSS_CLASS
+    set_status_css_class "$h2_status"; h2_class=$HTML_CSS_CLASS
+    [[ "$ready_ms" == '-' ]] && ready_class='muted' || ready_class='ready'
+    set_status_css_class "$certificate_days"; certificate_class=$HTML_CSS_CLASS
+    set_status_css_class "$cdn_status"; cdn_class=$HTML_CSS_CLASS
+    set_http_css_class "$http_status"; http_class=$HTML_CSS_CLASS
+    set_status_css_class "$redirect_code"; redirect_class=$HTML_CSS_CLASS
+    set_status_css_class "$final_status"; result_class="result ${HTML_CSS_CLASS#status }"
+    printf '<tr><td class="%s">%s</td><td class="%s">%s</td>' \
+      "$domain_class" "$domain" "$ip_class" "$ip"
+    printf '<td class="%s">%s</td><td class="%s">%s</td><td class="%s">%s</td>' \
+      "$tls_class" "$tls_status" "$x25519_class" "$x25519_status" \
+      "$h2_class" "$h2_status"
+    printf '<td class="%s">%s</td><td class="%s">%s</td><td class="%s">%s</td>' \
+      "$ready_class" "$ready_ms" "$certificate_class" "$certificate_days" \
+      "$cdn_class" "$cdn_status"
+    printf '<td class="%s">%s</td><td class="%s">%s</td><td class="%s">%s</td></tr>\n' \
+      "$http_class" "$http_status" "$redirect_class" "$redirect_code" \
+      "$result_class" "$final_status"
+  done
+
+  printf '%s\n' '</tbody></table></div>' '<section class="details"><h2>DETAILS</h2>'
+  if table_has_details; then
+    for index in "${!DOMAIN_INPUTS[@]}"; do
+      IFS=$'\t' read -r domain _ _ _ _ _ _ _ _ _ final_status reasons \
+        <"$TEMP_DIR/result-$index"
+      [[ "$reasons" != '-' ]] || continue
+      set_html_escaped_value "$domain"; domain=$HTML_ESCAPED_VALUE
+      printf '<article class="detail-card"><h3>%s</h3><ul>\n' "$domain"
+      IFS=';' read -r -a reason_parts <<<"$reasons"
+      for reason_part in "${reason_parts[@]}"; do
+        reason_part=${reason_part#"${reason_part%%[![:space:]]*}"}
+        set_detail_css_class "$final_status" "$reason_part"
+        detail_class=$HTML_CSS_CLASS
+        set_html_escaped_value "$reason_part"; reason_part=$HTML_ESCAPED_VALUE
+        printf '<li class="%s">%s</li>\n' "$detail_class" "$reason_part"
+      done
+      printf '%s\n' '</ul></article>'
+    done
+  else
+    printf '%s\n' '<p class="muted">None</p>'
+  fi
+  printf '%s\n' '</section>' '</main>' '</body>' '</html>'
+}
+
+write_html_log() {
+  local log_home=${HOME:-}
+  local log_dir
+  local log_timestamp
+  local generated_at
+  local reservation_attempt
+  local reserved=false
+
+  HTML_LOG_PATH=''
+  if [[ -z "$log_home" || "$log_home" != /* ]]; then
+    printf '%s: WARN: unable to create HTML log: HOME is not absolute.\n' \
+      "$PROGRAM_NAME" >&2
+    return 0
+  fi
+  log_dir="$log_home/domain-check-logs"
+  if ! mkdir -p -- "$log_dir"; then
+    printf '%s: WARN: unable to create HTML log directory: %s\n' \
+      "$PROGRAM_NAME" "$log_dir" >&2
+    return 0
+  fi
+
+  for reservation_attempt in 1 2 3; do
+    log_timestamp=$(date '+%Y%m%d-%H%M%S') || log_timestamp=''
+    if [[ "$log_timestamp" =~ ^[0-9]{8}-[0-9]{6}$ ]]; then
+      HTML_LOG_PATH="$log_dir/domain-check-$log_timestamp.html"
+      if (set -o noclobber; : >"$HTML_LOG_PATH") 2>/dev/null; then
+        reserved=true
+        break
+      fi
+    fi
+    (( reservation_attempt < 3 )) && sleep 1
+  done
+  if [[ "$reserved" != true ]]; then
+    HTML_LOG_PATH=''
+    printf '%s: WARN: unable to reserve a unique HTML log file in: %s\n' \
+      "$PROGRAM_NAME" "$log_dir" >&2
+    return 0
+  fi
+
+  generated_at=$(date -u '+%Y-%m-%d %H:%M:%S UTC') || generated_at='-'
+  if ! render_html_report "$generated_at" >"$HTML_LOG_PATH"; then
+    rm -f -- "$HTML_LOG_PATH"
+    printf '%s: WARN: unable to write HTML log: %s\n' \
+      "$PROGRAM_NAME" "$HTML_LOG_PATH" >&2
+    HTML_LOG_PATH=''
+    return 0
+  fi
+  printf 'HTML log: %s\n' "$HTML_LOG_PATH" >&2
+}
+
 main() {
   local index
   local final_exit_code=0
@@ -1692,6 +2033,7 @@ main() {
   if ! aggregate_exit_code "${RESULT_STATUSES[@]}"; then
     final_exit_code=1
   fi
+  write_html_log
   exit "$final_exit_code"
 }
 
