@@ -27,6 +27,7 @@ jobs:
             node-config-wizard.sh
             protocol-benchmark.sh
             scripts/update-smartdns.sh
+            scripts/domain-check-go-benchmark.sh
             request-cloudflare-certificate.sh
             tests/domain-check-test.sh
             tests/node-config-wizard-test.sh
@@ -45,6 +46,7 @@ jobs:
           for executable_script in \
             domain-check.sh \
             node-config-wizard.sh \
+            scripts/domain-check-go-benchmark.sh \
             scripts/update-smartdns.sh \
             tests/domain-check-test.sh \
             tests/node-config-wizard-test.sh \
@@ -156,6 +158,7 @@ jobs:
             node-config-wizard.sh \
             protocol-benchmark.sh \
             scripts/update-smartdns.sh \
+            scripts/domain-check-go-benchmark.sh \
             request-cloudflare-certificate.sh \
             tests/domain-check-test.sh \
             tests/node-config-wizard-test.sh \

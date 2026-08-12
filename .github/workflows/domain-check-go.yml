@@ -1,0 +1,29 @@
+name: Domain check Go
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.26.5'
+      - name: Format check
+        run: test -z "$(gofmt -l cmd internal)"
+      - name: Test
+        run: go test -race ./...
+      - name: Vet
+        run: go vet ./...
+      - name: Build static Linux binaries
+        run: |
+          mkdir -p dist
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags='-s -w' -o dist/domain-check-linux-amd64 ./cmd/domain-check
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -ldflags='-s -w' -o dist/domain-check-linux-arm64 ./cmd/domain-check
+          file dist/domain-check-linux-*
