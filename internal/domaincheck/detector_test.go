@@ -12,6 +12,7 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"io"
 	"math/big"
 	"net"
 	"net/http"
@@ -21,6 +22,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -155,6 +157,9 @@ func TestParseDomainsAndConcurrency(t *testing.T) {
 	defaultConfig, err := ConfigFromEnv(func(string) string { return "" })
 	if err != nil || defaultConfig.Concurrency != 8 {
 		t.Fatalf("default concurrency = %d, %v", defaultConfig.Concurrency, err)
+	}
+	if defaultConfig.ResponseHeaderTimeout != 2*time.Second || defaultConfig.HTTPTimeout != 2500*time.Millisecond {
+		t.Fatalf("unexpected HTTP budgets: headers=%v overall=%v", defaultConfig.ResponseHeaderTimeout, defaultConfig.HTTPTimeout)
 	}
 }
 
@@ -375,17 +380,118 @@ func TestWorkerPoolConcurrencyCap(t *testing.T) {
 	}
 }
 
-func TestHTTPTransportFailureHasTwoAttemptBudget(t *testing.T) {
-	cfg := DefaultConfig()
-	var attempts atomic.Int32
-	cfg.DialContext = func(context.Context, string, string) (net.Conn, error) {
-		attempts.Add(1)
-		return nil, errors.New("transport offline")
+func TestHTTPTransportFailuresStopAfterOneAttempt(t *testing.T) {
+	tests := []struct {
+		name string
+		dial func(context.Context, string, string) (net.Conn, error)
+	}{
+		{"immediate transport error", func(context.Context, string, string) (net.Conn, error) {
+			return nil, errors.New("transport offline")
+		}},
+		{"connection reset", func(context.Context, string, string) (net.Conn, error) {
+			return nil, syscall.ECONNRESET
+		}},
+		{"EOF before response", func(context.Context, string, string) (net.Conn, error) {
+			return nil, io.EOF
+		}},
+		{"context deadline", func(ctx context.Context, _, _ string) (net.Conn, error) {
+			<-ctx.Done()
+			return nil, ctx.Err()
+		}},
 	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			cfg := DefaultConfig()
+			cfg.HTTPTimeout = 25 * time.Millisecond
+			var attempts atomic.Int32
+			cfg.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
+				attempts.Add(1)
+				return test.dial(ctx, network, address)
+			}
+			detector, _ := New(cfg)
+			outcome := detector.probeHTTP(context.Background(), "http-fail.test", net.ParseIP("192.0.2.20"))
+			if outcome.OK || outcome.Attempts != 1 || attempts.Load() != 1 || classifyHTTP(outcome) != "HTTP 请求失败" {
+				t.Fatalf("transport failure was retried: %+v dials=%d", outcome, attempts.Load())
+			}
+		})
+	}
+}
+
+func TestHTTPResponseHeaderTimeoutStopsAfterOneAttempt(t *testing.T) {
+	const domain = "header-timeout.test"
+	var attempts atomic.Int32
+	server := startTLSServer(t, domain, []tls.CurveID{tls.X25519}, http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		attempts.Add(1)
+		time.Sleep(150 * time.Millisecond)
+		writer.WriteHeader(http.StatusOK)
+	}))
+	cfg := configForServer(server, &fakeResolver{})
+	cfg.ResponseHeaderTimeout = 30 * time.Millisecond
+	cfg.HTTPTimeout = 100 * time.Millisecond
 	detector, _ := New(cfg)
-	outcome := detector.probeHTTP(context.Background(), "http-fail.test", net.ParseIP("192.0.2.20"))
-	if outcome.OK || outcome.Attempts != 2 || attempts.Load() != 2 || classifyHTTP(outcome) != "HTTP 请求失败" {
-		t.Fatalf("unexpected transport retry budget: %+v dials=%d", outcome, attempts.Load())
+	started := time.Now()
+	outcome := detector.probeHTTP(context.Background(), domain, net.ParseIP("127.0.0.1"))
+	if elapsed := time.Since(started); elapsed > 120*time.Millisecond {
+		t.Fatalf("response-header timeout exceeded one attempt: %v", elapsed)
+	}
+	if outcome.OK || outcome.Attempts != 1 || attempts.Load() != 1 {
+		t.Fatalf("response-header timeout was retried: %+v handlers=%d", outcome, attempts.Load())
+	}
+}
+
+func TestHTTPRetriesOnlyReceived5xx(t *testing.T) {
+	for _, status := range []int{http.StatusInternalServerError, http.StatusBadGateway, http.StatusServiceUnavailable} {
+		t.Run(fmt.Sprintf("status_%d", status), func(t *testing.T) {
+			const domain = "retry.test"
+			var attempts atomic.Int32
+			server := startTLSServer(t, domain, []tls.CurveID{tls.X25519}, http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+				attempts.Add(1)
+				writer.WriteHeader(status)
+			}))
+			detector, _ := New(configForServer(server, &fakeResolver{}))
+			outcome := detector.probeHTTP(context.Background(), domain, net.ParseIP("127.0.0.1"))
+			if !outcome.OK || outcome.Code != status || outcome.Attempts != 2 || attempts.Load() != 2 {
+				t.Fatalf("5xx retry policy changed: %+v handlers=%d", outcome, attempts.Load())
+			}
+		})
+	}
+
+	for _, status := range []int{http.StatusOK, http.StatusFound, http.StatusForbidden, http.StatusNotFound} {
+		t.Run(fmt.Sprintf("status_%d", status), func(t *testing.T) {
+			const domain = "no-retry.test"
+			var attempts atomic.Int32
+			server := startTLSServer(t, domain, []tls.CurveID{tls.X25519}, http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+				attempts.Add(1)
+				writer.WriteHeader(status)
+			}))
+			detector, _ := New(configForServer(server, &fakeResolver{}))
+			outcome := detector.probeHTTP(context.Background(), domain, net.ParseIP("127.0.0.1"))
+			if !outcome.OK || outcome.Code != status || outcome.Attempts != 1 || attempts.Load() != 1 {
+				t.Fatalf("non-5xx response was retried: %+v handlers=%d", outcome, attempts.Load())
+			}
+		})
+	}
+}
+
+func TestHTTPTimeoutWarnPreservesCoreTLSResults(t *testing.T) {
+	const domain = "timeout-warn.test"
+	var attempts atomic.Int32
+	server := startTLSServer(t, domain, []tls.CurveID{tls.X25519}, http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		attempts.Add(1)
+		time.Sleep(150 * time.Millisecond)
+		writer.WriteHeader(http.StatusOK)
+	}))
+	resolver := &fakeResolver{ipv4: []net.IP{net.ParseIP("127.0.0.1")}}
+	cfg := configForServer(server, resolver)
+	cfg.ResponseHeaderTimeout = 30 * time.Millisecond
+	cfg.HTTPTimeout = 100 * time.Millisecond
+	detector, _ := New(cfg)
+	result := detector.Check(context.Background(), domain)
+	if result.Result != Warn || result.TLS13 != Pass || result.X25519 != Pass || result.H2 != Pass || result.CertDays == "FAIL" || result.HTTP != "-" {
+		t.Fatalf("HTTP timeout damaged core TLS result: %+v", result)
+	}
+	if attempts.Load() != 1 || !containsReason(result, "HTTP 请求失败") {
+		t.Fatalf("HTTP timeout retry/warning changed: handlers=%d reasons=%+v", attempts.Load(), result.Reasons)
 	}
 }
 

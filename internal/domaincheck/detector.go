@@ -336,7 +336,11 @@ func (d *Detector) probeHTTP(ctx context.Context, domain string, ip net.IP) http
 		}
 		transport.CloseIdleConnections()
 		cancel()
-		if err == nil && response.StatusCode < 500 {
+		// Transport failures have no HTTP response to classify and are not
+		// retried. HTTP is an auxiliary signal, so repeating the same connect or
+		// response-header timeout would only extend the batch tail. A received
+		// 5xx response may be transient and gets the one permitted retry.
+		if err != nil || response.StatusCode < 500 {
 			break
 		}
 	}
