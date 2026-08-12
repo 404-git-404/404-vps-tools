@@ -889,19 +889,28 @@ cat >"$MOCK_BIN/curl" <<'EOF'
 #!/usr/bin/env bash
 set -Eeuo pipefail
 global_counter_file="$MOCK_LOG_DIR/curl.count"
+global_counter_lock="$MOCK_LOG_DIR/curl-count-lock"
+while ! mkdir "$global_counter_lock" 2>/dev/null; do
+  sleep 0.01
+done
 global_counter=$(<"$global_counter_file")
 global_counter=$(( global_counter + 1 ))
 printf '%s\n' "$global_counter" >"$global_counter_file"
+rmdir "$global_counter_lock"
 printf '<%s>' "$@" >>"$MOCK_LOG_DIR/curl.log"
 printf '\n' >>"$MOCK_LOG_DIR/curl.log"
 
 header_file=''
 request_url=''
+insecure=false
 while (( $# > 0 )); do
   case "$1" in
     --dump-header)
       shift
       header_file=$1
+      ;;
+    --insecure|-k)
+      insecure=true
       ;;
     https://*)
       request_url=$1
@@ -913,7 +922,11 @@ done
 request_domain=${request_url#https://}
 request_domain=${request_domain%/}
 safe_domain=${request_domain//[^a-zA-Z0-9]/_}
-counter_file="$MOCK_LOG_DIR/curl-domain-$safe_domain.count"
+if [[ "$insecure" == true ]]; then
+  counter_file="$MOCK_LOG_DIR/curl-ready-domain-$safe_domain.count"
+else
+  counter_file="$MOCK_LOG_DIR/curl-http-domain-$safe_domain.count"
+fi
 counter=0
 [[ ! -r "$counter_file" ]] || counter=$(<"$counter_file")
 counter=$(( counter + 1 ))
@@ -930,13 +943,15 @@ appconnect_time=${appconnect_times[counter - 1]:-0}
 exit_code=${exit_codes[counter - 1]:-0}
 location=${locations[counter - 1]:-}
 
-: >"$header_file"
-printf 'HTTP/1.1 %s Mock\r\n' "$code" >>"$header_file"
-[[ -z "$location" ]] ||
-  printf 'Location: %s\r\n' "$location" >>"$header_file"
-[[ -z ${MOCK_RESPONSE_HEADER:-} ]] ||
-  printf '%b\r\n' "$MOCK_RESPONSE_HEADER" >>"$header_file"
-printf '\r\n' >>"$header_file"
+if [[ -n "$header_file" ]]; then
+  : >"$header_file"
+  printf 'HTTP/1.1 %s Mock\r\n' "$code" >>"$header_file"
+  [[ -z "$location" ]] ||
+    printf 'Location: %s\r\n' "$location" >>"$header_file"
+  [[ -z ${MOCK_RESPONSE_HEADER:-} ]] ||
+    printf '%b\r\n' "$MOCK_RESPONSE_HEADER" >>"$header_file"
+  printf '\r\n' >>"$header_file"
+fi
 printf 'DOMAIN_CHECK_METRICS\t%s\t%s\t%s\n' \
   "$code" "$connect_time" "$appconnect_time"
 exit "$exit_code"
@@ -1010,7 +1025,7 @@ run_mocked_domain_check() {
 
   mkdir -p "$TEST_TEMP_DIR/worker-tmp"
   printf '0\n' >"$MOCK_LOG_DIR/curl.count"
-  rm -f -- "$MOCK_LOG_DIR"/curl-domain-*.count
+  rm -f -- "$MOCK_LOG_DIR"/curl-*-domain-*.count
   : >"$MOCK_LOG_DIR/curl.log"
   : >"$MOCK_LOG_DIR/openssl.log"
   : >"$MOCK_LOG_DIR/timeout.log"
@@ -1052,8 +1067,8 @@ run_mocked_domain_check \
   '0.100|0.200|0.050'
 assert_equal '0' "$MOCK_RUN_STATUS" \
   'successful OpenSSL commands with complete parsed evidence pass'
-assert_equal '3' "$(<"$MOCK_LOG_DIR/curl.count")" \
-  'worker always completes exactly three curl connections'
+assert_equal '5' "$(<"$MOCK_LOG_DIR/curl.count")" \
+  'worker uses three READY connections and two strict HTTP attempts'
 assert_contains 'READY(ms)' "$MOCK_RUN_OUTPUT" \
   'high-fidelity worker output uses the connection-ready header'
 assert_not_contains 'HS(ms)' "$MOCK_RUN_OUTPUT" \
@@ -1083,16 +1098,29 @@ assert_not_contains 'TCP 443 不可达' "$MOCK_RUN_OUTPUT" \
 
 openssl_log=$(<"$MOCK_LOG_DIR/openssl.log")
 timeout_log=$(<"$MOCK_LOG_DIR/timeout.log")
-assert_equal '3' \
+assert_equal '5' \
   "$(grep -Fc '<--resolve><example.com:443:203.0.113.10>' \
     "$MOCK_LOG_DIR/curl.log")" \
-  'all curl samples pin the same preferred IPv4 address'
-assert_equal '3' \
+  'all curl requests pin the same preferred IPv4 address'
+assert_equal '5' \
   "$(grep -Fc '<--noproxy><*>' "$MOCK_LOG_DIR/curl.log")" \
-  'all curl samples bypass environment proxies'
-assert_equal '3' \
+  'all curl requests bypass environment proxies'
+assert_equal '5' \
   "$(grep -Fc '<https://example.com/>' "$MOCK_LOG_DIR/curl.log")" \
-  'all curl samples preserve the original URL and Host'
+  'all curl requests preserve the original URL and Host'
+assert_equal '5' \
+  "$(grep -Fc '<--ipv4>' "$MOCK_LOG_DIR/curl.log")" \
+  'all curl requests explicitly use IPv4 for an IPv4 target'
+assert_equal '3' \
+  "$(grep -Fc '<--insecure>' "$MOCK_LOG_DIR/curl.log")" \
+  'only the three READY timing samples skip certificate verification'
+assert_equal '2' \
+  "$(grep -Fc '<--dump-header>' "$MOCK_LOG_DIR/curl.log")" \
+  'strict HTTP retries capture response headers without extra final attempts'
+assert_equal '0' \
+  "$(grep -Ec '<--dump-header>.*<--insecure>|<--insecure>.*<--dump-header>' \
+    "$MOCK_LOG_DIR/curl.log" || :)" \
+  'strict HTTP requests never inherit READY certificate bypass'
 assert_equal '2' \
   "$(grep -Fc '<-connect><203.0.113.10:443>' \
     "$MOCK_LOG_DIR/openssl.log")" \
@@ -1141,13 +1169,13 @@ run_mocked_domain_check \
   'first.example.com/second.example.com/third.example.com'
 assert_equal '0' "$MOCK_RUN_STATUS" \
   'three-domain high-fidelity concurrent run succeeds'
-assert_equal '9' "$(<"$MOCK_LOG_DIR/curl.count")" \
-  'three domains still perform exactly three curl samples each'
+assert_equal '12' "$(<"$MOCK_LOG_DIR/curl.count")" \
+  'three domains each perform three READY samples and one strict HTTP request'
 for concurrent_domain in \
   first.example.com second.example.com third.example.com; do
-  assert_equal '3' \
+  assert_equal '4' \
     "$(grep -Fc "<https://$concurrent_domain/>" "$MOCK_LOG_DIR/curl.log")" \
-    "$concurrent_domain performs three independent curl samples"
+    "$concurrent_domain performs three READY samples and one HTTP request"
 done
 assert_in_order "$MOCK_RUN_OUTPUT" \
   'three-domain output preserves input order' \
@@ -1204,8 +1232,7 @@ check_domain() {
       acquire_ready_sample_lock
       for sample_number in 1 2 3; do
         run_network_command "$TEMP_DIR/sample-$index-$sample_number" \
-          "$HTTP_TIMEOUT" curl --dump-header \
-          "$TEMP_DIR/header-$index-$sample_number" \
+          "$HTTP_TIMEOUT" curl --insecure \
           "https://$domain/" || :
       done
       release_ready_sample_lock
@@ -1291,11 +1318,15 @@ cat >"$BATCH_BIN/curl" <<'EOF'
 set -Eeuo pipefail
 header_file=''
 request_url=''
+insecure=false
 while (( $# > 0 )); do
   case "$1" in
     --dump-header)
       shift
       header_file=$1
+      ;;
+    --insecure|-k)
+      insecure=true
       ;;
     https://*)
       request_url=$1
@@ -1307,6 +1338,13 @@ done
 if [[ "$request_url" == 'https://curl-block.example.com/' ]]; then
   printf '%s\n' "$$" >"$BATCH_BLOCK_PID_DIR/curl.pid"
   exec sleep 300
+fi
+
+if [[ "$insecure" != true ]]; then
+  : >"$header_file"
+  printf 'HTTP/1.1 200 Mock\r\n\r\n' >"$header_file"
+  printf 'DOMAIN_CHECK_METRICS\t200\t0.005\t0.020\n'
+  exit 0
 fi
 
 while ! mkdir "$BATCH_COUNTER_LOCK" 2>/dev/null; do
@@ -1322,8 +1360,6 @@ fi
 rmdir "$BATCH_COUNTER_LOCK"
 
 sleep 0.02
-: >"$header_file"
-printf 'HTTP/1.1 200 Mock\r\n\r\n' >"$header_file"
 printf 'DOMAIN_CHECK_METRICS\t200\t0.005\t0.020\n'
 
 while ! mkdir "$BATCH_COUNTER_LOCK" 2>/dev/null; do

@@ -778,7 +778,7 @@ check_domain() {
   local http_code=''
   local location=''
   local http_5xx_count=0
-  local curl_command_ok=false
+  local http_command_ok=false
   local tls_command_ok=false
   local x25519_command_ok=false
   local openssl_target=''
@@ -796,6 +796,9 @@ check_domain() {
   local expiry_epoch=''
   local current_epoch=''
   local -a ready_samples=()
+  local -a curl_common_args=()
+  local -a curl_address_family=()
+  local ready_output_file
   local dns_a_file="$TEMP_DIR/dns-a-$index"
   local dns_aaaa_file="$TEMP_DIR/dns-aaaa-$index"
   local dns_cname_file="$TEMP_DIR/dns-cname-$index"
@@ -842,6 +845,19 @@ check_domain() {
   if [[ "$dns_status" == 'PASS' ]]; then
     openssl_target=$(openssl_target_for_ip "$ip")
     curl_resolve=$(curl_resolve_for_ip "$domain" "$ip")
+    if [[ "$ip" == *:* ]]; then
+      curl_address_family=(--ipv6)
+    else
+      curl_address_family=(--ipv4)
+    fi
+    curl_common_args=(
+      "${curl_address_family[@]}"
+      --silent --show-error --output /dev/null
+      --connect-timeout 5 --max-time 9 --no-keepalive
+      --header 'Connection: close' --noproxy '*' --proto '=https'
+      --tlsv1.3 --tls-max 1.3 --resolve "$curl_resolve"
+      --user-agent "$HTTP_USER_AGENT" "https://$domain/"
+    )
 
     if run_network_command "$tcp_file" "$TCP_TIMEOUT" \
       bash -c "exec 3<>\"/dev/tcp/\$1/443\"; exec 3<&-; exec 3>&-" \
@@ -861,41 +877,51 @@ check_domain() {
       x25519_command_ok=true
     fi
 
-    reset_http_retry_state
+    # READY deliberately skips CA verification for timing purposes. Certificate
+    # trust, hostname, and expiry are validated separately by the strict
+    # OpenSSL check above. Local CA bundle parsing and X.509 verification cost
+    # must not contaminate the target connection-latency measurement.
     acquire_ready_sample_lock
+    for attempt in 1 2 3; do
+      attempt_time_appconnect=''
+      ready_output_file="$TEMP_DIR/ready-output-$index-$attempt"
+      run_network_command "$ready_output_file" "$HTTP_TIMEOUT" \
+        curl --insecure \
+          --write-out 'DOMAIN_CHECK_METRICS\t%{http_code}\t%{time_connect}\t%{time_appconnect}\n' \
+          "${curl_common_args[@]}" || :
+      attempt_time_appconnect=$(extract_curl_metric "$ready_output_file" 4)
+      if positive_seconds "$attempt_time_appconnect" &&
+        attempt_ready_ms=$(seconds_to_milliseconds \
+          "$attempt_time_appconnect"); then
+        ready_samples+=("$attempt_ready_ms")
+        tcp_status='PASS'
+      fi
+    done
+    release_ready_sample_lock
+
+    reset_http_retry_state
     for attempt in 1 2 3; do
       attempt_request_ok=false
       attempt_http_code=''
       attempt_http_status='-'
       attempt_location=''
       attempt_time_connect=''
-      attempt_time_appconnect=''
-      curl_command_ok=false
+      http_command_ok=false
       http_output_file="$TEMP_DIR/http-output-$index-$attempt"
       http_header_file="$TEMP_DIR/http-header-$index-$attempt"
       if run_network_command "$http_output_file" "$HTTP_TIMEOUT" \
-        curl --silent --show-error --output /dev/null \
-          --dump-header "$http_header_file" \
+        curl --dump-header "$http_header_file" \
           --write-out 'DOMAIN_CHECK_METRICS\t%{http_code}\t%{time_connect}\t%{time_appconnect}\n' \
-          --connect-timeout 5 --max-time 9 --no-keepalive \
-          --header 'Connection: close' --noproxy '*' --proto '=https' \
-          --tlsv1.3 --tls-max 1.3 --resolve "$curl_resolve" \
-          --user-agent "$HTTP_USER_AGENT" "https://$domain/"; then
-        curl_command_ok=true
+          "${curl_common_args[@]}"; then
+        http_command_ok=true
       fi
 
       attempt_http_code=$(extract_http_code "$http_output_file")
       attempt_time_connect=$(extract_curl_metric "$http_output_file" 3)
-      attempt_time_appconnect=$(extract_curl_metric "$http_output_file" 4)
       if positive_seconds "$attempt_time_connect"; then
         tcp_status='PASS'
       fi
-      if positive_seconds "$attempt_time_appconnect" &&
-        attempt_ready_ms=$(seconds_to_milliseconds \
-          "$attempt_time_appconnect"); then
-        ready_samples+=("$attempt_ready_ms")
-      fi
-      if [[ "$curl_command_ok" == true &&
+      if [[ "$http_command_ok" == true &&
         "$attempt_http_code" =~ ^[0-9]{3}$ &&
         "$attempt_http_code" != '000' ]]; then
         attempt_request_ok=true
@@ -905,8 +931,8 @@ check_domain() {
       fi
       record_http_attempt "$attempt" "$attempt_request_ok" \
         "$attempt_http_status" "$attempt_location" "$http_header_file"
+      [[ "$HTTP_FINALIZED" == true ]] && break
     done
-    release_ready_sample_lock
 
     if [[ "$tls_command_ok" == true ]] &&
       tls13_evidence_present "$tls_file"; then
