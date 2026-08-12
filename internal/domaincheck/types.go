@@ -68,7 +68,7 @@ func DefaultConfig() Config {
 		Concurrency:           8,
 		Port:                  "443",
 		DNSTimeout:            6 * time.Second,
-		TCPTimeout:            6 * time.Second,
+		TCPTimeout:            2500 * time.Millisecond,
 		TLSTimeout:            4 * time.Second,
 		ReadyTimeout:          3 * time.Second,
 		HTTPTimeout:           2500 * time.Millisecond,

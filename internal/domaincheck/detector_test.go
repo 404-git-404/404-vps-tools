@@ -161,6 +161,9 @@ func TestParseDomainsAndConcurrency(t *testing.T) {
 	if defaultConfig.ResponseHeaderTimeout != 2*time.Second || defaultConfig.HTTPTimeout != 2500*time.Millisecond {
 		t.Fatalf("unexpected HTTP budgets: headers=%v overall=%v", defaultConfig.ResponseHeaderTimeout, defaultConfig.HTTPTimeout)
 	}
+	if defaultConfig.TCPTimeout != 2500*time.Millisecond {
+		t.Fatalf("unexpected TCP timeout: %v", defaultConfig.TCPTimeout)
+	}
 }
 
 func TestNativeDetectorPrimaryReadyHTTPAndPinning(t *testing.T) {
@@ -324,6 +327,82 @@ func TestFailFastAndDomainTimeout(t *testing.T) {
 	if time.Since(started) > 300*time.Millisecond || results[0].Result != Fail {
 		t.Fatalf("domain deadline failed: elapsed=%v result=%+v", time.Since(started), results[0])
 	}
+}
+
+func TestTCPTimeoutAndCancellation(t *testing.T) {
+	t.Run("stalled target stops at TCP timeout", func(t *testing.T) {
+		cfg := DefaultConfig()
+		cfg.Resolver = &fakeResolver{ipv4: []net.IP{net.ParseIP("192.0.2.10")}}
+		cfg.TCPTimeout = 50 * time.Millisecond
+		var calls atomic.Int32
+		cfg.DialContext = func(ctx context.Context, _, _ string) (net.Conn, error) {
+			calls.Add(1)
+			<-ctx.Done()
+			return nil, ctx.Err()
+		}
+		detector, _ := New(cfg)
+		started := time.Now()
+		result := detector.Check(context.Background(), "tcp-timeout.test")
+		elapsed := time.Since(started)
+		if elapsed < 40*time.Millisecond || elapsed > 250*time.Millisecond {
+			t.Fatalf("TCP timeout elapsed=%v, want approximately %v", elapsed, cfg.TCPTimeout)
+		}
+		if result.Result != Fail || calls.Load() != 1 || !containsReason(result, "TCP 443 不可达") {
+			t.Fatalf("TCP timeout did not fail fast before TLS/READY/HTTP: %+v calls=%d", result, calls.Load())
+		}
+	})
+
+	t.Run("fast failure returns immediately", func(t *testing.T) {
+		cfg := DefaultConfig()
+		cfg.Resolver = &fakeResolver{ipv4: []net.IP{net.ParseIP("192.0.2.11")}}
+		var calls atomic.Int32
+		cfg.DialContext = func(context.Context, string, string) (net.Conn, error) {
+			calls.Add(1)
+			return nil, syscall.ECONNREFUSED
+		}
+		detector, _ := New(cfg)
+		started := time.Now()
+		result := detector.Check(context.Background(), "tcp-refused.test")
+		if elapsed := time.Since(started); elapsed > 250*time.Millisecond {
+			t.Fatalf("fast TCP failure waited for timeout: %v", elapsed)
+		}
+		if result.Result != Fail || calls.Load() != 1 || !containsReason(result, "TCP 443 不可达") {
+			t.Fatalf("TCP fast failure changed: %+v calls=%d", result, calls.Load())
+		}
+	})
+
+	t.Run("successful connection is accepted", func(t *testing.T) {
+		cfg := DefaultConfig()
+		cfg.DialContext = func(context.Context, string, string) (net.Conn, error) {
+			client, server := net.Pipe()
+			go func() { _ = server.Close() }()
+			return client, nil
+		}
+		detector, _ := New(cfg)
+		if err := detector.probeTCP(context.Background(), net.ParseIP("192.0.2.12")); err != nil {
+			t.Fatalf("healthy TCP connection rejected: %v", err)
+		}
+	})
+
+	t.Run("parent cancellation wins", func(t *testing.T) {
+		cfg := DefaultConfig()
+		cfg.TCPTimeout = time.Second
+		cfg.DialContext = func(ctx context.Context, _, _ string) (net.Conn, error) {
+			<-ctx.Done()
+			return nil, ctx.Err()
+		}
+		detector, _ := New(cfg)
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		started := time.Now()
+		err := detector.probeTCP(ctx, net.ParseIP("192.0.2.13"))
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("probeTCP cancellation error = %v", err)
+		}
+		if elapsed := time.Since(started); elapsed > 100*time.Millisecond {
+			t.Fatalf("parent cancellation was delayed: %v", elapsed)
+		}
+	})
 }
 
 func TestDNSAndCertificateFailFast(t *testing.T) {
