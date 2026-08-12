@@ -171,7 +171,7 @@ func TestParseDomainsAndConcurrency(t *testing.T) {
 		}
 	}
 	defaultConfig, err := ConfigFromEnv(func(string) string { return "" })
-	if err != nil || defaultConfig.Concurrency != 8 || defaultConfig.ReadyConcurrency != 4 {
+	if err != nil || defaultConfig.Concurrency != 24 || defaultConfig.ReadyConcurrency != 4 {
 		t.Fatalf("default concurrency: workers=%d ready=%d err=%v", defaultConfig.Concurrency, defaultConfig.ReadyConcurrency, err)
 	}
 	if defaultConfig.ResponseHeaderTimeout != 2*time.Second || defaultConfig.HTTPTimeout != 2500*time.Millisecond {

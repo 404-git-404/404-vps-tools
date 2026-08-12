@@ -66,7 +66,7 @@ type Config struct {
 func DefaultConfig() Config {
 	dialer := &net.Dialer{}
 	return Config{
-		Concurrency:           8,
+		Concurrency:           24,
 		ReadyConcurrency:      4,
 		Port:                  "443",
 		DNSTimeout:            6 * time.Second,

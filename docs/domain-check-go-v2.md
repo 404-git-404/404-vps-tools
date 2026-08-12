@@ -19,10 +19,16 @@ For Linux arm64, replace `GOARCH=amd64` with `GOARCH=arm64`.
 ./domain-check domain1.com/domain2.com/domain3.com
 ```
 
-Worker concurrency defaults to 8. Override it with a validated positive integer:
+Worker concurrency defaults to 24. Override it with a validated positive integer:
 
 ```bash
 DOMAIN_CHECK_CONCURRENCY=12 ./domain-check domain1.com/domain2.com
+```
+
+READY timing concurrency defaults to 4 and can be overridden independently:
+
+```bash
+DOMAIN_CHECK_READY_CONCURRENCY=2 ./domain-check domain1.com/domain2.com
 ```
 
 The detector writes a self-contained HTML report below
