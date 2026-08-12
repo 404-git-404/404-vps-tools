@@ -508,6 +508,74 @@ func TestHTTPHeadersOnlyRetryRedirectAndCDN(t *testing.T) {
 	}
 }
 
+func TestHTTPBashCompatibleRequestAndNoRedirectFollow(t *testing.T) {
+	const domain = "request.test"
+	const expectedUserAgent = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0 Safari/537.36"
+	type observedRequest struct {
+		userAgent      string
+		accept         string
+		acceptEncoding string
+		host           string
+		path           string
+		protoMajor     int
+	}
+	observed := make(chan observedRequest, 2)
+	server := startTLSServer(t, domain, []tls.CurveID{tls.X25519}, http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		observed <- observedRequest{
+			userAgent:      request.Header.Get("User-Agent"),
+			accept:         request.Header.Get("Accept"),
+			acceptEncoding: request.Header.Get("Accept-Encoding"),
+			host:           request.Host,
+			path:           request.URL.Path,
+			protoMajor:     request.ProtoMajor,
+		}
+		writer.Header().Set("Location", "/followed")
+		writer.WriteHeader(http.StatusFound)
+	}))
+	cfg := configForServer(server, &fakeResolver{})
+	realDial := (&net.Dialer{}).DialContext
+	var addressesMu sync.Mutex
+	var addresses []string
+	cfg.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
+		addressesMu.Lock()
+		addresses = append(addresses, address)
+		addressesMu.Unlock()
+		return realDial(ctx, network, address)
+	}
+	detector, _ := New(cfg)
+	outcome := detector.probeHTTP(context.Background(), domain, net.ParseIP("127.0.0.1"))
+	if !outcome.OK || outcome.Code != http.StatusFound || outcome.Attempts != 1 || outcome.Location != "/followed" {
+		t.Fatalf("redirect handling changed: %+v", outcome)
+	}
+
+	request := <-observed
+	if request.userAgent != expectedUserAgent {
+		t.Errorf("User-Agent = %q, want %q", request.userAgent, expectedUserAgent)
+	}
+	if request.accept != "*/*" {
+		t.Errorf("Accept = %q, want */*", request.accept)
+	}
+	if request.acceptEncoding != "" {
+		t.Errorf("automatic compression was enabled: Accept-Encoding=%q", request.acceptEncoding)
+	}
+	if request.host != domain || request.path != "/" {
+		t.Errorf("HTTP authority/path changed: host=%q path=%q", request.host, request.path)
+	}
+	if request.protoMajor != 2 {
+		t.Errorf("HTTP/2 behavior changed: protocol major=%d", request.protoMajor)
+	}
+	select {
+	case followed := <-observed:
+		t.Fatalf("redirect was followed: %+v", followed)
+	default:
+	}
+	addressesMu.Lock()
+	defer addressesMu.Unlock()
+	if len(addresses) != 1 || addresses[0] != net.JoinHostPort("127.0.0.1", server.port) {
+		t.Fatalf("HTTP escaped pinned IP: %v", addresses)
+	}
+}
+
 func TestFailFastAndDomainTimeout(t *testing.T) {
 	resolver := &fakeResolver{ipv4: []net.IP{net.ParseIP("192.0.2.10")}}
 	cfg := DefaultConfig()

@@ -19,6 +19,8 @@ type Detector struct {
 	readySlots chan struct{}
 }
 
+const bashCompatibleUserAgent = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0 Safari/537.36"
+
 func New(cfg Config) (*Detector, error) {
 	if cfg.Concurrency < 1 || cfg.ReadyConcurrency < 1 || cfg.Port == "" || cfg.Resolver == nil ||
 		cfg.DialContext == nil || cfg.Now == nil {
@@ -325,7 +327,7 @@ func (d *Detector) probeHTTP(ctx context.Context, domain string, ip net.IP) http
 	for attempt := 1; attempt <= 2; attempt++ {
 		attemptCtx, cancel := context.WithTimeout(ctx, d.cfg.HTTPTimeout)
 		transport := &http.Transport{
-			Proxy: nil, DisableKeepAlives: true, ForceAttemptHTTP2: true,
+			Proxy: nil, DisableKeepAlives: true, DisableCompression: true, ForceAttemptHTTP2: true,
 			ResponseHeaderTimeout: d.cfg.ResponseHeaderTimeout,
 			TLSHandshakeTimeout:   d.cfg.TLSTimeout,
 			TLSClientConfig: &tls.Config{
@@ -342,7 +344,8 @@ func (d *Detector) probeHTTP(ctx context.Context, domain string, ip net.IP) http
 		}
 		request, _ := http.NewRequestWithContext(attemptCtx, http.MethodGet, "https://"+domain+"/", nil)
 		request.Host = domain
-		request.Header.Set("User-Agent", "domain-check-go/2")
+		request.Header.Set("User-Agent", bashCompatibleUserAgent)
+		request.Header.Set("Accept", "*/*")
 		response, err := client.Do(request)
 		outcome.Attempts = attempt
 		if err == nil {
