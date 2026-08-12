@@ -937,7 +937,9 @@ check_domain() {
 
         # READY deliberately skips CA verification for timing purposes.
         # Certificate trust, hostname, and expiry are validated separately by
-        # the strict OpenSSL check above. Acquire the global lock per sample so
+        # the strict OpenSSL check above. HEAD prevents the serialized READY
+        # probe from downloading a response body. Acquire the global lock per
+        # sample; its scope ends when that HEAD command exits, so
         # a failing target cannot monopolize it across three timeouts.
         ready_check_attempted=true
         for attempt in 1 2 3; do
@@ -946,7 +948,7 @@ check_domain() {
           ready_output_file="$TEMP_DIR/ready-output-$index-$attempt"
           acquire_ready_sample_lock
           if run_network_command "$ready_output_file" "$HTTP_TIMEOUT" \
-            curl --insecure \
+            curl --insecure --head \
               --write-out 'DOMAIN_CHECK_METRICS\t%{http_code}\t%{time_connect}\t%{time_appconnect}\n' \
               "${curl_common_args[@]}"; then
             ready_command_status=0

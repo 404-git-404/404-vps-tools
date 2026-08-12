@@ -1274,6 +1274,13 @@ assert_equal '5' \
 assert_equal '3' \
   "$(grep -Fc '<--insecure>' "$MOCK_LOG_DIR/curl.log")" \
   'only the three READY timing samples skip certificate verification'
+assert_equal '3' \
+  "$(grep -Fc '<--head>' "$MOCK_LOG_DIR/curl.log")" \
+  'all three READY timing samples use HEAD without a response body'
+assert_equal '3' \
+  "$(grep -Ec '<--insecure>.*<--head>|<--head>.*<--insecure>' \
+    "$MOCK_LOG_DIR/curl.log")" \
+  'HEAD is scoped to the three insecure READY timing samples'
 assert_equal '2' \
   "$(grep -Fc '<--dump-header>' "$MOCK_LOG_DIR/curl.log")" \
   'strict HTTP retries capture response headers without extra final attempts'
@@ -1281,6 +1288,10 @@ assert_equal '0' \
   "$(grep -Ec '<--dump-header>.*<--insecure>|<--insecure>.*<--dump-header>' \
     "$MOCK_LOG_DIR/curl.log" || :)" \
   'strict HTTP requests never inherit READY certificate bypass'
+assert_equal '0' \
+  "$(grep -Ec '<--dump-header>.*<--head>|<--head>.*<--dump-header>' \
+    "$MOCK_LOG_DIR/curl.log" || :)" \
+  'strict HTTP probes remain normal GET requests after READY switches to HEAD'
 assert_equal '2' \
   "$(grep -Fc '<-connect><203.0.113.10:443>' \
     "$MOCK_LOG_DIR/openssl.log")" \
@@ -1318,8 +1329,33 @@ ready_loop_block=$(sed -n \
 assert_in_order "$ready_loop_block" \
   'READY acquires and releases the global lock around each individual sample' \
   'for attempt in 1 2 3' 'acquire_ready_sample_lock' \
-  'run_network_command' 'release_ready_sample_lock' \
+  'run_network_command' 'curl --insecure --head' 'release_ready_sample_lock' \
   'curl_failure_is_deterministic'
+
+run_mocked_domain_check \
+  '405|403|404' \
+  '0.041|0.019|0.027' \
+  '0|0|0' \
+  '||' \
+  1 '' '0.005|0.006|0.007' 1 0 2000000000 1900000000 \
+  0 0 example.com 0 \
+  '35|22|92' '0|0|0'
+assert_equal '0' "$MOCK_RUN_STATUS" \
+  'HEAD HTTP status and late curl errors do not invalidate completed TLS timing'
+assert_contains '| 27        |' "$MOCK_RUN_OUTPUT" \
+  'positive time_appconnect samples retain the existing median aggregation'
+assert_not_contains '连接就绪计时样本不足' "$MOCK_RUN_OUTPUT" \
+  'positive READY samples survive 403, 404, 405, and later curl errors'
+assert_equal '3' \
+  "$(grep -Fc '<--head>' "$MOCK_LOG_DIR/curl.log")" \
+  'HTTP status compatibility path still performs exactly three READY HEAD samples'
+assert_equal '1' \
+  "$(grep -Fc '<--dump-header>' "$MOCK_LOG_DIR/curl.log")" \
+  'HTTP status compatibility path still performs its independent strict GET probe'
+assert_equal '0' \
+  "$(grep -Ec '<--dump-header>.*<--head>|<--head>.*<--dump-header>' \
+    "$MOCK_LOG_DIR/curl.log" || :)" \
+  'strict HTTP GET remains isolated from READY HEAD compatibility handling'
 
 run_mocked_domain_check \
   '200|200|200|200|200|200|200|200|200' \
