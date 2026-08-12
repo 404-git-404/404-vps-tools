@@ -766,17 +766,18 @@ set -e
 assert_equal '1' "$cleanup_worker_status" \
   'worker cleanup terminates and reaps the active worker'
 
-# The sed range intentionally matches the literal shell variable syntax.
+# The sed range and expected argument intentionally contain literal variables.
 # shellcheck disable=SC2016
-x25519_block=$(sed -n \
-  '/run_network_command "$x25519_file"/,/-tls1_3 -groups X25519 || :/p' \
+primary_tls_block=$(sed -n \
+  '/run_network_command "$tls_primary_file"/,/-verify_return_error -showcerts/p' \
   "$DOMAIN_CHECK_SCRIPT")
-assert_contains '-tls1_3 -groups X25519' "$x25519_block" \
-  'X25519 handshake forces the expected group'
-assert_not_contains '-verify_hostname' "$x25519_block" \
-  'X25519 handshake does not perform hostname verification'
-assert_not_contains '-verify_return_error' "$x25519_block" \
-  'X25519 handshake does not fail on certificate verification'
+assert_contains '-tls1_3 -groups X25519 -alpn h2' "$primary_tls_block" \
+  'PRIMARY handshake forces X25519 while requesting TLS1.3 and h2'
+# shellcheck disable=SC2016
+assert_contains '-verify_hostname "$domain"' "$primary_tls_block" \
+  'PRIMARY handshake strictly verifies the requested hostname'
+assert_contains '-verify_return_error -showcerts' "$primary_tls_block" \
+  'PRIMARY handshake strictly verifies and captures the certificate chain'
 
 executable_mode_block=$(sed -n \
   '/for executable_script in/,/done/p' "$WORKFLOW_FILE")
@@ -1160,6 +1161,14 @@ if [[ " $* " == *' -groups X25519 '* ]]; then
     printf '%s\n' \
       'New, TLSv1.3, Cipher is TLS_AES_256_GCM_SHA384' \
       'Peer Temp Key: X25519, 253 bits'
+    if [[ ${MOCK_NORMAL_COMPLETE:-1} == 1 ]]; then
+      printf '%s\n' \
+        'ALPN protocol: h2' \
+        '-----BEGIN CERTIFICATE-----' \
+        'offline-fixture' \
+        '-----END CERTIFICATE-----' \
+        'Verify return code: 0 (ok)'
+    fi
   else
     printf '%s\n' 'CONNECTED'
   fi
@@ -1213,6 +1222,7 @@ run_mocked_domain_check() {
   local tcp_exit=${15:-0}
   local ready_curl_exits=${16:-$curl_exits}
   local http_curl_exits=${17:-$curl_exits}
+  local profile=${18:-}
 
   mkdir -p "$TEST_TEMP_DIR/worker-tmp"
   rm -rf -- "$TEST_LOG_HOME/mock/domain-check-logs"
@@ -1243,6 +1253,7 @@ run_mocked_domain_check() {
       MOCK_RESPONSE_HEADER="$response_header" \
       MOCK_EXPIRY_EPOCH="$expiry_epoch" \
       MOCK_CURRENT_EPOCH="$current_epoch" \
+      DOMAIN_CHECK_PROFILE="$profile" \
       HOME="$TEST_LOG_HOME/mock" \
       TMPDIR="$TEST_TEMP_DIR/worker-tmp" \
       DOMAIN_CHECK_SOURCE_ONLY=0 \
@@ -1273,6 +1284,12 @@ assert_contains "HTML log: $mock_html_log" "$MOCK_RUN_OUTPUT" \
 assert_file_contains \
   '<span class="summary-item status-pass"><span>PASS</span><strong>1</strong></span>' \
   "$mock_html_log" 'successful HTML log contains the PASS summary'
+assert_not_contains 'Profile log:' "$MOCK_RUN_OUTPUT" \
+  'default detector output does not mention stage profiling'
+assert_equal '0' \
+  "$(find "$TEST_LOG_HOME/mock/domain-check-logs" -maxdepth 1 \
+    -type f -name 'domain-check-profile-*.tsv' | wc -l)" \
+  'default detector run creates no profile TSV'
 assert_equal '0' \
   "$(find "$TEST_LOG_HOME/mock/domain-check-logs" -maxdepth 1 \
     -type f -name '*.md' | wc -l)" \
@@ -1342,14 +1359,17 @@ assert_equal '0' \
   "$(grep -Ec '<--dump-header>.*<--head>|<--head>.*<--dump-header>' \
     "$MOCK_LOG_DIR/curl.log" || :)" \
   'strict HTTP probes remain normal GET requests after READY switches to HEAD'
-assert_equal '2' \
+assert_equal '1' \
   "$(grep -Fc '<-connect><203.0.113.10:443>' \
     "$MOCK_LOG_DIR/openssl.log")" \
-  'both OpenSSL handshakes use the selected address'
-assert_equal '2' \
+  'successful PRIMARY path performs one TLS handshake to the selected address'
+assert_equal '1' \
   "$(grep -Fc '<-servername><example.com>' \
     "$MOCK_LOG_DIR/openssl.log")" \
-  'both OpenSSL handshakes preserve the original SNI'
+  'successful PRIMARY path preserves SNI in its single TLS handshake'
+assert_equal '1' \
+  "$(grep -Fc '<-groups><X25519>' "$MOCK_LOG_DIR/openssl.log")" \
+  'successful PRIMARY path forces X25519 exactly once'
 assert_not_contains '<-connect><example.com:443>' "$openssl_log" \
   'OpenSSL never re-resolves the domain after address selection'
 assert_contains '<dig>' "$timeout_log" \
@@ -1381,6 +1401,60 @@ assert_in_order "$ready_loop_block" \
   'for attempt in 1 2 3' 'acquire_ready_sample_lock' \
   'run_network_command' 'curl --insecure --head' 'release_ready_sample_lock' \
   'curl_failure_is_deterministic'
+
+run_mocked_domain_check \
+  '503|503|503' \
+  '0.041|0.019|0.027' \
+  '0|0|0' \
+  '||' \
+  1 '' '0.005|0.006|0.007' 1 0 2000000000 1900000000 \
+  0 0 example.com 0 \
+  '0|0|0' '0|0|0' 1
+profile_log=$(find "$TEST_LOG_HOME/mock/domain-check-logs" \
+  -maxdepth 1 -type f -name 'domain-check-profile-*.tsv' -print -quit)
+assert_equal 'true' \
+  "$([[ -n "$profile_log" && -s "$profile_log" ]] &&
+    printf true || printf false)" \
+  'DOMAIN_CHECK_PROFILE=1 writes one complete profile TSV'
+assert_contains "Profile log: $profile_log" "$MOCK_RUN_OUTPUT" \
+  'profile mode reports the absolute TSV path on stderr'
+profile_header=$(sed -n '1p' "$profile_log")
+profile_row=$(sed -n '2p' "$profile_log")
+assert_equal \
+  $'DOMAIN\tTOTAL\tDNS_A\tDNS_AAAA\tDNS_CNAME\tTCP\tTLS_PRIMARY\tTLS_FALLBACK\tREADY_LOCK_WAIT_1\tREADY_PROBE_1\tREADY_LOCK_WAIT_2\tREADY_PROBE_2\tREADY_LOCK_WAIT_3\tREADY_PROBE_3\tHTTP_1\tHTTP_1_EXIT\tHTTP_1_CODE\tHTTP_2\tHTTP_2_EXIT\tHTTP_2_CODE\tHTTP_3\tHTTP_3_EXIT\tHTTP_3_CODE' \
+  "$profile_header" 'profile TSV exposes every required stage field'
+IFS=$'\t' read -r -a profile_fields <<<"$profile_row"
+assert_equal '23' "${#profile_fields[@]}" \
+  'profile row has one value for every stage field'
+assert_equal 'example.com' "${profile_fields[0]}" \
+  'profile row identifies the measured domain'
+assert_not_contains '-' "${profile_fields[1]}" \
+  'executed domain TOTAL contains wall-clock milliseconds'
+assert_equal '-' "${profile_fields[7]}" \
+  'successful PRIMARY fast path leaves TLS_FALLBACK unexecuted'
+for profile_field_index in 8 10 12; do
+  assert_not_contains '-' "${profile_fields[$profile_field_index]}" \
+    'each READY lock wait has its own elapsed value'
+done
+for profile_field_index in 9 11 13; do
+  assert_not_contains '-' "${profile_fields[$profile_field_index]}" \
+    'each READY HEAD probe has a separate wall-clock value'
+done
+for profile_field_index in 14 17 20; do
+  assert_not_contains '-' "${profile_fields[$profile_field_index]}" \
+    'each executed HTTP attempt has a wall-clock value'
+done
+for profile_field_index in 15 18 21; do
+  assert_equal '0' "${profile_fields[$profile_field_index]}" \
+    'each HTTP attempt records its curl exit status'
+done
+for profile_field_index in 16 19 22; do
+  assert_equal '503' "${profile_fields[$profile_field_index]}" \
+    'each HTTP attempt records its response code'
+done
+assert_in_order "$MOCK_RUN_OUTPUT" \
+  'profile path is the final logging message after the unchanged HTML log' \
+  'HTML log:' 'Profile log:'
 
 run_mocked_domain_check \
   '405|403|404' \
@@ -1556,7 +1630,12 @@ fi
 if [[ " $* " == *' -groups X25519 '* ]]; then
   printf '%s\n' \
     'New, TLSv1.3, Cipher is TLS_AES_256_GCM_SHA384' \
-    'Peer Temp Key: X25519, 253 bits'
+    'Peer Temp Key: X25519, 253 bits' \
+    'ALPN protocol: h2' \
+    '-----BEGIN CERTIFICATE-----' \
+    'offline-fixture' \
+    '-----END CERTIFICATE-----' \
+    'Verify return code: 0 (ok)'
 else
   printf '%s\n' \
     'New, TLSv1.3, Cipher is TLS_AES_256_GCM_SHA384' \
@@ -1664,7 +1743,7 @@ PATH="$BATCH_BIN:$PATH" \
   BATCH_CURL_MAX="$BATCH_CURL_MAX" \
   TMPDIR="$TEST_TEMP_DIR/batch-worker-tmp" \
   DOMAIN_CHECK_SOURCE_ONLY=0 \
-  "$real_timeout" 20 bash "$BATCH_DRIVER" "$batch_argument" \
+  "$real_timeout" 30 bash "$BATCH_DRIVER" "$batch_argument" \
   >"$BATCH_STDOUT" 2>"$BATCH_STDERR"
 batch_status=$?
 set -e
@@ -1674,7 +1753,7 @@ batch_progress=$(<"$BATCH_STDERR")
 
 assert_equal '1' "$batch_status" \
   '45-domain blocked-command run finishes with domain failures, not a batch timeout'
-assert_less_or_equal '19' "$batch_elapsed" \
+assert_less_or_equal '29' "$batch_elapsed" \
   '45-domain blocked-command run completes within the deterministic outer limit'
 assert_equal '1' "$(<"$BATCH_CURL_MAX")" \
   'only the three READY curl samples are serialized across domain workers'
@@ -1718,7 +1797,7 @@ main_block=$(sed -n '/^main() {/,/^}/p' "$DOMAIN_CHECK_SCRIPT")
 assert_in_order "$main_block" \
   'progress, terminal results, and HTML logging keep their required order' \
   'while (( ${#WORKER_PIDS[@]} > 0 ))' 'clear_progress' 'print_results' \
-  'write_html_log' 'exit "$final_exit_code"'
+  'write_html_log' 'write_profile_log' 'exit "$final_exit_code"'
 
 rm -f -- "$BATCH_BLOCK_PID_DIR"/*.pid
 INTERRUPT_OUTPUT="$TEST_TEMP_DIR/interrupt-output"
@@ -1763,15 +1842,15 @@ run_mocked_domain_check \
   2000000000 \
   1900000000 \
   1 \
-  0
+  1
 assert_equal '1' "$MOCK_RUN_STATUS" \
-  'failed normal OpenSSL command remains a hard failure despite TLS1.3 text'
+  'failed PRIMARY and fallback commands remain a hard failure despite evidence'
 assert_contains 'TLS 1.3 握手失败' "$MOCK_RUN_OUTPUT" \
-  'failed normal OpenSSL command cannot promote parsed TLS1.3 evidence'
+  'failed fallback command cannot promote parsed TLS1.3 evidence'
 assert_contains 'ALPN 未协商 h2' "$MOCK_RUN_OUTPUT" \
-  'failed normal OpenSSL command cannot promote parsed ALPN evidence'
+  'failed fallback command cannot promote parsed ALPN evidence'
 assert_contains '证书链、有效期或主机名验证失败' "$MOCK_RUN_OUTPUT" \
-  'failed normal OpenSSL command cannot promote certificate evidence'
+  'failed fallback command cannot promote certificate evidence'
 
 run_mocked_domain_check \
   '200|200|200' \
@@ -1786,17 +1865,45 @@ run_mocked_domain_check \
   2000000000 \
   1900000000 \
   0 \
+  1 \
+  example.com \
+  0 \
+  '0|0|0' \
+  '0|0|0' \
   1
 assert_equal '1' "$MOCK_RUN_STATUS" \
-  'failed X25519 OpenSSL command remains a hard failure despite key text'
+  'failed PRIMARY X25519 command falls back while X25519 remains a hard failure'
 assert_contains '强制 X25519 握手失败' "$MOCK_RUN_OUTPUT" \
-  'failed X25519 command cannot promote parsed temporary-key evidence'
+  'failed PRIMARY command cannot promote parsed temporary-key evidence'
+assert_not_contains 'TLS 1.3 握手失败' "$MOCK_RUN_OUTPUT" \
+  'fallback preserves TLS1.3 PASS after PRIMARY X25519 failure'
+assert_not_contains 'ALPN 未协商 h2' "$MOCK_RUN_OUTPUT" \
+  'fallback preserves H2 PASS after PRIMARY X25519 failure'
+assert_not_contains '证书链、有效期或主机名验证失败' "$MOCK_RUN_OUTPUT" \
+  'fallback preserves strict certificate PASS after PRIMARY X25519 failure'
+assert_equal '2' \
+  "$(grep -Fc '<openssl>' "$MOCK_LOG_DIR/timeout.log")" \
+  'PRIMARY X25519 failure performs exactly one fallback strict handshake'
+assert_equal '1' \
+  "$(grep -Fc '<-groups><X25519>' "$MOCK_LOG_DIR/openssl.log")" \
+  'fallback strict handshake does not force X25519 again'
+fallback_profile_log=$(find "$TEST_LOG_HOME/mock/domain-check-logs" \
+  -maxdepth 1 -type f -name 'domain-check-profile-*.tsv' -print -quit)
+IFS=$'\t' read -r -a fallback_profile_fields \
+  <<<"$(sed -n '2p' "$fallback_profile_log")"
+assert_not_contains '-' "${fallback_profile_fields[6]}" \
+  'failed PRIMARY path records its wall-clock duration'
+assert_not_contains '-' "${fallback_profile_fields[7]}" \
+  'executed fallback strict TLS path records its wall-clock duration'
 
 run_mocked_domain_check \
   '200|200|200' \
   '0.010|0.020|0.030' \
   '0|0|0' \
   '||' \
+  0 \
+  '' \
+  '0.005|0.006|0.007' \
   0
 assert_equal '1' "$MOCK_RUN_STATUS" \
   'incomplete OpenSSL evidence produces a hard failure'
@@ -1806,9 +1913,9 @@ assert_contains 'FAIL    | -' "$MOCK_RUN_OUTPUT" \
   'certificate verification failure displays FAIL in CERT(d)'
 assert_not_contains 'TCP 443 不可达' "$MOCK_RUN_OUTPUT" \
   'successful independent TCP probe survives incomplete TLS evidence'
-assert_equal '1' \
+assert_equal '2' \
   "$(grep -Fc '<openssl>' "$MOCK_LOG_DIR/timeout.log")" \
-  'missing TLS1.3 handshake evidence skips the X25519 probe'
+  'PRIMARY without X25519 evidence tries one fallback before fail-fast'
 assert_equal '0' "$(<"$MOCK_LOG_DIR/curl.count")" \
   'missing TLS1.3 handshake evidence skips READY and HTTP curl calls'
 assert_not_contains '连接就绪计时样本不足' "$MOCK_RUN_OUTPUT" \
@@ -1931,6 +2038,9 @@ run_mocked_domain_check \
   0 \
   0 \
   example.com \
+  1 \
+  '0|0|0' \
+  '0|0|0' \
   1
 assert_equal '1' "$MOCK_RUN_STATUS" \
   'explicit TCP 443 failure stops the domain as a hard failure'
@@ -1947,6 +2057,14 @@ assert_not_contains 'HTTP 请求失败' "$MOCK_RUN_OUTPUT" \
   'TCP fail-fast does not add a misleading HTTP failure'
 assert_not_contains '连接就绪计时样本不足' "$MOCK_RUN_OUTPUT" \
   'TCP fail-fast does not add a misleading READY warning'
+tcp_fail_profile_log=$(find "$TEST_LOG_HOME/mock/domain-check-logs" \
+  -maxdepth 1 -type f -name 'domain-check-profile-*.tsv' -print -quit)
+IFS=$'\t' read -r -a tcp_fail_profile_fields \
+  <<<"$(sed -n '2p' "$tcp_fail_profile_log")"
+for profile_field_index in {6..22}; do
+  assert_equal '-' "${tcp_fail_profile_fields[$profile_field_index]}" \
+    'TCP fail-fast marks every unexecuted TLS, READY, and HTTP stage with a dash'
+done
 failed_html_log=$(find "$TEST_LOG_HOME/mock/domain-check-logs" \
   -maxdepth 1 -type f -name 'domain-check-*.html' -print -quit)
 assert_equal 'true' \
