@@ -48,6 +48,7 @@ type Resolver interface {
 
 type Config struct {
 	Concurrency           int
+	ReadyConcurrency      int
 	Port                  string
 	DNSTimeout            time.Duration
 	TCPTimeout            time.Duration
@@ -66,6 +67,7 @@ func DefaultConfig() Config {
 	dialer := &net.Dialer{}
 	return Config{
 		Concurrency:           8,
+		ReadyConcurrency:      4,
 		Port:                  "443",
 		DNSTimeout:            6 * time.Second,
 		TCPTimeout:            2500 * time.Millisecond,
@@ -82,15 +84,24 @@ func DefaultConfig() Config {
 
 func ConfigFromEnv(getenv func(string) string) (Config, error) {
 	cfg := DefaultConfig()
-	raw := strings.TrimSpace(getenv("DOMAIN_CHECK_CONCURRENCY"))
-	if raw == "" {
-		return cfg, nil
+	variables := []struct {
+		name   string
+		target *int
+	}{
+		{"DOMAIN_CHECK_CONCURRENCY", &cfg.Concurrency},
+		{"DOMAIN_CHECK_READY_CONCURRENCY", &cfg.ReadyConcurrency},
 	}
-	workers, err := strconv.Atoi(raw)
-	if err != nil || workers < 1 || workers > 256 {
-		return Config{}, fmt.Errorf("DOMAIN_CHECK_CONCURRENCY must be an integer from 1 to 256")
+	for _, variable := range variables {
+		raw := strings.TrimSpace(getenv(variable.name))
+		if raw == "" {
+			continue
+		}
+		workers, err := strconv.Atoi(raw)
+		if err != nil || workers < 1 || workers > 256 {
+			return Config{}, fmt.Errorf("%s must be an integer from 1 to 256", variable.name)
+		}
+		*variable.target = workers
 	}
-	cfg.Concurrency = workers
 	return cfg, nil
 }
 

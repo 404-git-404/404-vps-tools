@@ -141,22 +141,38 @@ func TestParseDomainsAndConcurrency(t *testing.T) {
 		}
 	}
 	cfg, err := ConfigFromEnv(func(key string) string {
-		if key == "DOMAIN_CHECK_CONCURRENCY" {
+		switch key {
+		case "DOMAIN_CHECK_CONCURRENCY":
 			return "12"
+		case "DOMAIN_CHECK_READY_CONCURRENCY":
+			return "3"
 		}
 		return ""
 	})
-	if err != nil || cfg.Concurrency != 12 {
-		t.Fatalf("unexpected concurrency: %d, %v", cfg.Concurrency, err)
+	if err != nil || cfg.Concurrency != 12 || cfg.ReadyConcurrency != 3 {
+		t.Fatalf("unexpected concurrency: workers=%d ready=%d err=%v", cfg.Concurrency, cfg.ReadyConcurrency, err)
 	}
 	for _, invalid := range []string{"0", "-1", "x", "257"} {
-		if _, err := ConfigFromEnv(func(string) string { return invalid }); err == nil {
+		if _, err := ConfigFromEnv(func(key string) string {
+			if key == "DOMAIN_CHECK_CONCURRENCY" {
+				return invalid
+			}
+			return ""
+		}); err == nil {
 			t.Errorf("accepted invalid concurrency %q", invalid)
+		}
+		if _, err := ConfigFromEnv(func(key string) string {
+			if key == "DOMAIN_CHECK_READY_CONCURRENCY" {
+				return invalid
+			}
+			return ""
+		}); err == nil {
+			t.Errorf("accepted invalid READY concurrency %q", invalid)
 		}
 	}
 	defaultConfig, err := ConfigFromEnv(func(string) string { return "" })
-	if err != nil || defaultConfig.Concurrency != 8 {
-		t.Fatalf("default concurrency = %d, %v", defaultConfig.Concurrency, err)
+	if err != nil || defaultConfig.Concurrency != 8 || defaultConfig.ReadyConcurrency != 4 {
+		t.Fatalf("default concurrency: workers=%d ready=%d err=%v", defaultConfig.Concurrency, defaultConfig.ReadyConcurrency, err)
 	}
 	if defaultConfig.ResponseHeaderTimeout != 2*time.Second || defaultConfig.HTTPTimeout != 2500*time.Millisecond {
 		t.Fatalf("unexpected HTTP budgets: headers=%v overall=%v", defaultConfig.ResponseHeaderTimeout, defaultConfig.HTTPTimeout)
@@ -259,6 +275,198 @@ func TestReadyAggregation(t *testing.T) {
 		if got != test.want || ok != test.ok {
 			t.Errorf("aggregateReady(%v) = %d,%v", test.values, got, ok)
 		}
+	}
+}
+
+func TestReadyConcurrencyLimiter(t *testing.T) {
+	updateMaximum := func(maximum *atomic.Int32, current int32) {
+		for {
+			old := maximum.Load()
+			if current <= old || maximum.CompareAndSwap(old, current) {
+				return
+			}
+		}
+	}
+
+	for _, readyConcurrency := range []int{1, 2} {
+		t.Run(fmt.Sprintf("limit_%d", readyConcurrency), func(t *testing.T) {
+			cfg := DefaultConfig()
+			cfg.ReadyConcurrency = readyConcurrency
+			detector, err := New(cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			const workers = 8
+			var overallActive atomic.Int32
+			var overallMaximum atomic.Int32
+			var readyActive atomic.Int32
+			var readyMaximum atomic.Int32
+			var arrived sync.WaitGroup
+			var finished sync.WaitGroup
+			arrived.Add(workers)
+			finished.Add(workers)
+			start := make(chan struct{})
+			for range workers {
+				go func() {
+					defer finished.Done()
+					current := overallActive.Add(1)
+					updateMaximum(&overallMaximum, current)
+					arrived.Done()
+					<-start
+					samples := detector.collectReady(context.Background(), func(context.Context) (time.Duration, error) {
+						current := readyActive.Add(1)
+						updateMaximum(&readyMaximum, current)
+						time.Sleep(5 * time.Millisecond)
+						readyActive.Add(-1)
+						return 7 * time.Millisecond, nil
+					})
+					overallActive.Add(-1)
+					if len(samples) != 3 {
+						t.Errorf("READY samples = %d, want 3", len(samples))
+					}
+				}()
+			}
+			arrived.Wait()
+			close(start)
+			finished.Wait()
+			if overallMaximum.Load() != workers {
+				t.Fatalf("overall concurrency = %d, want %d", overallMaximum.Load(), workers)
+			}
+			if readyMaximum.Load() != int32(readyConcurrency) {
+				t.Fatalf("READY concurrency = %d, want %d", readyMaximum.Load(), readyConcurrency)
+			}
+		})
+	}
+}
+
+func TestReadySlotCoversAllSamplesAndExcludesWait(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.ReadyConcurrency = 1
+	detector, _ := New(cfg)
+
+	var eventsMu sync.Mutex
+	var events []string
+	firstStarted := make(chan struct{})
+	var firstCount atomic.Int32
+	var secondCount atomic.Int32
+	firstDone := make(chan []time.Duration, 1)
+	secondDone := make(chan []time.Duration, 1)
+
+	go func() {
+		firstDone <- detector.collectReady(context.Background(), func(context.Context) (time.Duration, error) {
+			attempt := firstCount.Add(1)
+			eventsMu.Lock()
+			events = append(events, fmt.Sprintf("a%d", attempt))
+			eventsMu.Unlock()
+			if attempt == 1 {
+				close(firstStarted)
+			}
+			time.Sleep(10 * time.Millisecond)
+			return 5 * time.Millisecond, nil
+		})
+	}()
+	<-firstStarted
+	waitStarted := time.Now()
+	go func() {
+		secondDone <- detector.collectReady(context.Background(), func(context.Context) (time.Duration, error) {
+			attempt := secondCount.Add(1)
+			eventsMu.Lock()
+			events = append(events, fmt.Sprintf("b%d", attempt))
+			eventsMu.Unlock()
+			return 7 * time.Millisecond, nil
+		})
+	}()
+
+	firstSamples := <-firstDone
+	secondSamples := <-secondDone
+	if len(firstSamples) != 3 || len(secondSamples) != 3 {
+		t.Fatalf("unexpected sample counts: first=%d second=%d", len(firstSamples), len(secondSamples))
+	}
+	if waited := time.Since(waitStarted); waited < 15*time.Millisecond {
+		t.Fatalf("second domain did not wait for the first READY group: %v", waited)
+	}
+	eventsMu.Lock()
+	sequence := strings.Join(events, ",")
+	eventsMu.Unlock()
+	if sequence != "a1,a2,a3,b1,b2,b3" {
+		t.Fatalf("READY samples interleaved across domains: %s", sequence)
+	}
+	if readyMS, ok := aggregateReady(secondSamples); !ok || readyMS != 7 {
+		t.Fatalf("semaphore wait contaminated READY: %d,%v", readyMS, ok)
+	}
+}
+
+func TestReadySlotReleaseAndWaitCancellation(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.ReadyConcurrency = 1
+	detector, _ := New(cfg)
+
+	failed := detector.collectReady(context.Background(), func(context.Context) (time.Duration, error) {
+		return 0, errors.New("READY failed")
+	})
+	if len(failed) != 0 {
+		t.Fatalf("failed READY samples = %v", failed)
+	}
+	succeeded := detector.collectReady(context.Background(), func(context.Context) (time.Duration, error) {
+		return time.Millisecond, nil
+	})
+	if len(succeeded) != 3 {
+		t.Fatalf("READY slot was not released after failure: %v", succeeded)
+	}
+
+	detector.readySlots <- struct{}{}
+	defer func() { <-detector.readySlots }()
+	var probeCalls atomic.Int32
+	probe := func(context.Context) (time.Duration, error) {
+		probeCalls.Add(1)
+		return time.Millisecond, nil
+	}
+
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	started := time.Now()
+	if samples := detector.collectReady(canceled, probe); len(samples) != 0 {
+		t.Fatalf("canceled READY wait returned samples: %v", samples)
+	}
+	if elapsed := time.Since(started); elapsed > 100*time.Millisecond {
+		t.Fatalf("canceled READY wait was delayed: %v", elapsed)
+	}
+
+	deadline, cancelDeadline := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer cancelDeadline()
+	started = time.Now()
+	if samples := detector.collectReady(deadline, probe); len(samples) != 0 {
+		t.Fatalf("expired domain wait returned samples: %v", samples)
+	}
+	if elapsed := time.Since(started); elapsed < 20*time.Millisecond || elapsed > 200*time.Millisecond {
+		t.Fatalf("domain deadline while waiting elapsed=%v", elapsed)
+	}
+	if probeCalls.Load() != 0 {
+		t.Fatalf("READY probe ran without acquiring a slot: %d", probeCalls.Load())
+	}
+}
+
+func TestReadyLimiterDoesNotAffectPrimaryTLSOrHTTP(t *testing.T) {
+	const domain = "ready-isolation.test"
+	server := startTLSServer(t, domain, []tls.CurveID{tls.X25519}, http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		writer.WriteHeader(http.StatusNoContent)
+	}))
+	cfg := configForServer(server, &fakeResolver{})
+	cfg.ReadyConcurrency = 1
+	detector, _ := New(cfg)
+	detector.readySlots <- struct{}{}
+	defer func() { <-detector.readySlots }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	tlsResult, tlsOK := detector.probeTLSWithFallback(ctx, domain, net.ParseIP("127.0.0.1"))
+	if !tlsOK || !tlsResult.TLS13 || !tlsResult.X25519 || !tlsResult.H2 || !tlsResult.Cert {
+		t.Fatalf("READY limiter affected PRIMARY TLS: %+v ok=%v", tlsResult, tlsOK)
+	}
+	httpResult := detector.probeHTTP(ctx, domain, net.ParseIP("127.0.0.1"))
+	if !httpResult.OK || httpResult.Code != http.StatusNoContent || httpResult.Attempts != 1 {
+		t.Fatalf("READY limiter affected HTTP: %+v", httpResult)
 	}
 }
 

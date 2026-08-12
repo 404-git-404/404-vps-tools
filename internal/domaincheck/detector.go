@@ -15,15 +15,16 @@ import (
 )
 
 type Detector struct {
-	cfg Config
+	cfg        Config
+	readySlots chan struct{}
 }
 
 func New(cfg Config) (*Detector, error) {
-	if cfg.Concurrency < 1 || cfg.Port == "" || cfg.Resolver == nil ||
+	if cfg.Concurrency < 1 || cfg.ReadyConcurrency < 1 || cfg.Port == "" || cfg.Resolver == nil ||
 		cfg.DialContext == nil || cfg.Now == nil {
 		return nil, errors.New("invalid detector configuration")
 	}
-	return &Detector{cfg: cfg}, nil
+	return &Detector{cfg: cfg, readySlots: make(chan struct{}, cfg.ReadyConcurrency)}, nil
 }
 
 func (d *Detector) Run(ctx context.Context, domains []string, progress func(int, int, string)) []Result {
@@ -120,12 +121,9 @@ func (d *Detector) Check(ctx context.Context, domain string) Result {
 		return result
 	}
 
-	ready := make([]time.Duration, 0, 3)
-	for range 3 {
-		if elapsed, err := d.probeReady(ctx, domain, target.IP); err == nil {
-			ready = append(ready, elapsed)
-		}
-	}
+	ready := d.collectReady(ctx, func(ctx context.Context) (time.Duration, error) {
+		return d.probeReady(ctx, domain, target.IP)
+	})
 	if milliseconds, ok := aggregateReady(ready); ok {
 		result.ReadyMS = fmt.Sprintf("%d", milliseconds)
 	}
@@ -281,6 +279,26 @@ func (d *Detector) probeTLSWithFallback(ctx context.Context, domain string, ip n
 func (d *Detector) probeReady(ctx context.Context, domain string, ip net.IP) (time.Duration, error) {
 	_, elapsed, err := d.tlsHandshake(ctx, domain, ip, false, true, d.cfg.ReadyTimeout)
 	return elapsed, err
+}
+
+func (d *Detector) collectReady(ctx context.Context, probe func(context.Context) (time.Duration, error)) []time.Duration {
+	// Limit only timing probes. Waiting happens before probeReady starts its
+	// timer, and one domain keeps its slot across all three samples so a busy
+	// batch neither inflates READY nor interleaves a domain's sample group.
+	select {
+	case d.readySlots <- struct{}{}:
+	case <-ctx.Done():
+		return nil
+	}
+	defer func() { <-d.readySlots }()
+
+	samples := make([]time.Duration, 0, 3)
+	for range 3 {
+		if elapsed, err := probe(ctx); err == nil {
+			samples = append(samples, elapsed)
+		}
+	}
+	return samples
 }
 
 func aggregateReady(samples []time.Duration) (int64, bool) {
