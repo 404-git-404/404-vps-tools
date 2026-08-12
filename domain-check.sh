@@ -9,7 +9,7 @@ readonly DOMAIN_HARD_TIMEOUT=90
 readonly DOMAIN_TERMINATE_GRACE=2
 readonly DNS_TIMEOUT=6
 readonly TCP_TIMEOUT=6
-readonly TLS_TIMEOUT=10
+readonly TLS_TIMEOUT=4
 readonly HTTP_TIMEOUT=10
 readonly HTTP_USER_AGENT='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0 Safari/537.36'
 
@@ -47,8 +47,9 @@ CDN_DETAIL=''
 CERTIFICATE_EXPIRY_STATUS='PASS'
 CERTIFICATE_DAYS='-'
 CERTIFICATE_WARNING=''
-MARKDOWN_LOG_PATH=''
-MARKDOWN_ESCAPED_VALUE=''
+HTML_LOG_PATH=''
+HTML_ESCAPED_VALUE=''
+HTML_CSS_CLASS=''
 BORDER_HORIZONTAL='-'
 BORDER_VERTICAL='|'
 BORDER_TOP_LEFT='+'
@@ -1715,19 +1716,69 @@ print_results() {
   print_table
 }
 
-set_markdown_escaped_value() {
+set_html_escaped_value() {
   local value=$1
-  value=${value//\\/\\\\}
-  value=${value//|/\\|}
-  MARKDOWN_ESCAPED_VALUE=$value
+  local character
+  local escaped=''
+  local position
+
+  for (( position = 0; position < ${#value}; position += 1 )); do
+    character=${value:position:1}
+    case "$character" in
+      '&') escaped+='&amp;' ;;
+      '<') escaped+='&lt;' ;;
+      '>') escaped+='&gt;' ;;
+      '"') escaped+='&quot;' ;;
+      "'") escaped+='&#39;' ;;
+      *) escaped+=$character ;;
+    esac
+  done
+  HTML_ESCAPED_VALUE=$escaped
 }
 
-escape_markdown_cell() {
-  set_markdown_escaped_value "$1"
-  printf '%s' "$MARKDOWN_ESCAPED_VALUE"
+escape_html() {
+  set_html_escaped_value "$1"
+  printf '%s' "$HTML_ESCAPED_VALUE"
 }
 
-render_markdown_report() {
+set_status_css_class() {
+  case ${1:-} in
+    PASS) HTML_CSS_CLASS='status status-pass' ;;
+    WARN) HTML_CSS_CLASS='status status-warn' ;;
+    FAIL) HTML_CSS_CLASS='status status-fail' ;;
+    HIGH) HTML_CSS_CLASS='status status-high' ;;
+    -|'') HTML_CSS_CLASS='muted' ;;
+    *) HTML_CSS_CLASS='value' ;;
+  esac
+}
+
+set_http_css_class() {
+  case ${1:-} in
+    2??) HTML_CSS_CLASS='http http-2xx' ;;
+    3??) HTML_CSS_CLASS='http http-3xx' ;;
+    4??) HTML_CSS_CLASS='http http-4xx' ;;
+    5??) HTML_CSS_CLASS='http http-5xx' ;;
+    -|'') HTML_CSS_CLASS='muted' ;;
+    *) HTML_CSS_CLASS='http' ;;
+  esac
+}
+
+set_detail_css_class() {
+  local final_status=$1
+  local reason=$2
+
+  if [[ "$reason" == CDN\ * ]]; then
+    HTML_CSS_CLASS='detail-info'
+  elif [[ "$final_status" == 'FAIL' ]]; then
+    HTML_CSS_CLASS='detail-fail'
+  elif [[ "$final_status" == 'WARN' ]]; then
+    HTML_CSS_CLASS='detail-warn'
+  else
+    HTML_CSS_CLASS='detail-info'
+  fi
+}
+
+render_html_report() {
   local generated_at=$1
   local index
   local domain
@@ -1747,14 +1798,24 @@ render_markdown_report() {
   local pass_count=0
   local warn_count=0
   local fail_count=0
+  local domain_class
+  local ip_class
+  local tls_class
+  local x25519_class
+  local h2_class
+  local ready_class
+  local certificate_class
+  local cdn_class
+  local http_class
+  local redirect_class
+  local result_class
+  local detail_class
   local -a reason_parts=()
 
   for index in "${!DOMAIN_INPUTS[@]}"; do
     IFS=$'\t' read -r domain _ _ _ _ _ _ _ _ _ final_status _ \
       <"$TEMP_DIR/result-$index"
-    if [[ -n "$input_targets" ]]; then
-      input_targets+='/'
-    fi
+    [[ -z "$input_targets" ]] || input_targets+='/'
     input_targets+=$domain
     case "$final_status" in
       PASS) (( pass_count += 1 )) ;;
@@ -1762,69 +1823,117 @@ render_markdown_report() {
       FAIL) (( fail_count += 1 )) ;;
     esac
   done
-  printf '# Domain Check Report\n\n'
-  printf -- "- Time: \`%s\`\n" "$generated_at"
-  printf -- "- Input: \`%s\`\n" "$input_targets"
-  printf -- '- Targets: %d\n' "${#DOMAIN_INPUTS[@]}"
-  printf -- '- Summary: PASS %d / WARN %d / FAIL %d\n\n' \
-    "$pass_count" "$warn_count" "$fail_count"
+  set_html_escaped_value "$generated_at"
+  generated_at=$HTML_ESCAPED_VALUE
+  set_html_escaped_value "$input_targets"
+  input_targets=$HTML_ESCAPED_VALUE
+
   printf '%s\n' \
-    '| DOMAIN | IP | TLS1.3 | X25519 | H2 | READY(ms) | CERT(d) | CDN | HTTP | REDIRECT | RESULT |' \
-    '|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|'
+    '<!doctype html>' \
+    '<html lang="en">' \
+    '<head>' \
+    '<meta charset="utf-8">' \
+    '<meta name="viewport" content="width=device-width, initial-scale=1">' \
+    '<title>Domain Check Report</title>' \
+    '<style>' \
+    ':root{color-scheme:dark light;--bg:#0b0f14;--panel:#111820;--text:#d7e0e8;--muted:#74808b;--border:#33404c;--head:#17212b;--domain:#54d6e8;--ip:#e08cff;--pass:#53d769;--warn:#f6bd4b;--fail:#ff626e;--high:#4fc3f7;--ready:#8bd5ff;--row:#0e151c}' \
+    '*{box-sizing:border-box}' \
+    'body{margin:0;background:var(--bg);color:var(--text);font-family:ui-monospace,SFMono-Regular,Consolas,"Liberation Mono",monospace;font-size:13px;line-height:1.35}' \
+    'main{max-width:1600px;margin:0 auto;padding:18px}' \
+    'h1{margin:0 0 10px;font-size:21px;color:var(--domain)}' \
+    '.meta{display:grid;grid-template-columns:max-content 1fr;gap:3px 10px;margin-bottom:10px}.meta dt{color:var(--muted)}.meta dd{margin:0;overflow-wrap:anywhere}' \
+    '.summary{display:flex;flex-wrap:wrap;gap:6px;margin:8px 0 12px}.summary-item{border:1px solid var(--border);background:var(--panel);padding:3px 8px;border-radius:4px}.summary-item strong{margin-left:6px}' \
+    '.table-wrap{overflow-x:auto;border:1px solid var(--border)}' \
+    'table{width:100%;border-collapse:collapse;white-space:nowrap;background:var(--panel)}' \
+    'th,td{border-right:1px solid var(--border);border-bottom:1px solid var(--border);padding:4px 7px;text-align:left}th:last-child,td:last-child{border-right:0}tbody tr:last-child td{border-bottom:0}' \
+    'th{background:var(--head);color:var(--text);font-weight:700}tbody tr:nth-child(even){background:var(--row)}' \
+    '.domain{color:var(--domain)}.ip{color:var(--ip)}.muted{color:var(--muted)}.ready{color:var(--ready)}' \
+    '.status,.result,.http{font-weight:700}.status-pass,.http-2xx{color:var(--pass)}.status-warn,.http-4xx{color:var(--warn)}.status-fail,.http-5xx{color:var(--fail)}.status-high,.http-3xx{color:var(--high)}' \
+    '.result{font-weight:800;text-shadow:0 0 8px color-mix(in srgb,currentColor 30%,transparent)}' \
+    '.details{margin-top:14px}.details h2{font-size:16px;margin:0 0 7px}.detail-card{border-left:3px solid var(--border);background:var(--panel);padding:6px 9px;margin:0 0 6px}.detail-card h3{font-size:13px;color:var(--domain);margin:0 0 3px}.detail-card ul{margin:0;padding-left:18px}.detail-card li{margin:1px 0}.detail-fail{color:var(--fail)}.detail-warn{color:var(--warn)}.detail-info{color:var(--high)}' \
+    '@media (prefers-color-scheme:dark){:root{color-scheme:dark}}' \
+    '@media (prefers-color-scheme:light){:root{--bg:#f6f8fa;--panel:#fff;--text:#20262d;--muted:#69737d;--border:#b8c1ca;--head:#e8edf2;--domain:#007c91;--ip:#a11bb8;--pass:#187c2f;--warn:#a96100;--fail:#c51f32;--high:#006ea6;--ready:#006b9e;--row:#f3f6f8}}' \
+    '</style>' \
+    '</head>' \
+    '<body>' \
+    '<main>' \
+    '<h1>Domain Check Report</h1>'
+  printf '<dl class="meta"><dt>Time</dt><dd>%s</dd><dt>Input</dt><dd>%s</dd></dl>\n' \
+    "$generated_at" "$input_targets"
+  printf '<div class="summary"><span class="summary-item"><span>Targets</span><strong>%d</strong></span>' \
+    "${#DOMAIN_INPUTS[@]}"
+  printf '<span class="summary-item status-pass"><span>PASS</span><strong>%d</strong></span>' "$pass_count"
+  printf '<span class="summary-item status-warn"><span>WARN</span><strong>%d</strong></span>' "$warn_count"
+  printf '<span class="summary-item status-fail"><span>FAIL</span><strong>%d</strong></span></div>\n' "$fail_count"
+  printf '%s\n' \
+    '<div class="table-wrap"><table>' \
+    '<thead><tr><th>DOMAIN</th><th>IP</th><th>TLS1.3</th><th>X25519</th><th>H2</th><th>READY(ms)</th><th>CERT(d)</th><th>CDN</th><th>HTTP</th><th>REDIRECT</th><th>RESULT</th></tr></thead>' \
+    '<tbody>'
 
   for index in "${!DOMAIN_INPUTS[@]}"; do
     IFS=$'\t' read -r domain ip tls_status x25519_status h2_status \
       ready_ms certificate_days cdn_status http_status redirect_code \
       final_status reasons <"$TEMP_DIR/result-$index"
-    set_markdown_escaped_value "$domain"
-    domain=$MARKDOWN_ESCAPED_VALUE
-    set_markdown_escaped_value "$ip"
-    ip=$MARKDOWN_ESCAPED_VALUE
-    set_markdown_escaped_value "$tls_status"
-    tls_status=$MARKDOWN_ESCAPED_VALUE
-    set_markdown_escaped_value "$x25519_status"
-    x25519_status=$MARKDOWN_ESCAPED_VALUE
-    set_markdown_escaped_value "$h2_status"
-    h2_status=$MARKDOWN_ESCAPED_VALUE
-    set_markdown_escaped_value "$ready_ms"
-    ready_ms=$MARKDOWN_ESCAPED_VALUE
-    set_markdown_escaped_value "$certificate_days"
-    certificate_days=$MARKDOWN_ESCAPED_VALUE
-    set_markdown_escaped_value "$cdn_status"
-    cdn_status=$MARKDOWN_ESCAPED_VALUE
-    set_markdown_escaped_value "$http_status"
-    http_status=$MARKDOWN_ESCAPED_VALUE
-    set_markdown_escaped_value "$redirect_code"
-    redirect_code=$MARKDOWN_ESCAPED_VALUE
-    set_markdown_escaped_value "$final_status"
-    final_status=$MARKDOWN_ESCAPED_VALUE
-    printf '| %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s |\n' \
-      "$domain" "$ip" "$tls_status" "$x25519_status" "$h2_status" \
-      "$ready_ms" "$certificate_days" "$cdn_status" "$http_status" \
-      "$redirect_code" "$final_status"
+    set_html_escaped_value "$domain"; domain=$HTML_ESCAPED_VALUE
+    set_html_escaped_value "$ip"; ip=$HTML_ESCAPED_VALUE
+    set_html_escaped_value "$tls_status"; tls_status=$HTML_ESCAPED_VALUE
+    set_html_escaped_value "$x25519_status"; x25519_status=$HTML_ESCAPED_VALUE
+    set_html_escaped_value "$h2_status"; h2_status=$HTML_ESCAPED_VALUE
+    set_html_escaped_value "$ready_ms"; ready_ms=$HTML_ESCAPED_VALUE
+    set_html_escaped_value "$certificate_days"; certificate_days=$HTML_ESCAPED_VALUE
+    set_html_escaped_value "$cdn_status"; cdn_status=$HTML_ESCAPED_VALUE
+    set_html_escaped_value "$http_status"; http_status=$HTML_ESCAPED_VALUE
+    set_html_escaped_value "$redirect_code"; redirect_code=$HTML_ESCAPED_VALUE
+    set_html_escaped_value "$final_status"; final_status=$HTML_ESCAPED_VALUE
+    domain_class='domain'
+    ip_class='ip'
+    set_status_css_class "$tls_status"; tls_class=$HTML_CSS_CLASS
+    set_status_css_class "$x25519_status"; x25519_class=$HTML_CSS_CLASS
+    set_status_css_class "$h2_status"; h2_class=$HTML_CSS_CLASS
+    [[ "$ready_ms" == '-' ]] && ready_class='muted' || ready_class='ready'
+    set_status_css_class "$certificate_days"; certificate_class=$HTML_CSS_CLASS
+    set_status_css_class "$cdn_status"; cdn_class=$HTML_CSS_CLASS
+    set_http_css_class "$http_status"; http_class=$HTML_CSS_CLASS
+    set_status_css_class "$redirect_code"; redirect_class=$HTML_CSS_CLASS
+    set_status_css_class "$final_status"; result_class="result ${HTML_CSS_CLASS#status }"
+    printf '<tr><td class="%s">%s</td><td class="%s">%s</td>' \
+      "$domain_class" "$domain" "$ip_class" "$ip"
+    printf '<td class="%s">%s</td><td class="%s">%s</td><td class="%s">%s</td>' \
+      "$tls_class" "$tls_status" "$x25519_class" "$x25519_status" \
+      "$h2_class" "$h2_status"
+    printf '<td class="%s">%s</td><td class="%s">%s</td><td class="%s">%s</td>' \
+      "$ready_class" "$ready_ms" "$certificate_class" "$certificate_days" \
+      "$cdn_class" "$cdn_status"
+    printf '<td class="%s">%s</td><td class="%s">%s</td><td class="%s">%s</td></tr>\n' \
+      "$http_class" "$http_status" "$redirect_class" "$redirect_code" \
+      "$result_class" "$final_status"
   done
 
-  printf '\n## DETAILS\n\n'
-  for index in "${!DOMAIN_INPUTS[@]}"; do
-    IFS=$'\t' read -r domain _ _ _ _ _ _ _ _ _ _ reasons \
-      <"$TEMP_DIR/result-$index"
-    [[ "$reasons" != '-' ]] || continue
-    IFS=';' read -r -a reason_parts <<<"$reasons"
-    for reason_part in "${reason_parts[@]}"; do
-      reason_part=${reason_part#"${reason_part%%[![:space:]]*}"}
-      set_markdown_escaped_value "$domain"
-      domain=$MARKDOWN_ESCAPED_VALUE
-      set_markdown_escaped_value "$reason_part"
-      reason_part=$MARKDOWN_ESCAPED_VALUE
-      printf -- '- **%s**: %s\n' "$domain" "$reason_part"
+  printf '%s\n' '</tbody></table></div>' '<section class="details"><h2>DETAILS</h2>'
+  if table_has_details; then
+    for index in "${!DOMAIN_INPUTS[@]}"; do
+      IFS=$'\t' read -r domain _ _ _ _ _ _ _ _ _ final_status reasons \
+        <"$TEMP_DIR/result-$index"
+      [[ "$reasons" != '-' ]] || continue
+      set_html_escaped_value "$domain"; domain=$HTML_ESCAPED_VALUE
+      printf '<article class="detail-card"><h3>%s</h3><ul>\n' "$domain"
+      IFS=';' read -r -a reason_parts <<<"$reasons"
+      for reason_part in "${reason_parts[@]}"; do
+        reason_part=${reason_part#"${reason_part%%[![:space:]]*}"}
+        set_detail_css_class "$final_status" "$reason_part"
+        detail_class=$HTML_CSS_CLASS
+        set_html_escaped_value "$reason_part"; reason_part=$HTML_ESCAPED_VALUE
+        printf '<li class="%s">%s</li>\n' "$detail_class" "$reason_part"
+      done
+      printf '%s\n' '</ul></article>'
     done
-  done
-  if ! table_has_details; then
-    printf '%s\n' '- None'
+  else
+    printf '%s\n' '<p class="muted">None</p>'
   fi
+  printf '%s\n' '</section>' '</main>' '</body>' '</html>'
 }
 
-write_markdown_log() {
+write_html_log() {
   local log_home=${HOME:-}
   local log_dir
   local log_timestamp
@@ -1832,15 +1941,15 @@ write_markdown_log() {
   local reservation_attempt
   local reserved=false
 
-  MARKDOWN_LOG_PATH=''
+  HTML_LOG_PATH=''
   if [[ -z "$log_home" || "$log_home" != /* ]]; then
-    printf '%s: WARN: unable to create Markdown log: HOME is not absolute.\n' \
+    printf '%s: WARN: unable to create HTML log: HOME is not absolute.\n' \
       "$PROGRAM_NAME" >&2
     return 0
   fi
   log_dir="$log_home/domain-check-logs"
   if ! mkdir -p -- "$log_dir"; then
-    printf '%s: WARN: unable to create Markdown log directory: %s\n' \
+    printf '%s: WARN: unable to create HTML log directory: %s\n' \
       "$PROGRAM_NAME" "$log_dir" >&2
     return 0
   fi
@@ -1848,8 +1957,8 @@ write_markdown_log() {
   for reservation_attempt in 1 2 3; do
     log_timestamp=$(date '+%Y%m%d-%H%M%S') || log_timestamp=''
     if [[ "$log_timestamp" =~ ^[0-9]{8}-[0-9]{6}$ ]]; then
-      MARKDOWN_LOG_PATH="$log_dir/domain-check-$log_timestamp.md"
-      if (set -o noclobber; : >"$MARKDOWN_LOG_PATH") 2>/dev/null; then
+      HTML_LOG_PATH="$log_dir/domain-check-$log_timestamp.html"
+      if (set -o noclobber; : >"$HTML_LOG_PATH") 2>/dev/null; then
         reserved=true
         break
       fi
@@ -1857,21 +1966,21 @@ write_markdown_log() {
     (( reservation_attempt < 3 )) && sleep 1
   done
   if [[ "$reserved" != true ]]; then
-    MARKDOWN_LOG_PATH=''
-    printf '%s: WARN: unable to reserve a unique Markdown log file in: %s\n' \
+    HTML_LOG_PATH=''
+    printf '%s: WARN: unable to reserve a unique HTML log file in: %s\n' \
       "$PROGRAM_NAME" "$log_dir" >&2
     return 0
   fi
 
   generated_at=$(date -u '+%Y-%m-%d %H:%M:%S UTC') || generated_at='-'
-  if ! render_markdown_report "$generated_at" >"$MARKDOWN_LOG_PATH"; then
-    rm -f -- "$MARKDOWN_LOG_PATH"
-    printf '%s: WARN: unable to write Markdown log: %s\n' \
-      "$PROGRAM_NAME" "$MARKDOWN_LOG_PATH" >&2
-    MARKDOWN_LOG_PATH=''
+  if ! render_html_report "$generated_at" >"$HTML_LOG_PATH"; then
+    rm -f -- "$HTML_LOG_PATH"
+    printf '%s: WARN: unable to write HTML log: %s\n' \
+      "$PROGRAM_NAME" "$HTML_LOG_PATH" >&2
+    HTML_LOG_PATH=''
     return 0
   fi
-  printf 'Markdown log: %s\n' "$MARKDOWN_LOG_PATH" >&2
+  printf 'HTML log: %s\n' "$HTML_LOG_PATH" >&2
 }
 
 main() {
@@ -1924,7 +2033,7 @@ main() {
   if ! aggregate_exit_code "${RESULT_STATUSES[@]}"; then
     final_exit_code=1
   fi
-  write_markdown_log
+  write_html_log
   exit "$final_exit_code"
 }
 

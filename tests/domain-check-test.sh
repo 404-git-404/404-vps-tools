@@ -598,6 +598,8 @@ assert_file_not_contains 'TLS_SAMPLES' "$DOMAIN_CHECK_SCRIPT" \
   'there is no alternate TLS sample-count control'
 assert_equal '8' "$MAX_CONCURRENCY" \
   'domain workers use the fixed eight-worker limit'
+assert_equal '4' "$TLS_TIMEOUT" \
+  'TLS and X25519 probes use the four-second qualification timeout'
 assert_file_contains 'trap handle_interrupt INT TERM' "$DOMAIN_CHECK_SCRIPT" \
   'worker signal cleanup path remains installed'
 assert_file_contains 'terminate_workers' "$DOMAIN_CHECK_SCRIPT" \
@@ -867,54 +869,113 @@ assert_equal "${#details_lines[0]}" \
   "${#details_lines[${#details_lines[@]} - 1]}" \
   'DETAILS bottom border matches the main table width'
 
-markdown_output=$(render_markdown_report '2026-08-12 12:34:56 UTC')
-assert_contains '# Domain Check Report' "$markdown_output" \
-  'Markdown report has a document heading'
-assert_contains "- Time: \`2026-08-12 12:34:56 UTC\`" "$markdown_output" \
-  'Markdown report includes its generation time'
+html_hostile_reason='remote & <tag> "quote" '\''apostrophe'\'''
+printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+  'second.example.com' '1.2.3.4' PASS PASS PASS 25 20 HIGH 301 WWW WARN \
+  "跳转：www 切换; $html_hostile_reason" >"$TEMP_DIR/result-1"
+html_output=$(render_html_report '2026-08-12 12:34:56 UTC')
+assert_contains '<!doctype html>' "$html_output" \
+  'HTML report has a document type'
+assert_contains '<meta charset="utf-8">' "$html_output" \
+  'HTML report declares UTF-8'
+assert_contains '<style>' "$html_output" \
+  'HTML report embeds its stylesheet'
+assert_contains '@media (prefers-color-scheme:light)' "$html_output" \
+  'HTML report supports the light color scheme'
+assert_contains '@media (prefers-color-scheme:dark)' "$html_output" \
+  'HTML report supports the dark color scheme'
+assert_contains '<h1>Domain Check Report</h1>' "$html_output" \
+  'HTML report has its heading'
+assert_contains '<dt>Time</dt><dd>2026-08-12 12:34:56 UTC</dd>' \
+  "$html_output" 'HTML report includes its generation time'
+assert_contains "<dt>Input</dt><dd>$long_domain/second.example.com</dd>" \
+  "$html_output" 'HTML report includes slash-separated input targets'
+assert_contains '<span>Targets</span><strong>2</strong>' "$html_output" \
+  'HTML report includes the target count'
+assert_contains '<span>PASS</span><strong>1</strong>' "$html_output" \
+  'HTML report includes the PASS count'
+assert_contains '<span>WARN</span><strong>1</strong>' "$html_output" \
+  'HTML report includes the WARN count'
+assert_contains '<span>FAIL</span><strong>0</strong>' "$html_output" \
+  'HTML report includes the FAIL count'
 assert_contains \
-  "- Input: \`$long_domain/second.example.com\`" "$markdown_output" \
-  'Markdown report includes slash-separated input targets'
-assert_contains '- Targets: 2' "$markdown_output" \
-  'Markdown report includes the target count'
-assert_contains '- Summary: PASS 1 / WARN 1 / FAIL 0' "$markdown_output" \
-  'Markdown report summarizes result statuses from result files'
+  '<thead><tr><th>DOMAIN</th><th>IP</th><th>TLS1.3</th><th>X25519</th><th>H2</th><th>READY(ms)</th><th>CERT(d)</th><th>CDN</th><th>HTTP</th><th>REDIRECT</th><th>RESULT</th></tr></thead>' \
+  "$html_output" 'HTML table contains every terminal result field'
+assert_contains '<td class="status status-pass">PASS</td>' "$html_output" \
+  'HTML table applies the PASS status class'
+assert_contains '<td class="result status-warn">WARN</td>' "$html_output" \
+  'HTML table applies the WARN result class'
+assert_contains '<td class="status status-high">HIGH</td>' "$html_output" \
+  'HTML table applies the HIGH status class'
+assert_contains '<td class="http http-2xx">200</td>' "$html_output" \
+  'HTML table applies the 2xx HTTP class'
+assert_contains '<td class="http http-3xx">301</td>' "$html_output" \
+  'HTML table applies the 3xx HTTP class'
+set_http_css_class 403
+assert_equal 'http http-4xx' "$HTML_CSS_CLASS" \
+  'HTML table maps 4xx responses to the warning class'
+set_http_css_class 503
+assert_equal 'http http-5xx' "$HTML_CSS_CLASS" \
+  'HTML table maps 5xx responses to the failure class'
+assert_contains '<section class="details"><h2>DETAILS</h2>' "$html_output" \
+  'HTML report contains a DETAILS section'
+assert_contains '<article class="detail-card"><h3>second.example.com</h3>' \
+  "$html_output" 'HTML DETAILS identifies its domain'
+assert_contains '<li class="detail-warn">跳转：www 切换</li>' "$html_output" \
+  'HTML DETAILS applies the warning class'
 assert_contains \
-  '| DOMAIN | IP | TLS1.3 | X25519 | H2 | READY(ms) | CERT(d) | CDN | HTTP | REDIRECT | RESULT |' \
-  "$markdown_output" 'Markdown report uses a real pipe-table header'
-assert_contains \
-  '| second.example.com | 1.2.3.4 | PASS | PASS | PASS | 25 | 20 | - | 301 | WWW | WARN |' \
-  "$markdown_output" 'Markdown table renders structured result fields'
-assert_contains '## DETAILS' "$markdown_output" \
-  'Markdown report has a DETAILS heading'
-assert_contains '- **second.example.com**: 跳转：www 切换' "$markdown_output" \
-  'Markdown DETAILS uses bullets'
-assert_not_contains $'\033[' "$markdown_output" \
-  'Markdown report never contains terminal ANSI escapes'
-assert_equal 'a\|b' "$(escape_markdown_cell 'a|b')" \
-  'Markdown cells escape pipe characters'
+  'remote &amp; &lt;tag&gt; &quot;quote&quot; &#39;apostrophe&#39;' \
+  "$html_output" 'HTML escapes all special characters in remote details'
+assert_not_contains 'remote & <tag>' "$html_output" \
+  'HTML never emits an unescaped hostile detail'
+assert_not_contains $'\033[' "$html_output" \
+  'HTML report never contains terminal ANSI escapes'
+html_escape_input='&<>"'\'''
+assert_equal '&amp;&lt;&gt;&quot;&#39;' "$(escape_html "$html_escape_input")" \
+  'HTML escape helper handles ampersand, angles, quotes, and apostrophes'
 
-markdown_log_stderr=$(
-  HOME="$TEST_LOG_HOME/render" write_markdown_log 2>&1
-)
-markdown_log_path=${markdown_log_stderr#Markdown log: }
+html_log_stderr=$(HOME="$TEST_LOG_HOME/render" write_html_log 2>&1)
+html_log_path=${html_log_stderr#HTML log: }
 assert_equal 'true' \
-  "$([[ "$markdown_log_path" == "$TEST_LOG_HOME"/render/domain-check-logs/domain-check-*.md &&
-    -s "$markdown_log_path" ]] && printf true || printf false)" \
-  'automatic Markdown log is written below the configured home directory'
-assert_file_contains '# Domain Check Report' "$markdown_log_path" \
-  'automatic Markdown log contains the rendered report'
+  "$([[ "$html_log_path" == "$TEST_LOG_HOME"/render/domain-check-logs/domain-check-*.html &&
+    -s "$html_log_path" ]] && printf true || printf false)" \
+  'automatic HTML log is written below the configured home directory'
+assert_file_contains '<h1>Domain Check Report</h1>' "$html_log_path" \
+  'automatic HTML log contains the rendered report'
+html_second_stderr=$(HOME="$TEST_LOG_HOME/render" write_html_log 2>&1)
+html_second_path=${html_second_stderr#HTML log: }
+assert_equal 'true' \
+  "$([[ -s "$html_second_path" && "$html_second_path" != "$html_log_path" ]] &&
+    printf true || printf false)" \
+  'automatic HTML logs reserve unique files without overwriting'
+assert_equal '0' \
+  "$(find "$TEST_LOG_HOME/render/domain-check-logs" -maxdepth 1 \
+    -type f -name '*.md' | wc -l)" \
+  'automatic logging no longer creates legacy .md files'
 
-markdown_failure_home="$TEST_TEMP_DIR/markdown-home-file"
-printf '%s\n' 'not a directory' >"$markdown_failure_home"
+html_failure_home="$TEST_TEMP_DIR/html-home-file"
+printf '%s\n' 'not a directory' >"$html_failure_home"
 set +e
-markdown_failure_warning=$(HOME="$markdown_failure_home" write_markdown_log 2>&1)
-markdown_failure_status=$?
+html_failure_warning=$(HOME="$html_failure_home" write_html_log 2>&1)
+html_failure_status=$?
 set -e
-assert_equal '0' "$markdown_failure_status" \
-  'Markdown log failure does not change the detector status'
-assert_contains 'WARN: unable to create Markdown log directory' \
-  "$markdown_failure_warning" 'Markdown log failure emits an explicit warning'
+assert_equal '0' "$html_failure_status" \
+  'HTML log failure does not change the detector status'
+assert_contains 'WARN: unable to create HTML log directory' \
+  "$html_failure_warning" 'HTML log failure emits an explicit warning'
+
+html_render_failure_warning=$(
+  # Called indirectly by write_html_log in this isolated subshell.
+  # shellcheck disable=SC2329
+  render_html_report() { return 1; }
+  HOME="$TEST_LOG_HOME/render-failure" write_html_log 2>&1
+)
+assert_contains 'WARN: unable to write HTML log' \
+  "$html_render_failure_warning" 'HTML render failure emits an explicit warning'
+assert_equal '0' \
+  "$(find "$TEST_LOG_HOME/render-failure/domain-check-logs" -maxdepth 1 \
+    -type f -name '*.html' | wc -l)" \
+  'failed HTML render removes its incomplete reserved file'
 
 MOCK_BIN="$TEST_TEMP_DIR/mock-bin"
 MOCK_LOG_DIR="$TEST_TEMP_DIR/mock-log"
@@ -1151,16 +1212,21 @@ run_mocked_domain_check \
   '0.100|0.200|0.050'
 assert_equal '0' "$MOCK_RUN_STATUS" \
   'successful OpenSSL commands with complete parsed evidence pass'
-mock_markdown_log=$(find "$TEST_LOG_HOME/mock/domain-check-logs" \
-  -maxdepth 1 -type f -name 'domain-check-*.md' -print -quit)
+mock_html_log=$(find "$TEST_LOG_HOME/mock/domain-check-logs" \
+  -maxdepth 1 -type f -name 'domain-check-*.html' -print -quit)
 assert_equal 'true' \
-  "$([[ -n "$mock_markdown_log" && -s "$mock_markdown_log" ]] &&
+  "$([[ -n "$mock_html_log" && -s "$mock_html_log" ]] &&
     printf true || printf false)" \
-  'successful detector run writes one complete Markdown log'
-assert_contains "Markdown log: $mock_markdown_log" "$MOCK_RUN_OUTPUT" \
-  'detector reports the absolute Markdown log path on stderr'
-assert_file_contains '- Summary: PASS 1 / WARN 0 / FAIL 0' \
-  "$mock_markdown_log" 'successful Markdown log contains the PASS summary'
+  'successful detector run writes one complete HTML log'
+assert_contains "HTML log: $mock_html_log" "$MOCK_RUN_OUTPUT" \
+  'detector reports the absolute HTML log path on stderr'
+assert_file_contains \
+  '<span class="summary-item status-pass"><span>PASS</span><strong>1</strong></span>' \
+  "$mock_html_log" 'successful HTML log contains the PASS summary'
+assert_equal '0' \
+  "$(find "$TEST_LOG_HOME/mock/domain-check-logs" -maxdepth 1 \
+    -type f -name '*.md' | wc -l)" \
+  'successful detector run creates no legacy .md log'
 assert_equal '5' "$(<"$MOCK_LOG_DIR/curl.count")" \
   'worker uses three READY connections and two strict HTTP attempts'
 assert_contains 'READY(ms)' "$MOCK_RUN_OUTPUT" \
@@ -1310,7 +1376,7 @@ sed \
   -e 's/^readonly DOMAIN_HARD_TIMEOUT=90$/readonly DOMAIN_HARD_TIMEOUT=4/' \
   -e 's/^readonly DOMAIN_TERMINATE_GRACE=2$/readonly DOMAIN_TERMINATE_GRACE=1/' \
   -e 's/^readonly DNS_TIMEOUT=6$/readonly DNS_TIMEOUT=1/' \
-  -e 's/^readonly TLS_TIMEOUT=10$/readonly TLS_TIMEOUT=1/' \
+  -e 's/^readonly TLS_TIMEOUT=4$/readonly TLS_TIMEOUT=1/' \
   -e 's/^readonly HTTP_TIMEOUT=10$/readonly HTTP_TIMEOUT=1/' \
   "$DOMAIN_CHECK_SCRIPT" >"$BATCH_SCRIPT"
 chmod +x "$BATCH_SCRIPT"
@@ -1564,9 +1630,9 @@ main_block=$(sed -n '/^main() {/,/^}/p' "$DOMAIN_CHECK_SCRIPT")
 # The first marker intentionally contains literal shell variable syntax.
 # shellcheck disable=SC2016
 assert_in_order "$main_block" \
-  'progress, terminal results, and Markdown logging keep their required order' \
+  'progress, terminal results, and HTML logging keep their required order' \
   'while (( ${#WORKER_PIDS[@]} > 0 ))' 'clear_progress' 'print_results' \
-  'write_markdown_log' 'exit "$final_exit_code"'
+  'write_html_log' 'exit "$final_exit_code"'
 
 rm -f -- "$BATCH_BLOCK_PID_DIR"/*.pid
 INTERRUPT_OUTPUT="$TEST_TEMP_DIR/interrupt-output"
@@ -1795,16 +1861,17 @@ assert_not_contains 'HTTP 请求失败' "$MOCK_RUN_OUTPUT" \
   'TCP fail-fast does not add a misleading HTTP failure'
 assert_not_contains '连接就绪计时样本不足' "$MOCK_RUN_OUTPUT" \
   'TCP fail-fast does not add a misleading READY warning'
-failed_markdown_log=$(find "$TEST_LOG_HOME/mock/domain-check-logs" \
-  -maxdepth 1 -type f -name 'domain-check-*.md' -print -quit)
+failed_html_log=$(find "$TEST_LOG_HOME/mock/domain-check-logs" \
+  -maxdepth 1 -type f -name 'domain-check-*.html' -print -quit)
 assert_equal 'true' \
-  "$([[ -n "$failed_markdown_log" && -s "$failed_markdown_log" ]] &&
+  "$([[ -n "$failed_html_log" && -s "$failed_html_log" ]] &&
     printf true || printf false)" \
-  'exit-1 detector run still writes a complete Markdown log'
-assert_file_contains '- Summary: PASS 0 / WARN 0 / FAIL 1' \
-  "$failed_markdown_log" 'failed Markdown log contains the FAIL summary'
-assert_file_contains '- **example.com**: TCP 443 不可达' \
-  "$failed_markdown_log" 'failed Markdown log contains structured DETAILS'
+  'exit-1 detector run still writes a complete HTML log'
+assert_file_contains \
+  '<span class="summary-item status-fail"><span>FAIL</span><strong>1</strong></span>' \
+  "$failed_html_log" 'failed HTML log contains the FAIL summary'
+assert_file_contains '<li class="detail-fail">TCP 443 不可达</li>' \
+  "$failed_html_log" 'failed HTML log contains structured DETAILS'
 
 run_mocked_domain_check \
   '000|000|000' \
