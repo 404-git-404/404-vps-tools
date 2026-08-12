@@ -47,6 +47,8 @@ CDN_DETAIL=''
 CERTIFICATE_EXPIRY_STATUS='PASS'
 CERTIFICATE_DAYS='-'
 CERTIFICATE_WARNING=''
+MARKDOWN_LOG_PATH=''
+MARKDOWN_ESCAPED_VALUE=''
 BORDER_HORIZONTAL='-'
 BORDER_VERTICAL='|'
 BORDER_TOP_LEFT='+'
@@ -354,6 +356,15 @@ classify_http_result() {
       HTTP_RESULT_REASON="HTTP $status"
       ;;
   esac
+}
+
+curl_failure_is_deterministic() {
+  case ${1:-} in
+    1|2|3|4|35|51|58|59|60|77|90|91)
+      return 0
+      ;;
+  esac
+  return 1
 }
 
 append_reason() {
@@ -779,7 +790,12 @@ check_domain() {
   local location=''
   local http_5xx_count=0
   local http_command_ok=false
+  local http_command_status=0
+  local http_check_attempted=false
+  local ready_command_status=0
+  local ready_check_attempted=false
   local tls_command_ok=false
+  local tls_handshake_available=false
   local x25519_command_ok=false
   local openssl_target=''
   local curl_resolve=''
@@ -842,129 +858,158 @@ check_domain() {
     append_reason 'DNS 无法解析'
   fi
 
+  reset_http_retry_state
   if [[ "$dns_status" == 'PASS' ]]; then
-    openssl_target=$(openssl_target_for_ip "$ip")
-    curl_resolve=$(curl_resolve_for_ip "$domain" "$ip")
-    if [[ "$ip" == *:* ]]; then
-      curl_address_family=(--ipv6)
-    else
-      curl_address_family=(--ipv4)
-    fi
-    curl_common_args=(
-      "${curl_address_family[@]}"
-      --silent --show-error --output /dev/null
-      --connect-timeout 5 --max-time 9 --no-keepalive
-      --header 'Connection: close' --noproxy '*' --proto '=https'
-      --tlsv1.3 --tls-max 1.3 --resolve "$curl_resolve"
-      --user-agent "$HTTP_USER_AGENT" "https://$domain/"
-    )
-
     if run_network_command "$tcp_file" "$TCP_TIMEOUT" \
       bash -c "exec 3<>\"/dev/tcp/\$1/443\"; exec 3<&-; exec 3>&-" \
         bash "$ip"; then
       tcp_status='PASS'
     fi
 
-    if run_network_command "$tls_file" "$TLS_TIMEOUT" \
-      openssl s_client -connect "$openssl_target" -servername "$domain" \
-        -tls1_3 -alpn h2 -verify_hostname "$domain" -verify_return_error \
-        -showcerts; then
-      tls_command_ok=true
-    fi
-    if run_network_command "$x25519_file" "$TLS_TIMEOUT" \
-      openssl s_client -connect "$openssl_target" -servername "$domain" \
-        -tls1_3 -groups X25519; then
-      x25519_command_ok=true
-    fi
-
-    # READY deliberately skips CA verification for timing purposes. Certificate
-    # trust, hostname, and expiry are validated separately by the strict
-    # OpenSSL check above. Local CA bundle parsing and X.509 verification cost
-    # must not contaminate the target connection-latency measurement.
-    acquire_ready_sample_lock
-    for attempt in 1 2 3; do
-      attempt_time_appconnect=''
-      ready_output_file="$TEMP_DIR/ready-output-$index-$attempt"
-      run_network_command "$ready_output_file" "$HTTP_TIMEOUT" \
-        curl --insecure \
-          --write-out 'DOMAIN_CHECK_METRICS\t%{http_code}\t%{time_connect}\t%{time_appconnect}\n' \
-          "${curl_common_args[@]}" || :
-      attempt_time_appconnect=$(extract_curl_metric "$ready_output_file" 4)
-      if positive_seconds "$attempt_time_appconnect" &&
-        attempt_ready_ms=$(seconds_to_milliseconds \
-          "$attempt_time_appconnect"); then
-        ready_samples+=("$attempt_ready_ms")
-        tcp_status='PASS'
-      fi
-    done
-    release_ready_sample_lock
-
-    reset_http_retry_state
-    for attempt in 1 2 3; do
-      attempt_request_ok=false
-      attempt_http_code=''
-      attempt_http_status='-'
-      attempt_location=''
-      attempt_time_connect=''
-      http_command_ok=false
-      http_output_file="$TEMP_DIR/http-output-$index-$attempt"
-      http_header_file="$TEMP_DIR/http-header-$index-$attempt"
-      if run_network_command "$http_output_file" "$HTTP_TIMEOUT" \
-        curl --dump-header "$http_header_file" \
-          --write-out 'DOMAIN_CHECK_METRICS\t%{http_code}\t%{time_connect}\t%{time_appconnect}\n' \
-          "${curl_common_args[@]}"; then
-        http_command_ok=true
-      fi
-
-      attempt_http_code=$(extract_http_code "$http_output_file")
-      attempt_time_connect=$(extract_curl_metric "$http_output_file" 3)
-      if positive_seconds "$attempt_time_connect"; then
-        tcp_status='PASS'
-      fi
-      if [[ "$http_command_ok" == true &&
-        "$attempt_http_code" =~ ^[0-9]{3}$ &&
-        "$attempt_http_code" != '000' ]]; then
-        attempt_request_ok=true
-        tcp_status='PASS'
-        attempt_http_status=$attempt_http_code
-        attempt_location=$(extract_location "$http_header_file")
-      fi
-      record_http_attempt "$attempt" "$attempt_request_ok" \
-        "$attempt_http_status" "$attempt_location" "$http_header_file"
-      [[ "$HTTP_FINALIZED" == true ]] && break
-    done
-
-    if [[ "$tls_command_ok" == true ]] &&
-      tls13_evidence_present "$tls_file"; then
-      tls_status='PASS'
-      tcp_status='PASS'
-    fi
-    if [[ "$tls_command_ok" == true ]] &&
-      h2_evidence_present "$tls_file"; then
-      h2_status='PASS'
-    fi
-    if [[ "$x25519_command_ok" == true ]] &&
-      x25519_evidence_present "$x25519_file"; then
-      x25519_status='PASS'
-      tcp_status='PASS'
-    fi
-    if [[ "$tls_command_ok" == true ]] &&
-      certificate_verified_evidence_present "$tls_file"; then
-      certificate_status='PASS'
-      if extract_leaf_certificate "$tls_file" "$leaf_certificate_file" &&
-        certificate_enddate=$(openssl x509 -noout -enddate \
-          -in "$leaf_certificate_file" 2>/dev/null) &&
-        [[ "$certificate_enddate" == notAfter=* ]] &&
-        expiry_epoch=$(date -u -d "${certificate_enddate#notAfter=}" +%s \
-          2>/dev/null) &&
-        current_epoch=$(date -u +%s); then
-        evaluate_certificate_expiry "$expiry_epoch" "$current_epoch"
+    if [[ "$tcp_status" == 'PASS' ]]; then
+      openssl_target=$(openssl_target_for_ip "$ip")
+      curl_resolve=$(curl_resolve_for_ip "$domain" "$ip")
+      if [[ "$ip" == *:* ]]; then
+        curl_address_family=(--ipv6)
       else
-        evaluate_certificate_expiry
+        curl_address_family=(--ipv4)
       fi
-      certificate_status=$CERTIFICATE_EXPIRY_STATUS
-      certificate_days=$CERTIFICATE_DAYS
-      certificate_warning=$CERTIFICATE_WARNING
+      curl_common_args=(
+        "${curl_address_family[@]}"
+        --silent --show-error --output /dev/null
+        --connect-timeout 5 --max-time 9 --no-keepalive
+        --header 'Connection: close' --noproxy '*' --proto '=https'
+        --tlsv1.3 --tls-max 1.3 --resolve "$curl_resolve"
+        --user-agent "$HTTP_USER_AGENT" "https://$domain/"
+      )
+
+      if run_network_command "$tls_file" "$TLS_TIMEOUT" \
+        openssl s_client -connect "$openssl_target" -servername "$domain" \
+          -tls1_3 -alpn h2 -verify_hostname "$domain" -verify_return_error \
+          -showcerts; then
+        tls_command_ok=true
+      fi
+
+      if tls13_evidence_present "$tls_file"; then
+        tls_handshake_available=true
+        tcp_status='PASS'
+      fi
+      if [[ "$tls_command_ok" == true &&
+        "$tls_handshake_available" == true ]]; then
+        tls_status='PASS'
+        tcp_status='PASS'
+      fi
+      if [[ "$tls_command_ok" == true ]] &&
+        h2_evidence_present "$tls_file"; then
+        h2_status='PASS'
+      fi
+      if [[ "$tls_command_ok" == true ]] &&
+        certificate_verified_evidence_present "$tls_file"; then
+        certificate_status='PASS'
+        if extract_leaf_certificate "$tls_file" "$leaf_certificate_file" &&
+          certificate_enddate=$(openssl x509 -noout -enddate \
+            -in "$leaf_certificate_file" 2>/dev/null) &&
+          [[ "$certificate_enddate" == notAfter=* ]] &&
+          expiry_epoch=$(date -u -d "${certificate_enddate#notAfter=}" +%s \
+            2>/dev/null) &&
+          current_epoch=$(date -u +%s); then
+          evaluate_certificate_expiry "$expiry_epoch" "$current_epoch"
+        else
+          evaluate_certificate_expiry
+        fi
+        certificate_status=$CERTIFICATE_EXPIRY_STATUS
+        certificate_days=$CERTIFICATE_DAYS
+        certificate_warning=$CERTIFICATE_WARNING
+      fi
+
+      if [[ "$tls_handshake_available" == true ]]; then
+        if run_network_command "$x25519_file" "$TLS_TIMEOUT" \
+          openssl s_client -connect "$openssl_target" -servername "$domain" \
+            -tls1_3 -groups X25519; then
+          x25519_command_ok=true
+        fi
+        if [[ "$x25519_command_ok" == true ]] &&
+          x25519_evidence_present "$x25519_file"; then
+          x25519_status='PASS'
+          tcp_status='PASS'
+        fi
+
+        # READY deliberately skips CA verification for timing purposes.
+        # Certificate trust, hostname, and expiry are validated separately by
+        # the strict OpenSSL check above. Acquire the global lock per sample so
+        # a failing target cannot monopolize it across three timeouts.
+        ready_check_attempted=true
+        for attempt in 1 2 3; do
+          attempt_time_appconnect=''
+          ready_command_status=0
+          ready_output_file="$TEMP_DIR/ready-output-$index-$attempt"
+          acquire_ready_sample_lock
+          if run_network_command "$ready_output_file" "$HTTP_TIMEOUT" \
+            curl --insecure \
+              --write-out 'DOMAIN_CHECK_METRICS\t%{http_code}\t%{time_connect}\t%{time_appconnect}\n' \
+              "${curl_common_args[@]}"; then
+            ready_command_status=0
+          else
+            ready_command_status=$?
+          fi
+          release_ready_sample_lock
+          attempt_time_appconnect=$(extract_curl_metric \
+            "$ready_output_file" 4)
+          if positive_seconds "$attempt_time_appconnect" &&
+            attempt_ready_ms=$(seconds_to_milliseconds \
+              "$attempt_time_appconnect"); then
+            ready_samples+=("$attempt_ready_ms")
+            tcp_status='PASS'
+          elif curl_failure_is_deterministic "$ready_command_status"; then
+            break
+          fi
+        done
+
+        # HTTP checks use strict certificate verification. Retry transport
+        # failures that may be transient and retain the existing 5xx policy,
+        # but stop immediately for deterministic curl/TLS configuration errors.
+        http_check_attempted=true
+        for attempt in 1 2 3; do
+          attempt_request_ok=false
+          attempt_http_code=''
+          attempt_http_status='-'
+          attempt_location=''
+          attempt_time_connect=''
+          http_command_ok=false
+          http_command_status=0
+          http_output_file="$TEMP_DIR/http-output-$index-$attempt"
+          http_header_file="$TEMP_DIR/http-header-$index-$attempt"
+          if run_network_command "$http_output_file" "$HTTP_TIMEOUT" \
+            curl --dump-header "$http_header_file" \
+              --write-out 'DOMAIN_CHECK_METRICS\t%{http_code}\t%{time_connect}\t%{time_appconnect}\n' \
+              "${curl_common_args[@]}"; then
+            http_command_ok=true
+          else
+            http_command_status=$?
+          fi
+
+          attempt_http_code=$(extract_http_code "$http_output_file")
+          attempt_time_connect=$(extract_curl_metric "$http_output_file" 3)
+          if positive_seconds "$attempt_time_connect"; then
+            tcp_status='PASS'
+          fi
+          if [[ "$http_command_ok" == true &&
+            "$attempt_http_code" =~ ^[0-9]{3}$ &&
+            "$attempt_http_code" != '000' ]]; then
+            attempt_request_ok=true
+            tcp_status='PASS'
+            attempt_http_status=$attempt_http_code
+            attempt_location=$(extract_location "$http_header_file")
+          fi
+          record_http_attempt "$attempt" "$attempt_request_ok" \
+            "$attempt_http_status" "$attempt_location" "$http_header_file"
+          if [[ "$HTTP_FINALIZED" == true ]] ||
+            curl_failure_is_deterministic "$http_command_status"; then
+            HTTP_FINALIZED=true
+            break
+          fi
+        done
+      fi
     fi
 
     aggregate_ready_samples "${ready_samples[@]}"
@@ -975,7 +1020,6 @@ check_domain() {
     cdn_status=$CDN_STATUS
     cdn_detail=$CDN_DETAIL
   else
-    reset_http_retry_state
     aggregate_ready_samples
   fi
 
@@ -1018,12 +1062,15 @@ check_domain() {
     [[ "$final_status" == 'FAIL' ]] || final_status='WARN'
   fi
 
-  classify_http_result "$http_request_ok" "$http_status" "$http_5xx_count"
-  if [[ "$HTTP_RESULT_STATUS" == 'WARN' ]]; then
-    append_reason "$HTTP_RESULT_REASON"
-    [[ "$final_status" == 'FAIL' ]] || final_status='WARN'
+  if [[ "$http_check_attempted" == true ]]; then
+    classify_http_result "$http_request_ok" "$http_status" "$http_5xx_count"
+    if [[ "$HTTP_RESULT_STATUS" == 'WARN' ]]; then
+      append_reason "$HTTP_RESULT_REASON"
+      [[ "$final_status" == 'FAIL' ]] || final_status='WARN'
+    fi
   fi
-  if (( ready_sample_count < 3 )); then
+  if [[ "$ready_check_attempted" == true ]] &&
+    (( ready_sample_count < 3 )); then
     append_reason "连接就绪计时样本不足（${ready_sample_count}/3）"
     [[ "$final_status" == 'FAIL' ]] || final_status='WARN'
   fi
@@ -1668,6 +1715,165 @@ print_results() {
   print_table
 }
 
+set_markdown_escaped_value() {
+  local value=$1
+  value=${value//\\/\\\\}
+  value=${value//|/\\|}
+  MARKDOWN_ESCAPED_VALUE=$value
+}
+
+escape_markdown_cell() {
+  set_markdown_escaped_value "$1"
+  printf '%s' "$MARKDOWN_ESCAPED_VALUE"
+}
+
+render_markdown_report() {
+  local generated_at=$1
+  local index
+  local domain
+  local ip
+  local tls_status
+  local x25519_status
+  local h2_status
+  local ready_ms
+  local certificate_days
+  local cdn_status
+  local http_status
+  local redirect_code
+  local final_status
+  local reasons
+  local reason_part
+  local input_targets=''
+  local pass_count=0
+  local warn_count=0
+  local fail_count=0
+  local -a reason_parts=()
+
+  for index in "${!DOMAIN_INPUTS[@]}"; do
+    IFS=$'\t' read -r domain _ _ _ _ _ _ _ _ _ final_status _ \
+      <"$TEMP_DIR/result-$index"
+    if [[ -n "$input_targets" ]]; then
+      input_targets+='/'
+    fi
+    input_targets+=$domain
+    case "$final_status" in
+      PASS) (( pass_count += 1 )) ;;
+      WARN) (( warn_count += 1 )) ;;
+      FAIL) (( fail_count += 1 )) ;;
+    esac
+  done
+  printf '# Domain Check Report\n\n'
+  printf -- "- Time: \`%s\`\n" "$generated_at"
+  printf -- "- Input: \`%s\`\n" "$input_targets"
+  printf -- '- Targets: %d\n' "${#DOMAIN_INPUTS[@]}"
+  printf -- '- Summary: PASS %d / WARN %d / FAIL %d\n\n' \
+    "$pass_count" "$warn_count" "$fail_count"
+  printf '%s\n' \
+    '| DOMAIN | IP | TLS1.3 | X25519 | H2 | READY(ms) | CERT(d) | CDN | HTTP | REDIRECT | RESULT |' \
+    '|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|'
+
+  for index in "${!DOMAIN_INPUTS[@]}"; do
+    IFS=$'\t' read -r domain ip tls_status x25519_status h2_status \
+      ready_ms certificate_days cdn_status http_status redirect_code \
+      final_status reasons <"$TEMP_DIR/result-$index"
+    set_markdown_escaped_value "$domain"
+    domain=$MARKDOWN_ESCAPED_VALUE
+    set_markdown_escaped_value "$ip"
+    ip=$MARKDOWN_ESCAPED_VALUE
+    set_markdown_escaped_value "$tls_status"
+    tls_status=$MARKDOWN_ESCAPED_VALUE
+    set_markdown_escaped_value "$x25519_status"
+    x25519_status=$MARKDOWN_ESCAPED_VALUE
+    set_markdown_escaped_value "$h2_status"
+    h2_status=$MARKDOWN_ESCAPED_VALUE
+    set_markdown_escaped_value "$ready_ms"
+    ready_ms=$MARKDOWN_ESCAPED_VALUE
+    set_markdown_escaped_value "$certificate_days"
+    certificate_days=$MARKDOWN_ESCAPED_VALUE
+    set_markdown_escaped_value "$cdn_status"
+    cdn_status=$MARKDOWN_ESCAPED_VALUE
+    set_markdown_escaped_value "$http_status"
+    http_status=$MARKDOWN_ESCAPED_VALUE
+    set_markdown_escaped_value "$redirect_code"
+    redirect_code=$MARKDOWN_ESCAPED_VALUE
+    set_markdown_escaped_value "$final_status"
+    final_status=$MARKDOWN_ESCAPED_VALUE
+    printf '| %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s |\n' \
+      "$domain" "$ip" "$tls_status" "$x25519_status" "$h2_status" \
+      "$ready_ms" "$certificate_days" "$cdn_status" "$http_status" \
+      "$redirect_code" "$final_status"
+  done
+
+  printf '\n## DETAILS\n\n'
+  for index in "${!DOMAIN_INPUTS[@]}"; do
+    IFS=$'\t' read -r domain _ _ _ _ _ _ _ _ _ _ reasons \
+      <"$TEMP_DIR/result-$index"
+    [[ "$reasons" != '-' ]] || continue
+    IFS=';' read -r -a reason_parts <<<"$reasons"
+    for reason_part in "${reason_parts[@]}"; do
+      reason_part=${reason_part#"${reason_part%%[![:space:]]*}"}
+      set_markdown_escaped_value "$domain"
+      domain=$MARKDOWN_ESCAPED_VALUE
+      set_markdown_escaped_value "$reason_part"
+      reason_part=$MARKDOWN_ESCAPED_VALUE
+      printf -- '- **%s**: %s\n' "$domain" "$reason_part"
+    done
+  done
+  if ! table_has_details; then
+    printf '%s\n' '- None'
+  fi
+}
+
+write_markdown_log() {
+  local log_home=${HOME:-}
+  local log_dir
+  local log_timestamp
+  local generated_at
+  local reservation_attempt
+  local reserved=false
+
+  MARKDOWN_LOG_PATH=''
+  if [[ -z "$log_home" || "$log_home" != /* ]]; then
+    printf '%s: WARN: unable to create Markdown log: HOME is not absolute.\n' \
+      "$PROGRAM_NAME" >&2
+    return 0
+  fi
+  log_dir="$log_home/domain-check-logs"
+  if ! mkdir -p -- "$log_dir"; then
+    printf '%s: WARN: unable to create Markdown log directory: %s\n' \
+      "$PROGRAM_NAME" "$log_dir" >&2
+    return 0
+  fi
+
+  for reservation_attempt in 1 2 3; do
+    log_timestamp=$(date '+%Y%m%d-%H%M%S') || log_timestamp=''
+    if [[ "$log_timestamp" =~ ^[0-9]{8}-[0-9]{6}$ ]]; then
+      MARKDOWN_LOG_PATH="$log_dir/domain-check-$log_timestamp.md"
+      if (set -o noclobber; : >"$MARKDOWN_LOG_PATH") 2>/dev/null; then
+        reserved=true
+        break
+      fi
+    fi
+    (( reservation_attempt < 3 )) && sleep 1
+  done
+  if [[ "$reserved" != true ]]; then
+    MARKDOWN_LOG_PATH=''
+    printf '%s: WARN: unable to reserve a unique Markdown log file in: %s\n' \
+      "$PROGRAM_NAME" "$log_dir" >&2
+    return 0
+  fi
+
+  generated_at=$(date -u '+%Y-%m-%d %H:%M:%S UTC') || generated_at='-'
+  if ! render_markdown_report "$generated_at" >"$MARKDOWN_LOG_PATH"; then
+    rm -f -- "$MARKDOWN_LOG_PATH"
+    printf '%s: WARN: unable to write Markdown log: %s\n' \
+      "$PROGRAM_NAME" "$MARKDOWN_LOG_PATH" >&2
+    MARKDOWN_LOG_PATH=''
+    return 0
+  fi
+  printf 'Markdown log: %s\n' "$MARKDOWN_LOG_PATH" >&2
+}
+
 main() {
   local index
   local final_exit_code=0
@@ -1718,6 +1924,7 @@ main() {
   if ! aggregate_exit_code "${RESULT_STATUSES[@]}"; then
     final_exit_code=1
   fi
+  write_markdown_log
   exit "$final_exit_code"
 }
 

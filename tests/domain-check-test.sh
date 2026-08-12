@@ -20,6 +20,8 @@ TEST_MAIN_BASHPID=$BASHPID
 readonly TEST_MAIN_BASHPID
 TEST_TEMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/domain-check-tests.XXXXXXXX")
 readonly TEST_TEMP_DIR
+readonly TEST_LOG_HOME="$TEST_TEMP_DIR/log-home"
+mkdir -p "$TEST_LOG_HOME"
 
 cleanup_test_files() {
   if [[ "$BASHPID" != "$TEST_MAIN_BASHPID" ]]; then
@@ -406,6 +408,18 @@ aggregate_ready_samples
 assert_equal '0' "$READY_SAMPLE_COUNT" 'zero READY timing samples are counted'
 assert_equal '-' "$READY_MS" 'zero READY timing samples display a dash'
 
+for deterministic_curl_exit in 1 2 3 4 35 51 58 59 60 77 90 91; do
+  (( TEST_COUNT += 1 ))
+  curl_failure_is_deterministic "$deterministic_curl_exit" ||
+    fail "curl exit $deterministic_curl_exit should fail fast"
+done
+for retryable_curl_exit in 0 5 6 7 18 28 52 55 56 92; do
+  (( TEST_COUNT += 1 ))
+  if curl_failure_is_deterministic "$retryable_curl_exit"; then
+    fail "curl exit $retryable_curl_exit should remain retryable"
+  fi
+done
+
 assert_evidence tls13_evidence_present $'Protocol  : TLSv1.3\n' PASS \
   'TLS1.3 evidence accepts the spaced OpenSSL Protocol form'
 assert_evidence tls13_evidence_present $'Protocol: TLSv1.3\n' PASS \
@@ -668,7 +682,8 @@ SCHEDULER_DRIVER
 } >"$scheduler_driver"
 printf '0\n' >"$scheduler_active"
 printf '0\n' >"$scheduler_max"
-scheduler_output=$(bash "$scheduler_driver" 2>"$scheduler_progress")
+scheduler_output=$(HOME="$TEST_LOG_HOME/scheduler" \
+  bash "$scheduler_driver" 2>"$scheduler_progress")
 assert_less_or_equal '8' "$(<"$scheduler_max")" \
   '45-domain scheduler never exceeds eight concurrent workers'
 assert_greater_or_equal '2' "$(<"$scheduler_max")" \
@@ -763,6 +778,14 @@ assert_equal '...' "${truncated_domain: -3}" \
 
 TEMP_DIR="$TEST_TEMP_DIR"
 DOMAIN_INPUTS=("$long_domain" 'second.example.com')
+acquire_ready_sample_lock
+assert_equal 'true' \
+  "$([[ -d "$TEMP_DIR/ready-sample-lock" ]] && printf true || printf false)" \
+  'READY lock exists while a sample owns it'
+release_ready_sample_lock
+assert_equal 'false' \
+  "$([[ -d "$TEMP_DIR/ready-sample-lock" ]] && printf true || printf false)" \
+  'READY lock is removed immediately after an individual sample'
 printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
   "$long_domain" "$ipv6_address" PASS PASS PASS 125 45 HIGH 200 - PASS - \
   >"$TEMP_DIR/result-0"
@@ -843,6 +866,55 @@ mapfile -t details_lines <<<"$details_output"
 assert_equal "${#details_lines[0]}" \
   "${#details_lines[${#details_lines[@]} - 1]}" \
   'DETAILS bottom border matches the main table width'
+
+markdown_output=$(render_markdown_report '2026-08-12 12:34:56 UTC')
+assert_contains '# Domain Check Report' "$markdown_output" \
+  'Markdown report has a document heading'
+assert_contains "- Time: \`2026-08-12 12:34:56 UTC\`" "$markdown_output" \
+  'Markdown report includes its generation time'
+assert_contains \
+  "- Input: \`$long_domain/second.example.com\`" "$markdown_output" \
+  'Markdown report includes slash-separated input targets'
+assert_contains '- Targets: 2' "$markdown_output" \
+  'Markdown report includes the target count'
+assert_contains '- Summary: PASS 1 / WARN 1 / FAIL 0' "$markdown_output" \
+  'Markdown report summarizes result statuses from result files'
+assert_contains \
+  '| DOMAIN | IP | TLS1.3 | X25519 | H2 | READY(ms) | CERT(d) | CDN | HTTP | REDIRECT | RESULT |' \
+  "$markdown_output" 'Markdown report uses a real pipe-table header'
+assert_contains \
+  '| second.example.com | 1.2.3.4 | PASS | PASS | PASS | 25 | 20 | - | 301 | WWW | WARN |' \
+  "$markdown_output" 'Markdown table renders structured result fields'
+assert_contains '## DETAILS' "$markdown_output" \
+  'Markdown report has a DETAILS heading'
+assert_contains '- **second.example.com**: 跳转：www 切换' "$markdown_output" \
+  'Markdown DETAILS uses bullets'
+assert_not_contains $'\033[' "$markdown_output" \
+  'Markdown report never contains terminal ANSI escapes'
+assert_equal 'a\|b' "$(escape_markdown_cell 'a|b')" \
+  'Markdown cells escape pipe characters'
+
+markdown_log_stderr=$(
+  HOME="$TEST_LOG_HOME/render" write_markdown_log 2>&1
+)
+markdown_log_path=${markdown_log_stderr#Markdown log: }
+assert_equal 'true' \
+  "$([[ "$markdown_log_path" == "$TEST_LOG_HOME"/render/domain-check-logs/domain-check-*.md &&
+    -s "$markdown_log_path" ]] && printf true || printf false)" \
+  'automatic Markdown log is written below the configured home directory'
+assert_file_contains '# Domain Check Report' "$markdown_log_path" \
+  'automatic Markdown log contains the rendered report'
+
+markdown_failure_home="$TEST_TEMP_DIR/markdown-home-file"
+printf '%s\n' 'not a directory' >"$markdown_failure_home"
+set +e
+markdown_failure_warning=$(HOME="$markdown_failure_home" write_markdown_log 2>&1)
+markdown_failure_status=$?
+set -e
+assert_equal '0' "$markdown_failure_status" \
+  'Markdown log failure does not change the detector status'
+assert_contains 'WARN: unable to create Markdown log directory' \
+  "$markdown_failure_warning" 'Markdown log failure emits an explicit warning'
 
 MOCK_BIN="$TEST_TEMP_DIR/mock-bin"
 MOCK_LOG_DIR="$TEST_TEMP_DIR/mock-log"
@@ -935,7 +1007,12 @@ printf '%s\n' "$counter" >"$counter_file"
 IFS='|' read -r -a codes <<<"$MOCK_HTTP_CODES"
 IFS='|' read -r -a connect_times <<<"$MOCK_CONNECT_TIMES"
 IFS='|' read -r -a appconnect_times <<<"$MOCK_APPCONNECT_TIMES"
-IFS='|' read -r -a exit_codes <<<"$MOCK_CURL_EXITS"
+if [[ "$insecure" == true ]]; then
+  curl_exit_values=${MOCK_READY_CURL_EXITS:-$MOCK_CURL_EXITS}
+else
+  curl_exit_values=${MOCK_HTTP_CURL_EXITS:-$MOCK_CURL_EXITS}
+fi
+IFS='|' read -r -a exit_codes <<<"$curl_exit_values"
 IFS='|' read -r -a locations <<<"$MOCK_LOCATIONS"
 code=${codes[counter - 1]:-000}
 connect_time=${connect_times[counter - 1]:-0}
@@ -997,11 +1074,12 @@ cat >"$MOCK_BIN/date" <<'EOF'
 set -Eeuo pipefail
 printf '<%s>' "$@" >>"$MOCK_LOG_DIR/date.log"
 printf '\n' >>"$MOCK_LOG_DIR/date.log"
-if [[ " $* " == *' -d '* ]]; then
-  printf '%s\n' "${MOCK_EXPIRY_EPOCH:-2000000000}"
-else
-  printf '%s\n' "${MOCK_CURRENT_EPOCH:-1900000000}"
-fi
+case " $* " in
+  *' +%Y%m%d-%H%M%S '*) printf '%s\n' '20300101-000000' ;;
+  *' +%Y-%m-%d %H:%M:%S UTC '*) printf '%s\n' '2030-01-01 00:00:00 UTC' ;;
+  *' -d '*) printf '%s\n' "${MOCK_EXPIRY_EPOCH:-2000000000}" ;;
+  *) printf '%s\n' "${MOCK_CURRENT_EPOCH:-1900000000}" ;;
+esac
 EOF
 
 chmod +x "$MOCK_BIN"/*
@@ -1022,8 +1100,11 @@ run_mocked_domain_check() {
   local x25519_exit=${13:-0}
   local domain_argument=${14:-example.com}
   local tcp_exit=${15:-0}
+  local ready_curl_exits=${16:-$curl_exits}
+  local http_curl_exits=${17:-$curl_exits}
 
   mkdir -p "$TEST_TEMP_DIR/worker-tmp"
+  rm -rf -- "$TEST_LOG_HOME/mock/domain-check-logs"
   printf '0\n' >"$MOCK_LOG_DIR/curl.count"
   rm -f -- "$MOCK_LOG_DIR"/curl-*-domain-*.count
   : >"$MOCK_LOG_DIR/curl.log"
@@ -1039,6 +1120,8 @@ run_mocked_domain_check() {
       MOCK_CONNECT_TIMES="$connect_times" \
       MOCK_APPCONNECT_TIMES="$appconnect_times" \
       MOCK_CURL_EXITS="$curl_exits" \
+      MOCK_READY_CURL_EXITS="$ready_curl_exits" \
+      MOCK_HTTP_CURL_EXITS="$http_curl_exits" \
       MOCK_LOCATIONS="$locations" \
       MOCK_NORMAL_COMPLETE="$normal_complete" \
       MOCK_X25519_COMPLETE="$x25519_complete" \
@@ -1049,6 +1132,7 @@ run_mocked_domain_check() {
       MOCK_RESPONSE_HEADER="$response_header" \
       MOCK_EXPIRY_EPOCH="$expiry_epoch" \
       MOCK_CURRENT_EPOCH="$current_epoch" \
+      HOME="$TEST_LOG_HOME/mock" \
       TMPDIR="$TEST_TEMP_DIR/worker-tmp" \
       DOMAIN_CHECK_SOURCE_ONLY=0 \
       bash "$DOMAIN_CHECK_SCRIPT" "$domain_argument" 2>&1
@@ -1067,6 +1151,16 @@ run_mocked_domain_check \
   '0.100|0.200|0.050'
 assert_equal '0' "$MOCK_RUN_STATUS" \
   'successful OpenSSL commands with complete parsed evidence pass'
+mock_markdown_log=$(find "$TEST_LOG_HOME/mock/domain-check-logs" \
+  -maxdepth 1 -type f -name 'domain-check-*.md' -print -quit)
+assert_equal 'true' \
+  "$([[ -n "$mock_markdown_log" && -s "$mock_markdown_log" ]] &&
+    printf true || printf false)" \
+  'successful detector run writes one complete Markdown log'
+assert_contains "Markdown log: $mock_markdown_log" "$MOCK_RUN_OUTPUT" \
+  'detector reports the absolute Markdown log path on stderr'
+assert_file_contains '- Summary: PASS 1 / WARN 0 / FAIL 0' \
+  "$mock_markdown_log" 'successful Markdown log contains the PASS summary'
 assert_equal '5' "$(<"$MOCK_LOG_DIR/curl.count")" \
   'worker uses three READY connections and two strict HTTP attempts'
 assert_contains 'READY(ms)' "$MOCK_RUN_OUTPUT" \
@@ -1152,6 +1246,15 @@ assert_contains '<AAAA><example.com>' "$(<"$MOCK_LOG_DIR/dig.log")" \
 assert_contains '<-u><-d>' "$(<"$MOCK_LOG_DIR/date.log")" \
   'worker parses certificate expiry with the mocked GNU date path'
 
+ready_loop_block=$(sed -n \
+  '/# a failing target cannot monopolize it across three timeouts[.]/,/# HTTP checks use strict certificate verification/p' \
+  "$DOMAIN_CHECK_SCRIPT")
+assert_in_order "$ready_loop_block" \
+  'READY acquires and releases the global lock around each individual sample' \
+  'for attempt in 1 2 3' 'acquire_ready_sample_lock' \
+  'run_network_command' 'release_ready_sample_lock' \
+  'curl_failure_is_deterministic'
+
 run_mocked_domain_check \
   '200|200|200|200|200|200|200|200|200' \
   '0.111|0.333|0.222|0.444|0.666|0.555|0.777|0.999|0.888' \
@@ -1229,13 +1332,13 @@ check_domain() {
     d0[5-8].example.com)
       ACTIVE_PID_FILE="$TEMP_DIR/active-pid-$index"
       READY_SAMPLE_LOCK_HELD=false
-      acquire_ready_sample_lock
       for sample_number in 1 2 3; do
+        acquire_ready_sample_lock
         run_network_command "$TEMP_DIR/sample-$index-$sample_number" \
           "$HTTP_TIMEOUT" curl --insecure \
           "https://$domain/" || :
+        release_ready_sample_lock
       done
-      release_ready_sample_lock
       printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
         "$domain" 203.0.113.45 PASS PASS PASS 20 30 - 200 - PASS - \
         >"$TEMP_DIR/result-$index"
@@ -1374,11 +1477,12 @@ EOF
 cat >"$BATCH_BIN/date" <<'EOF'
 #!/usr/bin/env bash
 set -Eeuo pipefail
-if [[ " $* " == *' -d '* ]]; then
-  printf '%s\n' '2000000000'
-else
-  printf '%s\n' '1900000000'
-fi
+case " $* " in
+  *' +%Y%m%d-%H%M%S '*) printf '%s\n' '20300101-000000' ;;
+  *' +%Y-%m-%d %H:%M:%S UTC '*) printf '%s\n' '2030-01-01 00:00:00 UTC' ;;
+  *' -d '*) printf '%s\n' '2000000000' ;;
+  *) printf '%s\n' '1900000000' ;;
+esac
 EOF
 
 chmod +x "$BATCH_BIN"/*
@@ -1400,6 +1504,7 @@ real_timeout=$(command -v timeout)
 batch_started=$SECONDS
 set +e
 PATH="$BATCH_BIN:$PATH" \
+  HOME="$TEST_LOG_HOME/batch" \
   REAL_TIMEOUT="$real_timeout" \
   BATCH_BLOCK_PID_DIR="$BATCH_BLOCK_PID_DIR" \
   BATCH_COUNTER_LOCK="$BATCH_COUNTER_LOCK" \
@@ -1459,13 +1564,15 @@ main_block=$(sed -n '/^main() {/,/^}/p' "$DOMAIN_CHECK_SCRIPT")
 # The first marker intentionally contains literal shell variable syntax.
 # shellcheck disable=SC2016
 assert_in_order "$main_block" \
-  'transient progress is cleared before the final table is rendered' \
-  'while (( ${#WORKER_PIDS[@]} > 0 ))' 'clear_progress' 'print_results'
+  'progress, terminal results, and Markdown logging keep their required order' \
+  'while (( ${#WORKER_PIDS[@]} > 0 ))' 'clear_progress' 'print_results' \
+  'write_markdown_log' 'exit "$final_exit_code"'
 
 rm -f -- "$BATCH_BLOCK_PID_DIR"/*.pid
 INTERRUPT_OUTPUT="$TEST_TEMP_DIR/interrupt-output"
 set +e
 PATH="$BATCH_BIN:$PATH" \
+  HOME="$TEST_LOG_HOME/interrupt" \
   REAL_TIMEOUT="$real_timeout" \
   BATCH_BLOCK_PID_DIR="$BATCH_BLOCK_PID_DIR" \
   BATCH_COUNTER_LOCK="$BATCH_COUNTER_LOCK" \
@@ -1547,6 +1654,15 @@ assert_contains 'FAIL    | -' "$MOCK_RUN_OUTPUT" \
   'certificate verification failure displays FAIL in CERT(d)'
 assert_not_contains 'TCP 443 不可达' "$MOCK_RUN_OUTPUT" \
   'successful independent TCP probe survives incomplete TLS evidence'
+assert_equal '1' \
+  "$(grep -Fc '<openssl>' "$MOCK_LOG_DIR/timeout.log")" \
+  'missing TLS1.3 handshake evidence skips the X25519 probe'
+assert_equal '0' "$(<"$MOCK_LOG_DIR/curl.count")" \
+  'missing TLS1.3 handshake evidence skips READY and HTTP curl calls'
+assert_not_contains '连接就绪计时样本不足' "$MOCK_RUN_OUTPUT" \
+  'skipped READY sampling does not report misleading sample insufficiency'
+assert_not_contains 'HTTP 请求失败' "$MOCK_RUN_OUTPUT" \
+  'skipped HTTP checking does not report a misleading request failure'
 
 run_mocked_domain_check \
   '000|000|000' \
@@ -1574,10 +1690,12 @@ assert_contains 'ALPN 未协商 h2' "$MOCK_RUN_OUTPUT" \
   'TLS1.2-only fixture reports the missing h2 negotiation'
 assert_contains '证书链、有效期或主机名验证失败' "$MOCK_RUN_OUTPUT" \
   'TLS1.2-only fixture reports unavailable forced-handshake certificate evidence'
-assert_contains 'HTTP 请求失败' "$MOCK_RUN_OUTPUT" \
-  'TLS1.2-only fixture reports forced TLS1.3 curl failure'
-assert_contains '连接就绪计时样本不足（0/3）' "$MOCK_RUN_OUTPUT" \
-  'TLS1.2-only fixture reports zero TLS1.3 READY samples'
+assert_not_contains 'HTTP 请求失败' "$MOCK_RUN_OUTPUT" \
+  'TLS1.2-only fixture skips the impossible HTTP check'
+assert_not_contains '连接就绪计时样本不足' "$MOCK_RUN_OUTPUT" \
+  'TLS1.2-only fixture skips READY rather than creating empty samples'
+assert_equal '0' "$(<"$MOCK_LOG_DIR/curl.count")" \
+  'TLS1.2-only fixture performs no READY or HTTP curl calls'
 assert_not_contains 'TCP 443 不可达' "$MOCK_RUN_OUTPUT" \
   'TLS1.3 failure cannot overwrite a successful TCP probe'
 
@@ -1596,6 +1714,58 @@ assert_contains 'WARN' "$MOCK_RUN_OUTPUT" \
 
 run_mocked_domain_check \
   '200|200|200' \
+  '0|0|0' \
+  '0|0|0' \
+  '||' \
+  1 '' '0.005|0.006|0.007' 1 0 2000000000 1900000000 \
+  0 0 example.com 0 \
+  '35|35|35' '0|0|0'
+assert_equal '0' "$MOCK_RUN_STATUS" \
+  'deterministic READY curl failure remains warning-only'
+assert_equal '2' "$(<"$MOCK_LOG_DIR/curl.count")" \
+  'deterministic READY failure stops after one sample and still checks HTTP once'
+assert_equal '1' \
+  "$(grep -Fc '<--insecure>' "$MOCK_LOG_DIR/curl.log")" \
+  'deterministic READY failure performs only one locked timing attempt'
+assert_equal '1' \
+  "$(grep -Fc '<--dump-header>' "$MOCK_LOG_DIR/curl.log")" \
+  'READY failure releases the lock before the strict HTTP check'
+assert_contains '连接就绪计时样本不足（0/3）' "$MOCK_RUN_OUTPUT" \
+  'deterministic READY failure reports its zero successful samples'
+
+run_mocked_domain_check \
+  '200|200|200' \
+  '0.010|0.020|0.030' \
+  '0|0|0' \
+  '||' \
+  1 '' '0.005|0.006|0.007' 1 0 2000000000 1900000000 \
+  0 0 example.com 0 \
+  '0|0|0' '60|60|60'
+assert_equal '0' "$MOCK_RUN_STATUS" \
+  'deterministic strict HTTP failure remains warning-only'
+assert_equal '4' "$(<"$MOCK_LOG_DIR/curl.count")" \
+  'deterministic HTTP failure stops after one strict attempt'
+assert_equal '1' \
+  "$(grep -Fc '<--dump-header>' "$MOCK_LOG_DIR/curl.log")" \
+  'deterministic HTTP curl error is not retried three times'
+assert_contains 'HTTP 请求失败' "$MOCK_RUN_OUTPUT" \
+  'deterministic HTTP failure retains the existing warning detail'
+
+run_mocked_domain_check \
+  '503|503|503' \
+  '0.010|0.020|0.030' \
+  '0|0|0' \
+  '||' \
+  1
+assert_equal '0' "$MOCK_RUN_STATUS" \
+  'three HTTP 5xx responses remain warning-only'
+assert_equal '6' "$(<"$MOCK_LOG_DIR/curl.count")" \
+  'HTTP 5xx retains all three strict retries after three READY samples'
+assert_contains '连续 3 次 5xx' "$MOCK_RUN_OUTPUT" \
+  'HTTP 5xx retains the existing consecutive-retry detail'
+
+run_mocked_domain_check \
+  '200|200|200' \
   '0.010|0.020|0.030' \
   '0|0|0' \
   '||' \
@@ -1610,12 +1780,31 @@ run_mocked_domain_check \
   0 \
   example.com \
   1
-assert_equal '0' "$MOCK_RUN_STATUS" \
-  'independent TCP probe failure is recoverable after successful TLS and HTTP'
-assert_not_contains 'TCP 443 不可达' "$MOCK_RUN_OUTPUT" \
-  'successful TLS and HTTP evidence confirms TCP after a transient probe failure'
+assert_equal '1' "$MOCK_RUN_STATUS" \
+  'explicit TCP 443 failure stops the domain as a hard failure'
+assert_contains 'TCP 443 不可达' "$MOCK_RUN_OUTPUT" \
+  'explicit TCP failure is reported without downstream probing'
 assert_not_contains 'DNS 无法解析' "$MOCK_RUN_OUTPUT" \
   'resolved address is not mislabeled as DNS failure'
+assert_equal '0' "$(<"$MOCK_LOG_DIR/curl.count")" \
+  'explicit TCP failure skips all READY and HTTP curl calls'
+assert_equal '0' \
+  "$(grep -Fc '<openssl>' "$MOCK_LOG_DIR/timeout.log")" \
+  'explicit TCP failure skips TLS and X25519 OpenSSL calls'
+assert_not_contains 'HTTP 请求失败' "$MOCK_RUN_OUTPUT" \
+  'TCP fail-fast does not add a misleading HTTP failure'
+assert_not_contains '连接就绪计时样本不足' "$MOCK_RUN_OUTPUT" \
+  'TCP fail-fast does not add a misleading READY warning'
+failed_markdown_log=$(find "$TEST_LOG_HOME/mock/domain-check-logs" \
+  -maxdepth 1 -type f -name 'domain-check-*.md' -print -quit)
+assert_equal 'true' \
+  "$([[ -n "$failed_markdown_log" && -s "$failed_markdown_log" ]] &&
+    printf true || printf false)" \
+  'exit-1 detector run still writes a complete Markdown log'
+assert_file_contains '- Summary: PASS 0 / WARN 0 / FAIL 1' \
+  "$failed_markdown_log" 'failed Markdown log contains the FAIL summary'
+assert_file_contains '- **example.com**: TCP 443 不可达' \
+  "$failed_markdown_log" 'failed Markdown log contains structured DETAILS'
 
 run_mocked_domain_check \
   '000|000|000' \
@@ -1634,11 +1823,11 @@ run_mocked_domain_check \
   example.com \
   1
 assert_equal '1' "$MOCK_RUN_STATUS" \
-  'TCP 443 remains a hard failure when every connection attempt fails'
+  'TCP 443 remains a hard failure when the independent probe fails'
 assert_contains 'TCP 443 不可达' "$MOCK_RUN_OUTPUT" \
-  'TCP failure is reported only after all connection evidence is exhausted'
-assert_contains 'HTTP 请求失败' "$MOCK_RUN_OUTPUT" \
-  'true TCP failure retains the HTTP request failure detail'
+  'TCP failure is reported before downstream checks begin'
+assert_equal '0' "$(<"$MOCK_LOG_DIR/curl.count")" \
+  'TCP failure never enters the global READY lock or HTTP retry loops'
 
 run_mocked_domain_check \
   '000|000|000' \
