@@ -966,7 +966,7 @@ assert_contains 'WARN: unable to create HTML log directory' \
 
 html_render_failure_warning=$(
   # Called indirectly by write_html_log in this isolated subshell.
-  # shellcheck disable=SC2329
+  # shellcheck disable=SC2317,SC2329
   render_html_report() { return 1; }
   HOME="$TEST_LOG_HOME/render-failure" write_html_log 2>&1
 )
