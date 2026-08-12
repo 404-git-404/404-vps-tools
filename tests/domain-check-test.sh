@@ -596,8 +596,10 @@ assert_file_not_contains 'DOMAIN_CHECK_SAMPLE' "$DOMAIN_CHECK_SCRIPT" \
   'there is no environment variable for changing sample count'
 assert_file_not_contains 'TLS_SAMPLES' "$DOMAIN_CHECK_SCRIPT" \
   'there is no alternate TLS sample-count control'
-assert_equal '8' "$MAX_CONCURRENCY" \
-  'domain workers use the fixed eight-worker limit'
+assert_greater_or_equal '1' "$MAX_CONCURRENCY" \
+  'detected domain worker concurrency is never below one'
+assert_less_or_equal '4' "$MAX_CONCURRENCY" \
+  'detected domain worker concurrency is capped at four'
 assert_equal '4' "$TLS_TIMEOUT" \
   'TLS and X25519 probes use the four-second qualification timeout'
 assert_file_contains 'trap handle_interrupt INT TERM' "$DOMAIN_CHECK_SCRIPT" \
@@ -605,18 +607,67 @@ assert_file_contains 'trap handle_interrupt INT TERM' "$DOMAIN_CHECK_SCRIPT" \
 assert_file_contains 'terminate_workers' "$DOMAIN_CHECK_SCRIPT" \
   'worker termination cleanup remains available'
 
+detect_concurrency_with_fixtures() (
+  local nproc_output=$1
+  local getconf_output=$2
+
+  # Invoked indirectly by detect_max_concurrency in this isolated subshell.
+  # shellcheck disable=SC2317,SC2329
+  nproc() {
+    printf '%s\n' "$nproc_output"
+  }
+  # Invoked indirectly by detect_max_concurrency in this isolated subshell.
+  # shellcheck disable=SC2317,SC2329
+  getconf() {
+    printf '%s\n' "$getconf_output"
+  }
+  detect_max_concurrency
+)
+
+for cpu_fixture in 1 2 3 4; do
+  assert_equal "$cpu_fixture" \
+    "$(detect_concurrency_with_fixtures "$cpu_fixture" 1)" \
+    "$cpu_fixture online CPUs select $cpu_fixture domain workers"
+done
+for cpu_fixture in 8 64; do
+  assert_equal '4' \
+    "$(detect_concurrency_with_fixtures "$cpu_fixture" 1)" \
+    "$cpu_fixture online CPUs remain capped at four domain workers"
+done
+assert_equal '3' "$(detect_concurrency_with_fixtures invalid 3)" \
+  'invalid nproc output falls back to a valid getconf CPU count'
+assert_equal '1' "$(detect_concurrency_with_fixtures '' 0)" \
+  'invalid CPU counts fall back to one domain worker'
+
+cpu_fallback_bin="$TEST_TEMP_DIR/cpu-fallback-bin"
+mkdir -p "$cpu_fallback_bin"
+printf '%s\n' '#!/bin/sh' "printf '%s\\n' '2'" \
+  >"$cpu_fallback_bin/getconf"
+chmod +x "$cpu_fallback_bin/getconf"
+assert_equal '2' "$(PATH="$cpu_fallback_bin" detect_max_concurrency)" \
+  'missing nproc falls back to getconf _NPROCESSORS_ONLN'
+
+cpu_cap_bin="$TEST_TEMP_DIR/cpu-cap-bin"
+mkdir -p "$cpu_cap_bin"
+printf '%s\n' '#!/bin/sh' "printf '%s\\n' '64'" >"$cpu_cap_bin/nproc"
+chmod +x "$cpu_cap_bin/nproc"
+
 scheduler_driver="$TEST_TEMP_DIR/concurrent-scheduler-driver.sh"
 scheduler_progress="$TEST_TEMP_DIR/concurrent-scheduler-progress"
-scheduler_lock="$TEST_TEMP_DIR/concurrent-scheduler-lock"
-scheduler_active="$TEST_TEMP_DIR/concurrent-scheduler-active"
-scheduler_max="$TEST_TEMP_DIR/concurrent-scheduler-max"
+scheduler_started_dir="$TEST_TEMP_DIR/concurrent-scheduler-started"
+scheduler_first_wave_ready="$TEST_TEMP_DIR/concurrent-scheduler-first-wave-ready"
+scheduler_first_complete="$TEST_TEMP_DIR/concurrent-scheduler-first-complete"
+scheduler_oversubscribed="$TEST_TEMP_DIR/concurrent-scheduler-oversubscribed"
+mkdir -p "$scheduler_started_dir"
 {
   printf '%s\n' '#!/usr/bin/env bash' 'set -Eeuo pipefail'
   printf '%s\n' 'export DOMAIN_CHECK_SOURCE_ONLY=1'
   printf 'source %q\n' "$DOMAIN_CHECK_SCRIPT"
-  printf 'readonly SCHEDULER_LOCK_DIR=%q\n' "$scheduler_lock"
-  printf 'readonly SCHEDULER_ACTIVE_FILE=%q\n' "$scheduler_active"
-  printf 'readonly SCHEDULER_MAX_FILE=%q\n' "$scheduler_max"
+  printf 'readonly SCHEDULER_STARTED_DIR=%q\n' "$scheduler_started_dir"
+  printf 'readonly SCHEDULER_FIRST_WAVE_READY=%q\n' \
+    "$scheduler_first_wave_ready"
+  printf 'readonly SCHEDULER_FIRST_COMPLETE=%q\n' "$scheduler_first_complete"
+  printf 'readonly SCHEDULER_OVERSUBSCRIBED=%q\n' "$scheduler_oversubscribed"
   cat <<'SCHEDULER_DRIVER'
 parse_domain_argument() {
   local domain
@@ -639,33 +690,32 @@ initialize_output_style() {
 check_domain() {
   local index=$1
   local domain=$2
-  local active_count
-  local maximum_count
+  local marker
+  local marker_count
+  local ticks=0
 
-  while ! mkdir "$SCHEDULER_LOCK_DIR" 2>/dev/null; do
-    sleep 0.01
-  done
-  active_count=$(<"$SCHEDULER_ACTIVE_FILE")
-  maximum_count=$(<"$SCHEDULER_MAX_FILE")
-  (( active_count += 1 ))
-  printf '%s\n' "$active_count" >"$SCHEDULER_ACTIVE_FILE"
-  if (( active_count > maximum_count )); then
-    printf '%s\n' "$active_count" >"$SCHEDULER_MAX_FILE"
+  : >"$SCHEDULER_STARTED_DIR/$index"
+  if (( index < 4 )); then
+    while :; do
+      marker_count=0
+      for marker in "$SCHEDULER_STARTED_DIR"/*; do
+        [[ -e "$marker" ]] && (( marker_count += 1 ))
+      done
+      (( marker_count >= 4 )) && break
+      (( ticks += 1 ))
+      (( ticks < 500 )) || return 1
+      sleep 0.01
+    done
+    : >"$SCHEDULER_FIRST_WAVE_READY"
+  elif [[ ! -e "$SCHEDULER_FIRST_COMPLETE" ]]; then
+    : >"$SCHEDULER_OVERSUBSCRIBED"
   fi
-  rmdir "$SCHEDULER_LOCK_DIR"
 
   sleep 0.12
   printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
     "$domain" 203.0.113.10 PASS PASS PASS 20 30 - 200 - PASS - \
     >"$TEMP_DIR/result-$index"
-
-  while ! mkdir "$SCHEDULER_LOCK_DIR" 2>/dev/null; do
-    sleep 0.01
-  done
-  active_count=$(<"$SCHEDULER_ACTIVE_FILE")
-  (( active_count -= 1 ))
-  printf '%s\n' "$active_count" >"$SCHEDULER_ACTIVE_FILE"
-  rmdir "$SCHEDULER_LOCK_DIR"
+  (( index < 4 )) && : >"$SCHEDULER_FIRST_COMPLETE"
 }
 
 print_results() {
@@ -682,14 +732,14 @@ print_results() {
 main ignored.example.com
 SCHEDULER_DRIVER
 } >"$scheduler_driver"
-printf '0\n' >"$scheduler_active"
-printf '0\n' >"$scheduler_max"
-scheduler_output=$(HOME="$TEST_LOG_HOME/scheduler" \
+scheduler_output=$(PATH="$cpu_cap_bin:$PATH" HOME="$TEST_LOG_HOME/scheduler" \
   bash "$scheduler_driver" 2>"$scheduler_progress")
-assert_less_or_equal '8' "$(<"$scheduler_max")" \
-  '45-domain scheduler never exceeds eight concurrent workers'
-assert_greater_or_equal '2' "$(<"$scheduler_max")" \
-  '45-domain scheduler actually runs domain workers concurrently'
+assert_equal 'true' \
+  "$([[ -e "$scheduler_first_wave_ready" ]] && printf true || printf false)" \
+  'scheduler launches four workers concurrently when the CPU cap is four'
+assert_equal 'false' \
+  "$([[ -e "$scheduler_oversubscribed" ]] && printf true || printf false)" \
+  'scheduler never launches a fifth worker before the first wave completes'
 assert_equal '45' \
   "$(grep -Ec '^\[[0-9]+/45\] d[0-9]{2}[.]example[.]com$' \
     "$scheduler_progress")" \

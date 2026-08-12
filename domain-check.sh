@@ -4,7 +4,27 @@ set -Eeuo pipefail
 
 readonly PROGRAM_NAME='domain-check'
 readonly USAGE_TEXT='Usage: domain-check domain1.com/domain2.com/domain3.com'
-readonly MAX_CONCURRENCY=8
+
+detect_max_concurrency() {
+  local cpu_count=''
+
+  if command -v nproc >/dev/null 2>&1; then
+    cpu_count=$(nproc 2>/dev/null || :)
+  fi
+  if [[ ! "$cpu_count" =~ ^[1-9][0-9]*$ ]] &&
+    command -v getconf >/dev/null 2>&1; then
+    cpu_count=$(getconf _NPROCESSORS_ONLN 2>/dev/null || :)
+  fi
+  [[ "$cpu_count" =~ ^[1-9][0-9]*$ ]] || cpu_count=1
+  case "$cpu_count" in
+    1|2|3|4) ;;
+    *) cpu_count=4 ;;
+  esac
+  printf '%s\n' "$cpu_count"
+}
+
+MAX_CONCURRENCY=$(detect_max_concurrency)
+readonly MAX_CONCURRENCY
 readonly DOMAIN_HARD_TIMEOUT=90
 readonly DOMAIN_TERMINATE_GRACE=2
 readonly DNS_TIMEOUT=6
