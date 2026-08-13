@@ -166,7 +166,8 @@ run_real_pair() {
     cat "$client_log" >&2
     fail "$label real client benchmark failed."
   }
-  for expected in 'TCP A->B' 'TCP B->A' 'UDP A->B' 'UDP B->A' \
+  for expected in 'TCP CLIENT->SERVER' 'TCP SERVER->CLIENT' \
+    'UDP CLIENT->SERVER' 'UDP SERVER->CLIENT' \
     'TCP SCORE:' 'UDP SCORE:' 'LINK HEALTH:' 'TCP retransmissions:' \
     'loss=' 'jitter=' 'Peak CPU:'; do
     grep -Fq "$expected" "$client_log" ||
@@ -182,9 +183,7 @@ run_real_pair() {
     fail "$label history permissions changed: $history_permissions"
 
   set +e
-  # The production idle watchdog is 120 seconds; retain scheduling margin while
-  # still requiring the temporary server to close itself.
-  timeout 150 docker wait "$server" >"$TEMP_DIR/$label-server-status"
+  timeout 45 docker wait "$server" >"$TEMP_DIR/$label-server-status"
   status=$?
   set -e
   (( status == 0 )) || fail "$label server did not auto-close after idle timeout."

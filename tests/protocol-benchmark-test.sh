@@ -163,6 +163,11 @@ append_healthy_pair() {
 test_limits_and_scaling() {
   local rate
   local reserve
+  local status
+  local nominal
+  local percent
+  local sample
+  local coverage
 
   assert_equal '20' "$DEFAULT_MAX_PERCENT" 'default ceiling'
   assert_equal '200' "$DEFAULT_BUDGET_MB" 'default budget'
@@ -181,6 +186,40 @@ test_limits_and_scaling() {
   while reserve_budget "$reserve"; do :; done
   assert_true 'reservation must not exceed the 200 MB budget' \
     test "$TRAFFIC_RESERVED_BYTES" -le "$BUDGET_BYTES"
+
+  NOMINAL_MBPS=500
+  assert_equal '722' "$(calculate_deep_budget_mb)" \
+    '500 Mbps DEEP budget covers the full primary matrix and headroom'
+  NOMINAL_MBPS=1000
+  assert_equal '1444' "$(calculate_deep_budget_mb)" \
+    '1 Gbps DEEP budget covers the full primary matrix and headroom'
+  NOMINAL_MBPS=2000
+  assert_equal '2888' "$(calculate_deep_budget_mb)" \
+    '2 Gbps DEEP budget covers the full primary matrix and headroom'
+  for nominal in 500 1000 2000; do
+    NOMINAL_MBPS=$nominal
+    BUDGET_MB=$(calculate_deep_budget_mb)
+    BUDGET_BYTES=$((BUDGET_MB * 1000 * 1000))
+    TRAFFIC_ACCOUNTED_BYTES=0
+    TRAFFIC_RESERVED_BYTES=0
+    BUDGET_LIMITED=false
+    coverage=true
+    for percent in 5 10 20 35; do
+      rate=$(rate_for_percent "$percent")
+      reserve=$(planned_bytes "$rate" "$DEEP_DURATION")
+      for sample in 1 2 3 4; do
+        reserve_budget "$reserve" || coverage=false
+      done
+    done
+    assert_equal 'true' "$coverage" \
+      "$nominal Mbps DEEP budget admits every 35 percent primary stage"
+  done
+  set +e
+  (NOMINAL_MBPS=3000; configure_deep_budget) >/dev/null 2>&1
+  status=$?
+  set -e
+  assert_false 'custom DEEP bandwidth above the hard safety budget is rejected' \
+    test "$status" -eq 0
 }
 
 test_validation() {
@@ -337,10 +376,12 @@ test_independent_adaptive_stop_diagnostics() {
     "$output" 'TCP adaptive stop output'
   assert_contains 'UDP adaptive stop: no (reached 20%)' "$output" \
     'UDP adaptive stop output'
-  assert_contains 'A->B:        1.2 MB (1234567 bytes)' "$output" \
+  assert_contains 'CLIENT->SERVER: 1.2 MB (1234567 bytes)' "$output" \
     'forward transferred bytes use raw counter'
-  assert_contains 'B->A:        2.3 MB (2345678 bytes)' "$output" \
+  assert_contains 'SERVER->CLIENT: 2.3 MB (2345678 bytes)' "$output" \
     'reverse transferred bytes use raw counter'
+  assert_not_contains 'A->B' "$output" 'human-readable output omits ambiguous A-to-B label'
+  assert_not_contains 'B->A' "$output" 'human-readable output omits ambiguous B-to-A label'
 }
 
 test_failure_control_flow_and_evaluability() {
@@ -751,7 +792,7 @@ test_directional_asymmetry_regressions() {
   assert_true 'A-E persistent directional quality must be asymmetric' detect_asymmetry
   diagnostic=$ASYMMETRY_REASON
   assert_contains 'UDP loss' "$diagnostic" 'A-E diagnostic evidence'
-  assert_contains 'forward direction' "$diagnostic" 'A-E worse direction'
+  assert_contains 'CLIENT->SERVER' "$diagnostic" 'A-E worse direction'
   calculate_results
   assert_equal '65' "$TCP_SCORE" 'A-E fixture TCP score'
   assert_equal '93' "$UDP_SCORE" 'A-E fixture UDP score remains unchanged'
@@ -765,11 +806,11 @@ test_directional_asymmetry_regressions() {
   output=$(print_results)
   assert_contains 'ASYMMETRIC: UDP loss is materially worse' "$output" \
     'A-E printed diagnostic reason'
-  assert_contains 'A->B:        896.00 retrans / 100MB' "$output" \
+  assert_contains 'CLIENT->SERVER: 896.00 retrans / 100MB' "$output" \
     'A-E printed forward retransmission density'
   assert_contains 'Penalty:     34.91 / 50' "$output" \
     'A-E printed retransmission penalty'
-  assert_contains 'materially worse in forward direction' "$output" \
+  assert_contains 'materially worse on CLIENT->SERVER' "$output" \
     'A-E printed retransmission direction'
 
   # A<->F: a single severe reverse-loss sample is sufficient.
@@ -780,7 +821,7 @@ test_directional_asymmetry_regressions() {
   append_result UDP B_TO_A 5 5.003 0 6.979405 5.921 1250000
   assert_true 'A-F severe reverse loss must be asymmetric' detect_asymmetry
   diagnostic=$ASYMMETRY_REASON
-  assert_contains 'reverse direction' "$diagnostic" 'A-F worse direction'
+  assert_contains 'SERVER->CLIENT' "$diagnostic" 'A-F worse direction'
   assert_contains '6.98%' "$diagnostic" 'A-F loss magnitude'
   calculate_results
   assert_equal '56' "$TCP_SCORE" 'A-F fixture TCP score'
@@ -792,11 +833,11 @@ test_directional_asymmetry_regressions() {
   PORT=55001
   NOMINAL_MBPS=100
   output=$(print_results)
-  assert_contains 'B->A:        2500.00 retrans / 100MB' "$output" \
+  assert_contains 'SERVER->CLIENT: 2500.00 retrans / 100MB' "$output" \
     'A-F printed reverse retransmission density'
   assert_contains 'Penalty:     43.79 / 50' "$output" \
     'A-F printed retransmission penalty'
-  assert_contains 'materially worse in reverse direction' "$output" \
+  assert_contains 'materially worse on SERVER->CLIENT' "$output" \
     'A-F printed retransmission direction'
 
   # TCP retransmission evidence must work without UDP-loss evidence.
@@ -804,7 +845,7 @@ test_directional_asymmetry_regressions() {
   append_result TCP A_TO_B 5 5.0 0 0 5 1250000
   append_result TCP B_TO_A 5 5.0 125 0 5 1250000
   assert_true '0 vs 125 retransmissions must be asymmetric' detect_asymmetry
-  assert_contains 'reverse TCP path' "$ASYMMETRY_REASON" \
+  assert_contains 'SERVER->CLIENT TCP path' "$ASYMMETRY_REASON" \
     'TCP retransmission diagnostic direction'
 
   # Persistent A->E retransmissions also trigger without UDP evidence.
@@ -817,7 +858,7 @@ test_directional_asymmetry_regressions() {
   append_result TCP B_TO_A 20 100.133 0 0 0.107 25000000
   assert_true 'A-E persistent retransmissions alone must be asymmetric' \
     detect_asymmetry
-  assert_contains 'forward TCP path' "$ASYMMETRY_REASON" \
+  assert_contains 'CLIENT->SERVER TCP path' "$ASYMMETRY_REASON" \
     'A-E TCP-only diagnostic direction'
 
   # Reliable, repeated load-RTT divergence is independent evidence.
@@ -905,10 +946,12 @@ test_firewall_cleanup_exactness() {
       if [[ "$rules_present" == true ]]; then
         printf '[ 1] 55000/tcp ALLOW IN 192.0.2.9 # protocol-benchmark-test\n'
         printf '[ 2] 55000/udp ALLOW IN 192.0.2.9 # protocol-benchmark-test\n'
+        printf '[ 3] 55000/tcp (v6) ALLOW IN Anywhere (v6) # protocol-benchmark-test\n'
+        printf '[ 4] 55000/udp (v6) ALLOW IN Anywhere (v6) # protocol-benchmark-test\n'
       fi
     else
       printf '%s\n' "$*" >>"$log"
-      [[ "$(wc -l <"$log" | tr -d ' ')" != '2' ]] || rules_present=false
+      [[ "$(wc -l <"$log" | tr -d ' ')" != '4' ]] || rules_present=false
     fi
   }
   FIREWALL_RULE_ADDED=true
@@ -917,10 +960,11 @@ test_firewall_cleanup_exactness() {
   FIREWALL_COMMENT='protocol-benchmark-test'
   cleanup_firewall
   assert_equal 'false' "$FIREWALL_RULE_ADDED" 'firewall cleanup state'
-  assert_equal '2' "$(wc -l <"$log" | tr -d ' ')" 'TCP and UDP rules removed'
-  assert_equal '--force delete 2' "$(sed -n '1p' "$log")" \
+  assert_equal '4' "$(wc -l <"$log" | tr -d ' ')" \
+    'all mirrored TCP and UDP rules removed'
+  assert_equal '--force delete 4' "$(sed -n '1p' "$log")" \
     'higher unique rule number removed first'
-  assert_equal '--force delete 1' "$(sed -n '2p' "$log")" \
+  assert_equal '--force delete 1' "$(sed -n '4p' "$log")" \
     'lower unique rule number removed second'
 }
 
@@ -1336,9 +1380,17 @@ ufw() {
   if [[ "$scenario" == udp-fail && "$protocol" == udp ]]; then
     return 1
   fi
+  if [[ "$scenario" == missing-udp && "$protocol" == udp ]]; then
+    return 0
+  fi
   number=$(( $(wc -l <"$rules_file") + 1 ))
   printf '[ %s] %s/%s ALLOW IN %s # %s\n' \
-    "$number" "$port" "$protocol" "$peer" "$marker" >>"$rules_file"
+    "$number" "$PORT" "$protocol" "$peer" "$marker" >>"$rules_file"
+  if [[ "$scenario" == ipv6 ]]; then
+    number=$(( $(wc -l <"$rules_file") + 1 ))
+    printf '[ %s] %s/%s (v6) ALLOW IN %s (v6) # %s\n' \
+      "$number" "$PORT" "$protocol" "$peer" "$marker" >>"$rules_file"
+  fi
 }
 MODE=server
 PORT=$port
@@ -1367,6 +1419,16 @@ EOF
     'plain server adds Anywhere UDP rule'
   assert_not_contains 'protocol-benchmark-' "$(cat "$case_dir/rules")" \
     'normal cleanup removes all benchmark comments'
+
+  case_dir="$TEST_TEMP_DIR/ufw-ipv6"
+  mkdir -p "$case_dir"
+  output=$(bash "$helper" "$BENCHMARK_SCRIPT" ipv6 55016 '' "$case_dir")
+  assert_contains 'STATUS=temporary TCP/UDP allow added' "$output" \
+    'IPv4 and IPv6 mirrored entries verify as two logical rules'
+  assert_equal '6' "$(wc -l <"$case_dir/log" | tr -d ' ')" \
+    'IPv4 and IPv6 setup is followed by four exact numbered deletions'
+  assert_not_contains 'protocol-benchmark-' "$(cat "$case_dir/rules")" \
+    'IPv4 and IPv6 mirrored entries are all cleaned up'
 
   case_dir="$TEST_TEMP_DIR/ufw-peer"
   mkdir -p "$case_dir"
@@ -1404,7 +1466,7 @@ EOF
     assert_false "allow-peer fails when UFW is $scenario" test "$status" -eq 0
   done
 
-  for scenario in udp-fail verify-fail; do
+  for scenario in udp-fail verify-fail missing-udp; do
     case_dir="$TEST_TEMP_DIR/ufw-$scenario"
     mkdir -p "$case_dir"
     set +e
@@ -1518,9 +1580,9 @@ EOF
       >>"$case_dir/times"
   done
   output=$(bash "$helper" "$BENCHMARK_SCRIPT" "$case_dir" 2>&1)
-  assert_contains 'Completed test 8; waiting 120s for the next stage.' "$output" \
+  assert_contains 'Completed test 8; waiting 20s for the next stage.' "$output" \
     'complete multi-stage benchmark keeps restarting one-shot listener'
-  assert_contains 'idle timeout after the last test (120s, 8 completed)' "$output" \
+  assert_contains 'idle timeout after the last test (20s, 8 completed)' "$output" \
     'server reports last-test idle timeout explicitly'
   assert_equal '9' "$(wc -l <"$case_dir/waits" | tr -d ' ')" \
     'eight sessions plus final idle watchdog are supervised'
@@ -1528,12 +1590,12 @@ EOF
   case_dir="$TEST_TEMP_DIR/server-gap"
   mkdir -p "$case_dir"
   printf '0\n0\n124\n' >"$case_dir/statuses"
-  printf '1000\n1000\n1002\n1027\n1029\n1029\n' >"$case_dir/times"
+  printf '1000\n1000\n1002\n1014\n1016\n1016\n' >"$case_dir/times"
   output=$(bash "$helper" "$BENCHMARK_SCRIPT" "$case_dir" 2>&1)
-  assert_equal $'600\n95\n120' "$(cat "$case_dir/waits")" \
-    '25-second inter-test gap remains inside the 120-second watchdog'
+  assert_equal $'600\n8\n20' "$(cat "$case_dir/waits")" \
+    '12-second inter-test gap remains inside the 20-second watchdog'
   assert_contains 'Completed test 2' "$output" \
-    'server remains available after a 25-second logical gap'
+    'server remains available after a legitimate 12-second logical gap'
 
   case_dir="$TEST_TEMP_DIR/server-recoverable-error"
   mkdir -p "$case_dir"
@@ -1922,6 +1984,110 @@ test_history_modes_are_read_only() {
     test -f "$marker"
 }
 
+test_severe_stage_confirmation() {
+  local confirmation_calls=0
+  local confirmation_mode=healthy
+  local output
+  local persistent_score
+  local transient_score
+
+  run_controlled_test() {
+    local protocol=$1
+    local direction=$2
+    local percent=$3
+    local streams=$4
+    local output_file=$5
+
+    (( confirmation_calls += 1 ))
+    if [[ "$confirmation_mode" == budget ]]; then
+      reserve_budget 1
+      return $?
+    fi
+    if [[ "$protocol" == TCP ]]; then
+      if [[ "$confirmation_mode" == persistent ]]; then
+        printf 'TCP\t%s\t%s\t%s\t5\t5\t1.0\t500\t0\t0\t5\t1000000\n' \
+          "$direction" "$percent" "$streams" >>"$output_file"
+      else
+        printf 'TCP\t%s\t%s\t%s\t5\t5\t1.0\t0\t0\t0\t5\t1000000\n' \
+          "$direction" "$percent" "$streams" >>"$output_file"
+      fi
+    else
+      printf 'UDP\t%s\t%s\t%s\t5\t5\t1.0\t0\t%s\t1\t5\t1000000\n' \
+        "$direction" "$percent" "$streams" \
+        "$([[ "$confirmation_mode" == persistent ]] && printf 5 || printf 0)" \
+        >>"$output_file"
+    fi
+    return 0
+  }
+
+  reset_fixture
+  TEMP_DIR=$TEST_TEMP_DIR
+  NOMINAL_MBPS=100
+  BUDGET_BYTES=200000000
+  append_result TCP A_TO_B 5 5 500 0 5 1000000
+  append_result TCP B_TO_A 5 5 0 0 5 1000000
+  append_healthy_pair UDP 5 5
+  confirm_severe_sample TCP A_TO_B 5 1 >/dev/null
+  confirm_severe_sample TCP A_TO_B 5 1 >/dev/null
+  assert_equal '1' "$confirmation_calls" \
+    'severe stage receives at most one confirmation retry'
+  assert_equal 'TRANSIENT' "$(awk -F '\t' '$1=="TCP" && $2=="A_TO_B" {print $13}' "$RESULT_FILE")" \
+    'healthy confirmation marks the primary burst transient'
+  assert_equal '0' "$(awk -F '\t' '$1=="TCP" && $2=="A_TO_B" {print $8}' "$RESULT_FILE")" \
+    'transient scoring uses the clean confirmation retransmission value'
+  assert_equal '500' "$(awk -F '\t' '$1=="TCP" && $2=="A_TO_B" {print $16}' "$RESULT_FILE")" \
+    'transient classification retains the original severe evidence'
+  calculate_results
+  transient_score=$TCP_SCORE
+  output=$(print_results)
+  assert_contains 'TRANSIENT-ANOMALY' "$LABELS" \
+    'transient confirmation is exposed as a label'
+  assert_contains 'TRANSIENT (primary retrans=500, confirmation retrans=0)' "$output" \
+    'transient confirmation is explained in final diagnostics'
+  assert_equal 'EITHER' "$PREFERRED" \
+    'transient TCP burst does not dominate transport recommendation'
+
+  reset_fixture
+  TEMP_DIR=$TEST_TEMP_DIR
+  NOMINAL_MBPS=100
+  BUDGET_BYTES=200000000
+  confirmation_calls=0
+  confirmation_mode=persistent
+  append_result TCP A_TO_B 5 5 500 0 5 1000000
+  append_result TCP B_TO_A 5 5 0 0 5 1000000
+  append_healthy_pair UDP 5 5
+  confirm_severe_sample TCP A_TO_B 5 1 >/dev/null
+  assert_equal 'PERSISTENT' "$(awk -F '\t' '$1=="TCP" && $2=="A_TO_B" {print $13}' "$RESULT_FILE")" \
+    'repeated severe confirmation marks degradation persistent'
+  assert_equal '500' "$(awk -F '\t' '$1=="TCP" && $2=="A_TO_B" {print $8}' "$RESULT_FILE")" \
+    'persistent scoring retains the primary severe metric without double counting'
+  calculate_results
+  persistent_score=$TCP_SCORE
+  assert_contains 'PERSISTENT-DEGRADATION' "$LABELS" \
+    'persistent confirmation is exposed as a label'
+  assert_true 'persistent degradation keeps a materially stronger penalty' \
+    awk -v transient="$transient_score" -v persistent="$persistent_score" \
+    'BEGIN {exit !(persistent <= transient-20)}'
+
+  reset_fixture
+  TEMP_DIR=$TEST_TEMP_DIR
+  NOMINAL_MBPS=100
+  BUDGET_BYTES=0
+  confirmation_calls=0
+  confirmation_mode=budget
+  append_result TCP A_TO_B 5 5 500 0 5 1000000
+  confirm_severe_sample TCP A_TO_B 5 1 >/dev/null
+  confirm_severe_sample TCP A_TO_B 5 1 >/dev/null
+  assert_equal '1' "$confirmation_calls" \
+    'budget-denied confirmation is attempted only once'
+  assert_equal 'UNCONFIRMED' "$(awk -F '\t' '$1=="TCP" {print $13}' "$RESULT_FILE")" \
+    'insufficient confirmation budget preserves primary evidence as unconfirmed'
+  assert_equal 'true' "$BUDGET_LIMITED" \
+    'confirmation retry respects the traffic budget'
+  assert_equal '500' "$(awk -F '\t' '$1=="TCP" {print $8}' "$RESULT_FILE")" \
+    'budget skip leaves the original severe metric valid'
+}
+
 test_repository_invariants() {
   local content
   content=$(cat "$BENCHMARK_SCRIPT")
@@ -1982,6 +2148,7 @@ test_history_persistence_and_schema
 test_history_peer_keys_and_cli
 test_history_display_and_retention
 test_history_modes_are_read_only
+test_severe_stage_confirmation
 test_repository_invariants
 
 printf 'PASS: %d protocol benchmark assertions\n' "$TEST_COUNT"

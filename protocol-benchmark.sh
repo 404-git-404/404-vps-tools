@@ -7,9 +7,10 @@ readonly DEFAULT_DURATION=2
 readonly DEEP_DURATION=3
 readonly DEFAULT_COOLDOWN=1
 readonly DEFAULT_BUDGET_MB=200
-readonly DEEP_BUDGET_MB=600
+readonly DEEP_BUDGET_HEADROOM_PERCENT=25
+readonly DEEP_BUDGET_MAX_MB=4000
 readonly DEFAULT_SERVER_WAIT=600
-readonly SERVER_SESSION_IDLE=120
+readonly SERVER_SESSION_IDLE=20
 readonly SERVER_ERROR_LIMIT=3
 readonly DEFAULT_MAX_PERCENT=20
 readonly DEEP_MAX_PERCENT=35
@@ -140,7 +141,7 @@ Server options:
 Client options:
   --port PORT           Port printed by the temporary server (required).
   --bandwidth MBPS      Nominal package bandwidth; skips the prompt.
-  --deep                Explicit bounded deeper mode (max 35%, 600 MB).
+  --deep                Explicit bounded deeper mode (max 35%, adaptive budget).
   --save-baseline       Save the current healthy-link baseline.
   --compare             Compare the current result with a saved baseline.
 
@@ -691,6 +692,21 @@ cleanup_firewall() {
   FIREWALL_RULE_ADDED=false
 }
 
+firewall_rules_verified() {
+  local status_output=$1
+
+  printf '%s\n' "$status_output" | awk -v marker="$FIREWALL_COMMENT" \
+    -v port="$PORT" -v peer="$ALLOW_PEER" '
+    BEGIN { marker="# " marker; tcp=port "/tcp"; udp=port "/udp" }
+    index($0, marker) {
+      if (peer != "" && index($0, peer) == 0) next;
+      if (index(tolower($0), tcp)) tcp_found=1;
+      if (index(tolower($0), udp)) udp_found=1;
+    }
+    END { exit !(tcp_found && udp_found) }
+  '
+}
+
 cleanup() {
   local status=$?
 
@@ -728,7 +744,7 @@ trap signal_exit INT TERM HUP
 
 setup_firewall() {
   local ufw_status
-  local verified_count
+  local status_output
   local protocol
 
   FIREWALL_STATUS='unchanged (UFW is not active)'
@@ -772,9 +788,8 @@ setup_firewall() {
       die "Unable to add the temporary $protocol UFW rule."
     fi
   done
-  verified_count=$(LC_ALL=C "${UFW_COMMAND[@]}" status numbered 2>/dev/null | awk \
-    -v marker="$FIREWALL_COMMENT" 'index($0, "# " marker) {count++} END {print count+0}')
-  if (( verified_count != 2 )); then
+  status_output=$(LC_ALL=C "${UFW_COMMAND[@]}" status numbered 2>/dev/null || true)
+  if ! firewall_rules_verified "$status_output"; then
     cleanup_firewall || true
     die 'Temporary UFW rules could not be verified; rules were rolled back.'
   fi
@@ -934,6 +949,26 @@ planned_bytes() {
     'BEGIN { printf "%.0f", rate * 1000000 * seconds / 8 * 1.10 }'
 }
 
+calculate_deep_budget_mb() {
+  awk -v nominal="$NOMINAL_MBPS" -v duration="$DEEP_DURATION" \
+    -v headroom="$DEEP_BUDGET_HEADROOM_PERCENT" '
+    BEGIN {
+      primary=nominal*1000000*duration/8*4*(.05+.10+.20+.35)*1.10;
+      budget=primary*(100+headroom)/100/1000000;
+      printf "%.0f", (budget == int(budget) ? budget : int(budget)+1);
+    }'
+}
+
+configure_deep_budget() {
+  local calculated
+
+  calculated=$(calculate_deep_budget_mb)
+  if (( calculated > DEEP_BUDGET_MAX_MB )); then
+    die "DEEP bandwidth requires a ${calculated} MB budget, above the ${DEEP_BUDGET_MAX_MB} MB safety limit."
+  fi
+  BUDGET_MB=$calculated
+}
+
 reserve_budget() {
   local bytes=$1
   if (( TRAFFIC_ACCOUNTED_BYTES + TRAFFIC_RESERVED_BYTES + bytes > BUDGET_BYTES )); then
@@ -1066,6 +1101,14 @@ append_label() {
   [[ ",$LABELS," == *",$label,"* ]] || LABELS=${LABELS:+$LABELS,}$label
 }
 
+display_direction() {
+  case "$1" in
+    A_TO_B) printf 'CLIENT->SERVER' ;;
+    B_TO_A) printf 'SERVER->CLIENT' ;;
+    *) printf '%s' "$1" ;;
+  esac
+}
+
 record_failure() {
   local protocol=$1
   local direction=${2:-UNKNOWN}
@@ -1090,6 +1133,8 @@ run_controlled_test() {
   local direction=$2
   local percent=$3
   local streams=$4
+  local output_file=${5:-$RESULT_FILE}
+  local sample_kind=${6:-primary}
   local rate_mbps
   local reserve
   local json_file
@@ -1117,14 +1162,14 @@ run_controlled_test() {
   rate_mbps=$(rate_for_percent "$percent")
   reserve=$(planned_bytes "$rate_mbps" "$DURATION")
   reserve_budget "$reserve" || return "$TEST_RESULT_BUDGET_DENIED"
-  json_file="$TEMP_DIR/${protocol,,}-${direction,,}-${percent}-${streams}.json"
-  ping_file="$TEMP_DIR/${protocol,,}-${direction,,}-${percent}-${streams}.ping"
+  json_file="$TEMP_DIR/${protocol,,}-${direction,,}-${percent}-${streams}-${sample_kind}.json"
+  ping_file="$TEMP_DIR/${protocol,,}-${direction,,}-${percent}-${streams}-${sample_kind}.ping"
   command+=(-b "${rate_mbps}M" -P "$streams")
   [[ "$protocol" == 'UDP' ]] && command+=(-u)
   [[ "$direction" == 'B_TO_A' ]] && command+=(-R)
 
-  printf '  %-3s %-6s %5s%%  %7s Mbps  P=%s ... ' \
-    "$protocol" "${direction//_TO_/->}" "$percent" "$rate_mbps" "$streams"
+  printf '  %-3s %-14s %5s%%  %7s Mbps  P=%s ... ' \
+    "$protocol" "$(display_direction "$direction")" "$percent" "$rate_mbps" "$streams"
   read -r before_total before_idle < <(read_cpu_sample)
   LC_ALL=C ping -n -i 0.2 -w "$((DURATION + 1))" "$PEER" \
     >"$ping_file" 2>&1 &
@@ -1194,7 +1239,7 @@ run_controlled_test() {
   printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
     "$protocol" "$direction" "$percent" "$streams" "$rate_mbps" \
     "$achieved" "$ratio" "$retrans" "$loss" "$jitter" \
-    "$load_increase" "$bytes" >>"$RESULT_FILE"
+    "$load_increase" "$bytes" >>"$output_file"
   if [[ "$protocol" == 'TCP' ]]; then
     printf '%s Mbps, retrans=%s, RTT +%sms\n' "$achieved" "$retrans" "$load_increase"
   else
@@ -1263,6 +1308,134 @@ udp_is_healthy() {
   }' "$RESULT_FILE"
 }
 
+sample_is_severe() {
+  local file=$1
+  local protocol=$2
+  local direction=$3
+  local percent=$4
+  local streams=$5
+
+  awk -F '\t' -v protocol="$protocol" -v direction="$direction" \
+    -v percent="$percent" -v streams="$streams" '
+    $1 == protocol && $2 == direction && $3 == percent && $4 == streams {
+      found=1; ratio=$7; retrans=$8; loss=$9; jitter=$10; load=$11; bytes=$12
+    }
+    END {
+      if (!found) exit 1;
+      if (protocol == "TCP") {
+        density=(bytes > 0 ? retrans*100000000/bytes : 0);
+        exit !(ratio < .50 || load >= 150 || density >= 1000);
+      }
+      exit !(ratio < .70 || loss >= 2 || jitter >= 30 || load >= 120);
+    }
+  ' "$file"
+}
+
+sample_confirmation_pending() {
+  local protocol=$1
+  local direction=$2
+  local percent=$3
+  local streams=$4
+
+  awk -F '\t' -v protocol="$protocol" -v direction="$direction" \
+    -v percent="$percent" -v streams="$streams" '
+    $1 == protocol && $2 == direction && $3 == percent && $4 == streams && $13 == "" {
+      found=1
+    }
+    END { exit !found }
+  ' "$RESULT_FILE"
+}
+
+attach_confirmation() {
+  local protocol=$1
+  local direction=$2
+  local percent=$3
+  local streams=$4
+  local outcome=$5
+  local confirmation_file=${6:-}
+  local _c_protocol='' _c_direction='' _c_percent='' _c_streams=''
+  local _c_offered='' c_achieved='' c_ratio='' c_retrans=''
+  local c_loss='' c_jitter='' c_load='' c_bytes=''
+  local updated_file="$TEMP_DIR/results-confirmed.tsv"
+
+  if [[ -n "$confirmation_file" && -s "$confirmation_file" ]]; then
+    IFS=$'\t' read -r _c_protocol _c_direction _c_percent _c_streams _c_offered \
+      c_achieved c_ratio c_retrans c_loss c_jitter c_load c_bytes \
+      <"$confirmation_file"
+  fi
+  awk -F '\t' -v OFS='\t' -v protocol="$protocol" -v direction="$direction" \
+    -v percent="$percent" -v streams="$streams" -v outcome="$outcome" \
+    -v c_achieved="$c_achieved" -v c_ratio="$c_ratio" \
+    -v c_retrans="$c_retrans" -v c_loss="$c_loss" -v c_jitter="$c_jitter" \
+    -v c_load="$c_load" -v c_bytes="$c_bytes" '
+    $1 == protocol && $2 == direction && $3 == percent && $4 == streams && $13 == "" {
+      for (column=6; column<=12; column++) original[column]=$column;
+      $13=outcome;
+      for (column=6; column<=12; column++) $column=original[column];
+      $14=original[6]; $15=original[7]; $16=original[8]; $17=original[9];
+      $18=original[10]; $19=original[11]; $20=original[12];
+      $21=c_achieved; $22=c_ratio; $23=c_retrans; $24=c_loss;
+      $25=c_jitter; $26=c_load; $27=c_bytes;
+      if (outcome == "TRANSIENT") {
+        $6=c_achieved; $7=c_ratio; $8=c_retrans; $9=c_loss;
+        $10=c_jitter; $11=c_load; $12=c_bytes;
+      }
+    }
+    {print}
+  ' "$RESULT_FILE" >"$updated_file"
+  mv -- "$updated_file" "$RESULT_FILE"
+}
+
+confirm_severe_sample() {
+  local protocol=$1
+  local direction=$2
+  local percent=$3
+  local streams=$4
+  local confirmation_file
+  local confirmation_status
+
+  sample_confirmation_pending "$protocol" "$direction" "$percent" "$streams" ||
+    return 0
+  sample_is_severe "$RESULT_FILE" "$protocol" "$direction" "$percent" "$streams" ||
+    return 0
+  confirmation_file="$TEMP_DIR/confirmation-${protocol,,}-${direction,,}-${percent}-${streams}.tsv"
+  : >"$confirmation_file"
+  printf '  Confirmation: repeating %s %s %s%% once.\n' \
+    "$protocol" "$(display_direction "$direction")" "$percent"
+  if run_controlled_test "$protocol" "$direction" "$percent" "$streams" \
+    "$confirmation_file" confirmation; then
+    confirmation_status=$TEST_RESULT_OK
+  else
+    confirmation_status=$?
+  fi
+  if (( confirmation_status == TEST_RESULT_BUDGET_DENIED )); then
+    attach_confirmation "$protocol" "$direction" "$percent" "$streams" \
+      UNCONFIRMED
+    append_label 'SEVERE-UNCONFIRMED'
+    printf '  Confirmation skipped: traffic budget has insufficient headroom.\n'
+    return 0
+  fi
+  if (( confirmation_status != TEST_RESULT_OK )); then
+    attach_confirmation "$protocol" "$direction" "$percent" "$streams" \
+      UNCONFIRMED
+    append_label 'SEVERE-UNCONFIRMED'
+    printf '  Confirmation unavailable: primary severe evidence remains valid.\n'
+    return 0
+  fi
+  if sample_is_severe "$confirmation_file" "$protocol" "$direction" \
+    "$percent" "$streams"; then
+    attach_confirmation "$protocol" "$direction" "$percent" "$streams" \
+      PERSISTENT "$confirmation_file"
+    append_label 'PERSISTENT-DEGRADATION'
+    printf '  Confirmation result: PERSISTENT severe degradation.\n'
+  else
+    attach_confirmation "$protocol" "$direction" "$percent" "$streams" \
+      TRANSIENT "$confirmation_file"
+    append_label 'TRANSIENT-ANOMALY'
+    printf '  Confirmation result: TRANSIENT one-stage anomaly.\n'
+  fi
+}
+
 run_direction_pair() {
   local protocol=$1
   local percent=$2
@@ -1272,6 +1445,7 @@ run_direction_pair() {
 
   if run_controlled_test "$protocol" 'A_TO_B' "$percent" "$streams"; then
     forward_result=$TEST_RESULT_OK
+    confirm_severe_sample "$protocol" 'A_TO_B' "$percent" "$streams"
   else
     forward_result=$?
   fi
@@ -1280,6 +1454,7 @@ run_direction_pair() {
   fi
   if run_controlled_test "$protocol" 'B_TO_A' "$percent" "$streams"; then
     reverse_result=$TEST_RESULT_OK
+    confirm_severe_sample "$protocol" 'B_TO_A' "$percent" "$streams"
   else
     reverse_result=$?
   fi
@@ -1585,8 +1760,8 @@ detect_asymmetry() {
           (loss_low <= .1 || loss_high >= loss_low*2) &&
           (forward_loss_worse >= 2 || reverse_loss_worse >= 2));
         if (severe_loss || persistent_loss) {
-          worse=(forward_loss > reverse_loss ? "forward" : "reverse");
-          printf "UDP loss is materially worse in %s direction (A->B %.2f%% vs B->A %.2f%%).", worse, forward_loss, reverse_loss;
+          worse=(forward_loss > reverse_loss ? "CLIENT->SERVER" : "SERVER->CLIENT");
+          printf "UDP loss is materially worse on %s (CLIENT->SERVER %.2f%% vs SERVER->CLIENT %.2f%%).", worse, forward_loss, reverse_loss;
           exit;
         }
       }
@@ -1616,8 +1791,8 @@ detect_asymmetry() {
         (retrans_low <= 5 || retrans_high >= retrans_low*tcp_retrans_ratio) &&
         (forward_retrans_worse >= 2 || reverse_retrans_worse >= 2));
       if (severe_retrans || persistent_retrans) {
-        worse=(forward_retrans > reverse_retrans ? "forward" : "reverse");
-        printf "%s TCP path shows substantially more retransmissions (A->B %.0f vs B->A %.0f).", worse, forward_retrans, reverse_retrans;
+        worse=(forward_retrans > reverse_retrans ? "CLIENT->SERVER" : "SERVER->CLIENT");
+        printf "%s TCP path shows substantially more retransmissions (CLIENT->SERVER %.0f vs SERVER->CLIENT %.0f).", worse, forward_retrans, reverse_retrans;
         exit;
       }
 
@@ -1629,8 +1804,8 @@ detect_asymmetry() {
         if (abs(forward_load-reverse_load) >= load_delta_min &&
           load_high >= load_high_min &&
           (load_low <= 10 || load_high >= load_low*2)) {
-          worse=(forward_load > reverse_load ? "forward" : "reverse");
-          printf "load RTT is materially worse in %s direction (A->B +%.1f ms vs B->A +%.1f ms).", worse, forward_load, reverse_load;
+          worse=(forward_load > reverse_load ? "CLIENT->SERVER" : "SERVER->CLIENT");
+          printf "load RTT is materially worse on %s (CLIENT->SERVER +%.1f ms vs SERVER->CLIENT +%.1f ms).", worse, forward_load, reverse_load;
           exit;
         }
       }
@@ -1643,8 +1818,8 @@ detect_asymmetry() {
           if (forward_rate > 0 && reverse_rate > 0) {
             rate_ratio=(forward_rate < reverse_rate ? forward_rate/reverse_rate : reverse_rate/forward_rate);
             if (rate_ratio < throughput_ratio) {
-              worse=(forward_rate < reverse_rate ? "forward" : "reverse");
-              printf "%s achieved throughput is materially lower in %s direction (A->B %.2f Mbps vs B->A %.2f Mbps).", protocol, worse, forward_rate, reverse_rate;
+              worse=(forward_rate < reverse_rate ? "CLIENT->SERVER" : "SERVER->CLIENT");
+              printf "%s achieved throughput is materially lower on %s (CLIENT->SERVER %.2f Mbps vs SERVER->CLIENT %.2f Mbps).", protocol, worse, forward_rate, reverse_rate;
               exit;
             }
           }
@@ -1863,8 +2038,8 @@ print_results() {
   [[ -z "$IDLE_VARIATION" ]] || variation_display="${IDLE_VARIATION} ms"
   [[ -z "$LABELS" ]] || labels_display=$LABELS
   case "$TCP_RETRANS_WORST_DIRECTION" in
-    A_TO_B) retrans_direction_display='A->B' ;;
-    B_TO_A) retrans_direction_display='B->A' ;;
+    A_TO_B) retrans_direction_display='CLIENT->SERVER' ;;
+    B_TO_A) retrans_direction_display='SERVER->CLIENT' ;;
     BOTH) retrans_direction_display='both' ;;
     *) retrans_direction_display='none' ;;
   esac
@@ -1935,15 +2110,15 @@ print_results() {
   fi
   printf '\nTCP SCORE:     %s / 100\n' "$TCP_SCORE"
   printf 'TCP retransmissions:\n'
-  printf '  A->B:        %s\n' "$TCP_RETRANSMISSIONS_A_TO_B"
-  printf '  B->A:        %s\n' "$TCP_RETRANSMISSIONS_B_TO_A"
+  printf '  CLIENT->SERVER: %s\n' "$TCP_RETRANSMISSIONS_A_TO_B"
+  printf '  SERVER->CLIENT: %s\n' "$TCP_RETRANSMISSIONS_B_TO_A"
   printf 'TCP transferred:\n'
-  printf '  A->B:        %s\n' "$(human_bytes "$TCP_TRANSFERRED_BYTES_A_TO_B")"
-  printf '  B->A:        %s\n' "$(human_bytes "$TCP_TRANSFERRED_BYTES_B_TO_A")"
+  printf '  CLIENT->SERVER: %s\n' "$(human_bytes "$TCP_TRANSFERRED_BYTES_A_TO_B")"
+  printf '  SERVER->CLIENT: %s\n' "$(human_bytes "$TCP_TRANSFERRED_BYTES_B_TO_A")"
   printf 'TCP retrans density:\n'
-  printf '  A->B:        %s retrans / 100MB\n' \
+  printf '  CLIENT->SERVER: %s retrans / 100MB\n' \
     "$TCP_RETRANS_DENSITY_A_TO_B"
-  printf '  B->A:        %s retrans / 100MB\n' \
+  printf '  SERVER->CLIENT: %s retrans / 100MB\n' \
     "$TCP_RETRANS_DENSITY_B_TO_A"
   printf '  Worst path:  %s\n' "$retrans_direction_display"
   printf '  Penalty:     %s / %s\n' "$TCP_RETRANS_PENALTY" \
@@ -1955,6 +2130,7 @@ print_results() {
   printf 'LABELS:        %s\n' "$labels_display"
   printf '\nPreferred:     %s\n' "$PREFERRED"
   printf '\nReason:\n%s\n' "$REASON"
+  print_confirmation_summary
   if [[ -n "$ASYMMETRY_REASON" ]]; then
     printf 'ASYMMETRIC: %s\n' "$ASYMMETRY_REASON"
   fi
@@ -1962,8 +2138,8 @@ print_results() {
     -v threshold="$TCP_RETRANS_DIAGNOSTIC_PENALTY" \
     'BEGIN { exit !(penalty >= threshold) }'; then
     case "$TCP_RETRANS_WORST_DIRECTION" in
-      A_TO_B) printf 'TCP retransmission density is materially worse in forward direction.\n' ;;
-      B_TO_A) printf 'TCP retransmission density is materially worse in reverse direction.\n' ;;
+      A_TO_B) printf 'TCP retransmission density is materially worse on CLIENT->SERVER.\n' ;;
+      B_TO_A) printf 'TCP retransmission density is materially worse on SERVER->CLIENT.\n' ;;
       *) printf 'TCP retransmission density is materially elevated in both directions.\n' ;;
     esac
   fi
@@ -1978,6 +2154,40 @@ print_results() {
   printf 'This does NOT prove the sing-box/proxy layer is healthy.\n'
 }
 
+print_confirmation_summary() {
+  local protocol direction percent _streams _offered _achieved _ratio _retrans _loss
+  local _jitter _load _bytes outcome _original_achieved _original_ratio
+  local original_retrans original_loss _original_jitter _original_load _original_bytes
+  local _confirmation_achieved _confirmation_ratio confirmation_retrans
+  local confirmation_loss _confirmation_jitter _confirmation_load _confirmation_bytes
+  local heading_printed=false
+
+  [[ -n "$RESULT_FILE" && -s "$RESULT_FILE" ]] || return 0
+  while IFS=$'\t' read -r protocol direction percent _streams _offered _achieved \
+    _ratio _retrans _loss _jitter _load _bytes outcome _original_achieved _original_ratio \
+    original_retrans original_loss _original_jitter _original_load _original_bytes \
+    _confirmation_achieved _confirmation_ratio confirmation_retrans confirmation_loss \
+    _confirmation_jitter _confirmation_load _confirmation_bytes; do
+    [[ -n "$outcome" ]] || continue
+    if [[ "$heading_printed" == false ]]; then
+      printf '\nSevere-stage confirmations:\n'
+      heading_printed=true
+    fi
+    if [[ "$outcome" == 'UNCONFIRMED' ]]; then
+      printf '  %s %s %s%%: UNCONFIRMED; primary severe evidence retained.\n' \
+        "$protocol" "$(display_direction "$direction")" "$percent"
+    elif [[ "$protocol" == 'TCP' ]]; then
+      printf '  TCP %s %s%%: %s (primary retrans=%s, confirmation retrans=%s).\n' \
+        "$(display_direction "$direction")" "$percent" "$outcome" \
+        "$original_retrans" "$confirmation_retrans"
+    else
+      printf '  UDP %s %s%%: %s (primary loss=%s%%, confirmation loss=%s%%).\n' \
+        "$(display_direction "$direction")" "$percent" "$outcome" \
+        "$original_loss" "$confirmation_loss"
+    fi
+  done <"$RESULT_FILE"
+}
+
 print_successful_sample_summary() {
   local protocol direction percent streams _offered achieved ratio retrans loss
   local jitter load_increase bytes
@@ -1988,10 +2198,10 @@ print_successful_sample_summary() {
     ratio retrans loss jitter load_increase bytes; do
     if [[ "$protocol" == 'TCP' ]]; then
       printf '  TCP %s %s%%: %s Mbps, retrans=%s\n' \
-        "${direction//_TO_/->}" "$percent" "$achieved" "$retrans"
+        "$(display_direction "$direction")" "$percent" "$achieved" "$retrans"
     else
       printf '  UDP %s %s%%: %s Mbps, loss=%s%%, jitter=%sms\n' \
-        "${direction//_TO_/->}" "$percent" "$achieved" "$loss" "$jitter"
+        "$(display_direction "$direction")" "$percent" "$achieved" "$loss" "$jitter"
     fi
   done <"$RESULT_FILE"
 }
@@ -2003,7 +2213,7 @@ print_failure_summary() {
   printf '\nExecution failures:\n'
   while IFS=$'\t' read -r protocol direction percent status reason; do
     printf '  %s %s %s%% (exit %s): %s\n' "$protocol" \
-      "${direction//_TO_/->}" "$percent" "$status" "$reason"
+      "$(display_direction "$direction")" "$percent" "$status" "$reason"
   done <"$FAILURE_FILE"
 }
 
@@ -2414,8 +2624,8 @@ run_client() {
   choose_bandwidth
   if [[ "$DEEP" == true ]]; then
     DURATION=$DEEP_DURATION
-    BUDGET_MB=$DEEP_BUDGET_MB
     MAX_PERCENT=$DEEP_MAX_PERCENT
+    configure_deep_budget
   fi
   BUDGET_BYTES=$((BUDGET_MB * 1000 * 1000))
   TEMP_DIR=$(mktemp -d /tmp/protocol-benchmark-client.XXXXXXXX)
