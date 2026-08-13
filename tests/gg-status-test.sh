@@ -60,7 +60,7 @@ case "$service:$fixture" in
   youtube:invalid_region) body='<html>{"INNERTUBE_CONTEXT_GL":"usa"}</html>' ;;
   youtube:consent) body='<html><title>Before you continue to YouTube</title></html>' ;;
   youtube:unknown) body='<html><title>YouTube</title></html>' ;;
-  search:normal) body='<html><title>Google Search</title><a href="/search?q=test">test</a></html>' ;;
+  search:normal) body='<html><title>curl - Google Search</title><form action="/search" method="get"></form></html>' ;;
   search:captcha) body='<html><title>Google</title><script src="/recaptcha/api.js"></script></html>' ;;
   search:unusual) body='<html><title>Google</title>Our systems have detected unusual traffic from your computer network</html>' ;;
   search:sorry) body='<html><title>Sorry...</title></html>'; effective_url='https://www.google.com/sorry/index' ;;
@@ -112,7 +112,7 @@ chmod +x "$mock_bin/curl"
 
 default_youtube='YouTube: NOT_CN [US]'
 default_search='Google Search: OK'
-default_login='Google Login: AVAILABLE'
+default_login='Google Sign-in: REACHABLE'
 default_gemini='Gemini: AVAILABLE [USA]'
 
 run_fixture() {
@@ -216,13 +216,13 @@ run_fixture search-malformed search malformed 'Google Search: UNKNOWN'
 run_fixture search-empty search empty 'Google Search: UNKNOWN'
 run_fixture search-curl-failure search failure 'Google Search: UNKNOWN'
 
-run_fixture login-normal login normal 'Google Login: AVAILABLE'
-run_fixture login-challenge login challenge 'Google Login: CHALLENGE'
-run_fixture login-unusual login unusual 'Google Login: CHALLENGE'
-run_fixture login-blocked login blocked 'Google Login: BLOCKED'
-run_fixture login-unexpected login unexpected 'Google Login: UNKNOWN'
-run_fixture login-empty login empty 'Google Login: UNKNOWN'
-run_fixture login-curl-failure login failure 'Google Login: UNKNOWN'
+run_fixture login-normal login normal 'Google Sign-in: REACHABLE'
+run_fixture login-challenge login challenge 'Google Sign-in: CHALLENGE'
+run_fixture login-unusual login unusual 'Google Sign-in: CHALLENGE'
+run_fixture login-blocked login blocked 'Google Sign-in: BLOCKED'
+run_fixture login-unexpected login unexpected 'Google Sign-in: UNKNOWN'
+run_fixture login-empty login empty 'Google Sign-in: UNKNOWN'
+run_fixture login-curl-failure login failure 'Google Sign-in: UNKNOWN'
 
 run_fixture gemini-region gemini region 'Gemini: AVAILABLE [USA]'
 run_fixture gemini-available gemini available 'Gemini: AVAILABLE'
