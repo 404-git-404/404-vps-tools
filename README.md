@@ -32,5 +32,5 @@ bash <(curl -fsSL https://raw.githubusercontent.com/404-git-404/404notfound/main
 ```
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/404-git-404/404notfound/main/yt-region -o yt-region && chmod +x yt-region && ./yt-region
+curl -fsSL https://raw.githubusercontent.com/404-git-404/404notfound/main/gg-status -o gg-status && chmod +x gg-status && ./gg-status
 ```
