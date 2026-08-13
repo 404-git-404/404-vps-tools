@@ -162,19 +162,63 @@ jobs:
       - name: Install integration dependencies
         run: |
           apt-get update
-          apt-get install --yes ca-certificates curl dnsutils iproute2 procps
+          apt-get install --yes ca-certificates curl dnsutils iproute2 jq procps
 
       - name: Check out repository
         uses: actions/checkout@v6
 
       - name: Download, validate and install pinned package
+        timeout-minutes: 10
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           printf '#!/bin/sh\nexit 101\n' > /usr/sbin/policy-rc.d
           chmod 0755 /usr/sbin/policy-rc.d
-          curl --fail --location --silent --show-error \
-            --connect-timeout 10 --max-time 120 --retry 3 --retry-delay 2 \
-            --retry-connrefused \
-            "$RELEASE_BASE/${{ matrix.asset }}" -o /tmp/smartdns.deb
+          curl_with_retry() {
+            # With no --retry-delay, curl applies its bounded exponential backoff.
+            curl --fail --location --silent --show-error \
+              --connect-timeout 10 --max-time 60 \
+              --retry 7 --retry-max-time 180 --retry-all-errors "$@"
+          }
+          asset_name='${{ matrix.asset }}'
+          release_api_url="https://api.github.com/repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG"
+          curl_with_retry \
+            --header 'Accept: application/vnd.github+json' \
+            --header "Authorization: Bearer $GITHUB_TOKEN" \
+            --header 'X-GitHub-Api-Version: 2022-11-28' \
+            "$release_api_url" -o /tmp/release.json
+          mapfile -t asset_fields < <(
+            jq -er --arg name "$asset_name" '
+              [.assets[] | select(.name == $name)] as $matches
+              | if ($matches | length) == 1 then
+                  $matches[0]
+                  | [.url, (.id | tostring), .browser_download_url][]
+                else
+                  error("expected exactly one matching Release asset")
+                end
+            ' /tmp/release.json
+          )
+          test "${#asset_fields[@]}" -eq 3
+          asset_api_url=${asset_fields[0]}
+          asset_id=${asset_fields[1]}
+          browser_download_url=${asset_fields[2]}
+          [[ $asset_id =~ ^[0-9]+$ ]]
+          test "$asset_api_url" = \
+            "https://api.github.com/repos/$GITHUB_REPOSITORY/releases/assets/$asset_id"
+          if ! curl_with_retry \
+            --header 'Accept: application/octet-stream' \
+            --header "Authorization: Bearer $GITHUB_TOKEN" \
+            --header 'X-GitHub-Api-Version: 2022-11-28' \
+            "$asset_api_url" -o /tmp/smartdns.deb.part; then
+            echo 'Authenticated asset download failed; trying browser URL.' >&2
+            rm -f /tmp/smartdns.deb.part
+            if ! curl_with_retry "$browser_download_url" \
+              -o /tmp/smartdns.deb.part; then
+              echo 'Browser asset download also failed.' >&2
+              exit 1
+            fi
+          fi
+          mv /tmp/smartdns.deb.part /tmp/smartdns.deb
           test "$(sha256sum /tmp/smartdns.deb | awk '{print $1}')" = \
             "${{ matrix.sha256 }}"
           dpkg-deb --info /tmp/smartdns.deb >/dev/null
