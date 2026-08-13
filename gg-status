@@ -9,7 +9,7 @@ unknown_result() {
   case $1 in
     youtube) printf 'YouTube: UNKNOWN\n' ;;
     search) printf 'Google Search: UNKNOWN\n' ;;
-    login) printf 'Google Login: UNKNOWN\n' ;;
+    login) printf 'Google Sign-in: UNKNOWN\n' ;;
     gemini) printf 'Gemini: UNKNOWN\n' ;;
   esac
 }
@@ -63,7 +63,7 @@ check_service() {
     function unknown(mode) {
       if (mode == "youtube") return "YouTube: UNKNOWN"
       if (mode == "search") return "Google Search: UNKNOWN"
-      if (mode == "login") return "Google Login: UNKNOWN"
+      if (mode == "login") return "Google Sign-in: UNKNOWN"
       return "Gemini: UNKNOWN"
     }
 
@@ -144,7 +144,8 @@ check_service() {
       }
       if (status == "200" && index(url, "https://www.google.com/search") == 1 &&
           index(lower, "google search</title>") &&
-          (index(lower, "/search?") || index(lower, "name=\"q\""))) {
+          (index(lower, "/search?") || index(lower, "action=\"/search\"") ||
+           index(lower, "name=\"q\""))) {
         return "Google Search: OK"
       }
       return unknown("search")
@@ -158,21 +159,21 @@ check_service() {
           index(url, "/signin/v2/challenge") ||
           index(lower, "<title>verify your identity</title>") ||
           index(lower, "unusual traffic from your computer network")) {
-        return "Google Login: CHALLENGE"
+        return "Google Sign-in: CHALLENGE"
       }
       if (index(lower, "your request has been blocked") ||
           index(lower, "this request has been blocked") ||
           index(lower, "<title>access denied</title>")) {
-        return "Google Login: BLOCKED"
+        return "Google Sign-in: BLOCKED"
       }
       if (status == "403" || status == "429" || status == "451") {
-        return "Google Login: BLOCKED"
+        return "Google Sign-in: BLOCKED"
       }
       if (status == "200" && index(url, "/signin/identifier") &&
           index(lower, "<title>sign in - google accounts</title>") &&
           index(lower, "id=\"identifierid\"") &&
           index(lower, "identifiernext") && index(lower, "name=\"identifier\"")) {
-        return "Google Login: AVAILABLE"
+        return "Google Sign-in: REACHABLE"
       }
       return unknown("login")
     }

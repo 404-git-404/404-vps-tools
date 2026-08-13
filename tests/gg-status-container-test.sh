@@ -79,13 +79,13 @@ run_container() {
       normal=\$(PATH=/fixture:\$PATH /bin/sh /work/gg-status)
       expected_normal='YouTube: NOT_CN [US]
 Google Search: OK
-Google Login: AVAILABLE
+Google Sign-in: REACHABLE
 Gemini: AVAILABLE [USA]'
       test \"\$normal\" = \"\$expected_normal\"
       mixed=\$(GG_CONTAINER_CASE=mixed PATH=/fixture:\$PATH /bin/sh /work/gg-status)
       expected_mixed='YouTube: CN
 Google Search: CHALLENGE
-Google Login: BLOCKED
+Google Sign-in: BLOCKED
 Gemini: BLOCKED'
       test \"\$mixed\" = \"\$expected_mixed\"
     "
