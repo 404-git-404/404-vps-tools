@@ -61,6 +61,9 @@ case "$service:$fixture" in
   youtube:consent) body='<html><title>Before you continue to YouTube</title></html>' ;;
   youtube:unknown) body='<html><title>YouTube</title></html>' ;;
   search:normal) body='<html><title>curl - Google Search</title><form action="/search" method="get"></form></html>' ;;
+  search:normal_hk) body='<html><title>curl - Google Search</title><a href="/search?q=test">test</a></html>'; effective_url='https://www.google.com.hk/search?q=curl&hl=en' ;;
+  search:normal_kr) body='<html><title>curl - Google Search</title><a href="/search?q=test">test</a></html>'; effective_url='https://www.google.co.kr/search?q=curl&hl=en' ;;
+  search:nongoogle) body='<html><title>curl - Google Search</title><a href="/search?q=test">test</a></html>'; effective_url='https://www.google.evil.com/search?q=curl&hl=en' ;;
   search:captcha) body='<html><title>Google</title><script src="/recaptcha/api.js"></script></html>' ;;
   search:unusual) body='<html><title>Google</title>Our systems have detected unusual traffic from your computer network</html>' ;;
   search:sorry) body='<html><title>Sorry...</title></html>'; effective_url='https://www.google.com/sorry/index' ;;
@@ -208,6 +211,9 @@ run_fixture youtube-unknown youtube unknown 'YouTube: UNKNOWN'
 run_fixture youtube-curl-failure youtube failure 'YouTube: UNKNOWN'
 
 run_fixture search-normal search normal 'Google Search: OK'
+run_fixture search-normal-hk search normal_hk 'Google Search: OK'
+run_fixture search-normal-kr search normal_kr 'Google Search: OK'
+run_fixture search-nongoogle search nongoogle 'Google Search: UNKNOWN'
 run_fixture search-captcha search captcha 'Google Search: CHALLENGE'
 run_fixture search-unusual search unusual 'Google Search: CHALLENGE'
 run_fixture search-sorry search sorry 'Google Search: CHALLENGE'

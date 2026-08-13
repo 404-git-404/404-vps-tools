@@ -123,11 +123,20 @@ check_service() {
       return unknown("youtube")
     }
 
-    function search_result(body, status, url, type, lower) {
+    function search_result(body, status, url, type, lower, prefix, rest, slash, suffix, path) {
+      prefix = "https://www.google."
       if (body == "" || index(type, "text/html") != 1 ||
-          index(url, "https://www.google.com/") != 1) return unknown("search")
+          index(url, prefix) != 1) return unknown("search")
+      rest = substr(url, length(prefix) + 1)
+      slash = index(rest, "/")
+      if (!slash) return unknown("search")
+      suffix = substr(rest, 1, slash - 1)
+      path = substr(rest, slash)
+      if (suffix !~ /^([a-z][a-z]|[a-z][a-z][a-z]|(com|co)\.[a-z][a-z])$/) {
+        return unknown("search")
+      }
       lower = tolower(body)
-      if (index(url, "https://www.google.com/sorry/") == 1 ||
+      if (index(path, "/sorry/") == 1 ||
           index(lower, "unusual traffic from your computer network") ||
           index(lower, "our systems have detected unusual traffic") ||
           index(lower, "recaptcha/api") || index(lower, "g-recaptcha")) {
@@ -142,7 +151,8 @@ check_service() {
       if (status == "403" || status == "429" || status == "451") {
         return "Google Search: BLOCKED"
       }
-      if (status == "200" && index(url, "https://www.google.com/search") == 1 &&
+      if (status == "200" &&
+          (path == "/search" || index(path, "/search?") == 1) &&
           index(lower, "google search</title>") &&
           (index(lower, "/search?") || index(lower, "action=\"/search\"") ||
            index(lower, "name=\"q\""))) {

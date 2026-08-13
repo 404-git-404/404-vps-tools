@@ -32,7 +32,7 @@ case $url in
     esac
     ;;
   https://www.google.com/search*)
-    effective_url=$url
+    effective_url='https://www.google.com.hk/search?q=curl&hl=en'
     case ${GG_CONTAINER_CASE:-normal} in
       normal) body='<html><title>Google Search</title><a href="/search?q=test">test</a></html>' ;;
       mixed) body='<html>Our systems have detected unusual traffic from your computer network</html>' ;;
