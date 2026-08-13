@@ -31,10 +31,6 @@ bash <(curl -fsSL https://raw.githubusercontent.com/404-git-404/404notfound/main
 bash <(curl -fsSL https://raw.githubusercontent.com/404-git-404/404notfound/main/protocol-benchmark.sh) --history <peer-IP>
 ```
 
-## yt-region
-
-YouTube 地区检测
-
 ```sh
 curl -fsSL https://raw.githubusercontent.com/404-git-404/404notfound/main/yt-region -o yt-region && chmod +x yt-region && ./yt-region
 ```
