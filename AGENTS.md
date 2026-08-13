@@ -1,6 +1,7 @@
 # Project rules
 
 - 项目只面向 Debian 12/13，支持 Debian 默认 Bash 环境。
+- `protocol-benchmark.sh` 是独立 Bash 工具例外，仅支持 Debian 12/13 与 Alpine 3.21-3.24；此 Alpine 兼容范围不得扩展到项目其他部分。
 - 用户入口主脚本固定为 `404notfound.sh`，不得保留旧名称的兼容副本或软链接。
 - Shell 脚本必须使用 `set -Eeuo pipefail`。
 - 根目录 `yt-region` 和 `gg-status` 是独立 POSIX sh 工具例外：二者必须保持 `#!/bin/sh` 和 `set -eu`，不要求 `set -Eeuo pipefail`；此例外不得用于其他 Shell 脚本，且不得修改 `yt-region` 已通过 Debian / Alpine 实机测试的代码。
