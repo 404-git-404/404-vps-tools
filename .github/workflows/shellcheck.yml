@@ -30,6 +30,8 @@ jobs:
             scripts/domain-check-go-benchmark.sh
             request-cloudflare-certificate.sh
             tests/domain-check-test.sh
+            tests/gg-status-container-test.sh
+            tests/gg-status-test.sh
             tests/node-config-wizard-test.sh
             tests/protocol-benchmark-container-test.sh
             tests/protocol-benchmark-test.sh
@@ -49,10 +51,20 @@ jobs:
             scripts/domain-check-go-benchmark.sh \
             scripts/update-smartdns.sh \
             tests/domain-check-test.sh \
+            tests/gg-status-container-test.sh \
+            tests/gg-status-test.sh \
             tests/node-config-wizard-test.sh \
             tests/protocol-benchmark-container-test.sh \
             tests/smartdns-test.sh; do
             test -x "$executable_script"
+          done
+          for script in yt-region gg-status; do
+            test -s "$script"
+            if grep -q $'\r' "$script"; then
+              echo "$script contains CRLF." >&2
+              exit 1
+            fi
+            sh -n "$script"
           done
 
       - name: Extract and check embedded Cloudflare tool
@@ -131,7 +143,7 @@ jobs:
           ```
 
           ```sh
-          curl -fsSL https://raw.githubusercontent.com/404-git-404/404notfound/main/yt-region -o yt-region && chmod +x yt-region && ./yt-region
+          curl -fsSL https://raw.githubusercontent.com/404-git-404/404notfound/main/gg-status -o gg-status && chmod +x gg-status && ./gg-status
           ```
           EOF
           cmp -s README.md /tmp/expected-readme
@@ -147,12 +159,16 @@ jobs:
           ln -s "$(command -v mawk)" "$RUNNER_TEMP/mawk-bin/awk"
           PATH="$RUNNER_TEMP/mawk-bin:$PATH" awk -W version
           PATH="$RUNNER_TEMP/mawk-bin:$PATH" bash tests/domain-check-test.sh
+          PATH="$RUNNER_TEMP/mawk-bin:$PATH" bash tests/gg-status-test.sh
+          GG_STATUS_SHELL=/bin/dash PATH="$RUNNER_TEMP/mawk-bin:$PATH" bash tests/gg-status-test.sh
           PATH="$RUNNER_TEMP/mawk-bin:$PATH" bash tests/node-config-wizard-test.sh
           PATH="$RUNNER_TEMP/mawk-bin:$PATH" bash tests/protocol-benchmark-test.sh
           PATH="$RUNNER_TEMP/mawk-bin:$PATH" bash tests/smartdns-test.sh
 
-      - name: Run Debian and Alpine protocol containers
-        run: bash tests/protocol-benchmark-container-test.sh
+      - name: Run Debian and Alpine containers
+        run: |
+          bash tests/protocol-benchmark-container-test.sh
+          bash tests/gg-status-container-test.sh
 
       - name: Run ShellCheck
         run: |
@@ -165,8 +181,11 @@ jobs:
             scripts/domain-check-go-benchmark.sh \
             request-cloudflare-certificate.sh \
             tests/domain-check-test.sh \
+            tests/gg-status-container-test.sh \
+            tests/gg-status-test.sh \
             tests/node-config-wizard-test.sh \
             tests/protocol-benchmark-container-test.sh \
             tests/protocol-benchmark-test.sh \
             tests/smartdns-test.sh \
             /tmp/update-cloudflare-ufw
+          shellcheck -s sh yt-region gg-status

@@ -1,0 +1,264 @@
+#!/bin/sh
+
+set -eu
+
+LC_ALL=C
+export LC_ALL
+
+unknown_result() {
+  case $1 in
+    youtube) printf 'YouTube: UNKNOWN\n' ;;
+    search) printf 'Google Search: UNKNOWN\n' ;;
+    login) printf 'Google Login: UNKNOWN\n' ;;
+    gemini) printf 'Gemini: UNKNOWN\n' ;;
+  esac
+}
+
+if ! command -v curl >/dev/null 2>&1 || ! command -v awk >/dev/null 2>&1; then
+  unknown_result youtube
+  unknown_result search
+  unknown_result login
+  unknown_result gemini
+  exit 0
+fi
+
+marker='
+__GG_STATUS_METADATA__:'
+user_agent='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36'
+readonly marker user_agent
+
+check_service() {
+  check_mode=$1
+  check_url=$2
+  check_cookie=$3
+  response=''
+  result=''
+
+  if [ -n "$check_cookie" ]; then
+    set -- --header "Cookie: $check_cookie"
+  else
+    set --
+  fi
+
+  if ! response=$(curl \
+    -4 \
+    --silent \
+    --location \
+    --compressed \
+    --connect-timeout 3 \
+    --max-time 6 \
+    --max-redirs 5 \
+    --proto '=https' \
+    --proto-redir '=https' \
+    --user-agent "$user_agent" \
+    --header 'Accept-Language: en-US,en;q=0.9' \
+    "$@" \
+    --write-out "${marker}%{http_code}|%{url_effective}|%{content_type}" \
+    "$check_url" 2>/dev/null); then
+    unknown_result "$check_mode"
+    return
+  fi
+
+  if ! result=$(printf '%s' "$response" | awk -v mode="$check_mode" '
+    function unknown(mode) {
+      if (mode == "youtube") return "YouTube: UNKNOWN"
+      if (mode == "search") return "Google Search: UNKNOWN"
+      if (mode == "login") return "Google Login: UNKNOWN"
+      return "Gemini: UNKNOWN"
+    }
+
+    function last_index(text, needle, offset, found, relative) {
+      offset = 1
+      found = 0
+      while ((relative = index(substr(text, offset), needle)) != 0) {
+        found = offset + relative - 1
+        offset = found + 1
+      }
+      return found
+    }
+
+    function valid_region(value) {
+      return length(value) == 2 && value ~ /^[A-Z][A-Z]$/
+    }
+
+    function scan_youtube_regions(text, key, kind, needle, position, relative, value) {
+      needle = "\"" key "\""
+      position = 1
+      while ((relative = index(substr(text, position), needle)) != 0) {
+        position += relative - 1 + length(needle)
+        while (substr(text, position, 1) ~ /^[[:space:]]$/) position++
+        if (substr(text, position, 1) != ":") continue
+        position++
+        while (substr(text, position, 1) ~ /^[[:space:]]$/) position++
+        if (substr(text, position, 1) != "\"") continue
+        value = substr(text, position + 1, 2)
+        if (substr(text, position + 3, 1) != "\"" || !valid_region(value)) {
+          position++
+          continue
+        }
+        if (value == "CN") {
+          youtube_cn = 1
+        } else if (kind == "inner" && youtube_inner == "") {
+          youtube_inner = value
+        } else if (kind == "content" && youtube_content == "") {
+          youtube_content = value
+        }
+        position += 4
+      }
+    }
+
+    function youtube_result(body, status, url, type) {
+      if (body == "" || status != "200" ||
+          !(url == "https://www.youtube.com" ||
+            index(url, "https://www.youtube.com/") == 1) ||
+          index(type, "text/html") != 1) return unknown("youtube")
+      if (index(body, "<title>Before you continue to YouTube</title>") ||
+          index(body, "consent.youtube.com/save")) return unknown("youtube")
+      if (index(body, "www.google.cn")) youtube_cn = 1
+      scan_youtube_regions(body, "INNERTUBE_CONTEXT_GL", "inner")
+      scan_youtube_regions(body, "contentRegion", "content")
+      if (youtube_cn) return "YouTube: CN"
+      if (youtube_inner != "") return "YouTube: NOT_CN [" youtube_inner "]"
+      if (youtube_content != "") return "YouTube: NOT_CN [" youtube_content "]"
+      return unknown("youtube")
+    }
+
+    function search_result(body, status, url, type, lower) {
+      if (body == "" || index(type, "text/html") != 1 ||
+          index(url, "https://www.google.com/") != 1) return unknown("search")
+      lower = tolower(body)
+      if (index(url, "https://www.google.com/sorry/") == 1 ||
+          index(lower, "unusual traffic from your computer network") ||
+          index(lower, "our systems have detected unusual traffic") ||
+          index(lower, "recaptcha/api") || index(lower, "g-recaptcha")) {
+        return "Google Search: CHALLENGE"
+      }
+      if (index(lower, "unaddressed abuse") ||
+          index(lower, "your request has been blocked") ||
+          index(lower, "this request has been blocked") ||
+          index(lower, "<title>access denied</title>")) {
+        return "Google Search: BLOCKED"
+      }
+      if (status == "403" || status == "429" || status == "451") {
+        return "Google Search: BLOCKED"
+      }
+      if (status == "200" && index(url, "https://www.google.com/search") == 1 &&
+          index(lower, "google search</title>") &&
+          (index(lower, "/search?") || index(lower, "name=\"q\""))) {
+        return "Google Search: OK"
+      }
+      return unknown("search")
+    }
+
+    function login_result(body, status, url, type, lower) {
+      if (body == "" || index(type, "text/html") != 1 ||
+          index(url, "https://accounts.google.com/") != 1) return unknown("login")
+      lower = tolower(body)
+      if (index(url, "/challenge/") || index(url, "/signin/challenge") ||
+          index(url, "/signin/v2/challenge") ||
+          index(lower, "<title>verify your identity</title>") ||
+          index(lower, "unusual traffic from your computer network")) {
+        return "Google Login: CHALLENGE"
+      }
+      if (index(lower, "your request has been blocked") ||
+          index(lower, "this request has been blocked") ||
+          index(lower, "<title>access denied</title>")) {
+        return "Google Login: BLOCKED"
+      }
+      if (status == "403" || status == "429" || status == "451") {
+        return "Google Login: BLOCKED"
+      }
+      if (status == "200" && index(url, "/signin/identifier") &&
+          index(lower, "<title>sign in - google accounts</title>") &&
+          index(lower, "id=\"identifierid\"") &&
+          index(lower, "identifiernext") && index(lower, "name=\"identifier\"")) {
+        return "Google Login: AVAILABLE"
+      }
+      return unknown("login")
+    }
+
+    function gemini_region(body, needle, offset, relative, position, value) {
+      needle = ",2,1,200,\""
+      offset = 1
+      while ((relative = index(substr(body, offset), needle)) != 0) {
+        position = offset + relative - 1
+        value = substr(body, position + length(needle), 3)
+        if (value ~ /^[A-Z][A-Z][A-Z]$/ &&
+            substr(body, position + length(needle) + 3, 1) == "\"") return value
+        offset = position + length(needle)
+      }
+      return ""
+    }
+
+    function gemini_result(body, status, url, type, lower, region) {
+      if (body == "" || index(type, "text/html") != 1 ||
+          !(url == "https://gemini.google.com" ||
+            index(url, "https://gemini.google.com/") == 1)) return unknown("gemini")
+      lower = tolower(body)
+      if (index(body, "45631641,null,false") ||
+          index(lower, "gemini is not currently supported in your country") ||
+          index(lower, "gemini is not available in your location") ||
+          index(lower, "gemini is not available in your country") ||
+          index(lower, "gemini does not currently support your country/region") ||
+          index(lower, "this country is not supported")) {
+        return "Gemini: BLOCKED"
+      }
+      if (status == "403" || status == "451") return "Gemini: BLOCKED"
+      if (status == "200" && index(lower, "google gemini</title>") &&
+          index(body, "45631641,null,true")) {
+        region = gemini_region(body)
+        if (region != "") return "Gemini: AVAILABLE [" region "]"
+        return "Gemini: AVAILABLE"
+      }
+      return unknown("gemini")
+    }
+
+    BEGIN {
+      RS = sprintf("%c", 1)
+      marker = "\n__GG_STATUS_METADATA__:"
+    }
+
+    {
+      marker_at = last_index($0, marker)
+      if (marker_at == 0) {
+        print unknown(mode)
+        next
+      }
+      body = substr($0, 1, marker_at - 1)
+      metadata = substr($0, marker_at + length(marker))
+      first_separator = index(metadata, "|")
+      if (first_separator == 0) {
+        print unknown(mode)
+        next
+      }
+      status = substr(metadata, 1, first_separator - 1)
+      metadata = substr(metadata, first_separator + 1)
+      second_separator = index(metadata, "|")
+      if (second_separator == 0) {
+        print unknown(mode)
+        next
+      }
+      url = substr(metadata, 1, second_separator - 1)
+      type = substr(metadata, second_separator + 1)
+
+      if (mode == "youtube") print youtube_result(body, status, url, type)
+      else if (mode == "search") print search_result(body, status, url, type)
+      else if (mode == "login") print login_result(body, status, url, type)
+      else print gemini_result(body, status, url, type)
+    }
+  '); then
+    unknown_result "$check_mode"
+    return
+  fi
+
+  if [ -n "$result" ]; then
+    printf '%s\n' "$result"
+  else
+    unknown_result "$check_mode"
+  fi
+}
+
+check_service youtube 'https://www.youtube.com/premium' 'CONSENT=YES+cb.20220301-11-p0.en+FX+700'
+check_service search 'https://www.google.com/search?q=curl&hl=en' ''
+check_service login 'https://accounts.google.com/' ''
+check_service gemini 'https://gemini.google.com/' ''
