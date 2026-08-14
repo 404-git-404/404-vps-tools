@@ -96,6 +96,7 @@ reset_fixture() {
   IDLE_RTT=30
   IDLE_VARIATION=1
   IDLE_LOSS=0
+  IDLE_BASELINE_AVAILABLE=true
   MAX_LOAD_INCREASE=0
   MAX_CPU=20
   MAX_LOAD_AVERAGE=0
@@ -253,6 +254,93 @@ EOF
   assert_equal '20' "$PING_LOSS" 'iputils partial-loss parser'
   assert_equal '12.300' "$PING_AVG" 'round-trip IPv4/IPv6 average parser'
   assert_equal '1.400' "$PING_VARIATION" 'round-trip variation parser'
+}
+
+test_idle_ping_availability() {
+  local output
+
+  output=$(
+    TEMP_DIR=$TEST_TEMP_DIR
+    PEER=192.0.2.1
+    ping() {
+      printf '6 packets transmitted, 0 received, 100%% packet loss, time 5000ms\n'
+      return 1
+    }
+    collect_idle_baseline >/dev/null 2>/dev/null
+    printf '%s|%s|%s|%s' "$IDLE_BASELINE_AVAILABLE" "$IDLE_RTT" \
+      "$IDLE_VARIATION" "$IDLE_LOSS"
+  )
+  assert_equal 'false|||' "$output" \
+    'failed ping leaves the ICMP baseline unavailable instead of recording 100 percent loss'
+
+  output=$(
+    TEMP_DIR=$TEST_TEMP_DIR
+    PEER=192.0.2.1
+    ping() {
+      printf '6 packets transmitted, 3 received, 50%% packet loss, time 5000ms\n'
+      printf 'rtt min/avg/max/mdev = 10.0/12.0/15.0/1.0 ms\n'
+      return 1
+    }
+    collect_idle_baseline >/dev/null 2>/dev/null
+    printf '%s|%s|%s|%s' "$IDLE_BASELINE_AVAILABLE" "$IDLE_RTT" \
+      "$IDLE_VARIATION" "$IDLE_LOSS"
+  )
+  assert_equal 'false|||' "$output" \
+    'incomplete ping is not accepted as a valid loss baseline'
+
+  output=$(
+    TEMP_DIR=$TEST_TEMP_DIR
+    PEER=192.0.2.1
+    ping() {
+      printf '6 packets transmitted, 5 received, 16.6667%% packet loss, time 5000ms\n'
+      printf 'rtt min/avg/max/mdev = 10.0/12.0/15.0/1.0 ms\n'
+      return 0
+    }
+    collect_idle_baseline >/dev/null 2>/dev/null
+    printf '%s|%s|%s|%s' "$IDLE_BASELINE_AVAILABLE" "$IDLE_RTT" \
+      "$IDLE_VARIATION" "$IDLE_LOSS"
+  )
+  assert_equal 'true|12.0|1.0|16.6667' "$output" \
+    'successful partial-loss ping remains a valid ICMP baseline'
+
+  reset_fixture
+  append_healthy_pair TCP 5 50
+  append_healthy_pair TCP 10 100
+  append_healthy_pair UDP 5 50
+  append_healthy_pair UDP 10 100
+  IDLE_BASELINE_AVAILABLE=false
+  IDLE_RTT=''
+  IDLE_VARIATION=''
+  IDLE_LOSS=''
+  calculate_results
+  output=$(print_results)
+  assert_equal '100' "$LINK_HEALTH" \
+    'unavailable ICMP baseline applies no idle-loss health penalty'
+  assert_equal 'MEDIUM' "$CONFIDENCE" \
+    'unavailable ICMP baseline reduces otherwise high confidence'
+  assert_contains 'ICMP-BASELINE-UNAVAILABLE' "$LABELS" \
+    'unavailable ICMP baseline is labeled explicitly'
+  assert_contains 'ICMP baseline: unavailable' "$output" \
+    'report identifies unavailable ICMP baseline'
+  assert_contains 'Idle loss:     unavailable' "$output" \
+    'report does not display unavailable ping as 100 percent loss'
+
+  reset_fixture
+  append_healthy_pair TCP 5 50
+  append_healthy_pair TCP 10 100
+  append_healthy_pair UDP 5 50
+  append_healthy_pair UDP 10 100
+  IDLE_LOSS=10
+  calculate_results
+  output=$(print_results)
+  assert_equal '85' "$LINK_HEALTH" \
+    'valid ICMP packet loss retains the existing health penalty'
+  assert_equal 'HIGH' "$CONFIDENCE" \
+    'valid ICMP baseline retains high confidence'
+  assert_contains 'ICMP baseline: available' "$output" \
+    'report identifies valid ICMP baseline'
+  assert_contains 'Idle loss:     10%' "$output" \
+    'report displays measured ICMP loss'
 }
 
 test_iperf_json_execution() {
@@ -2005,7 +2093,7 @@ test_severe_stage_confirmation() {
     fi
     if [[ "$protocol" == TCP ]]; then
       if [[ "$confirmation_mode" == persistent ]]; then
-        printf 'TCP\t%s\t%s\t%s\t5\t5\t1.0\t500\t0\t0\t5\t1000000\n' \
+        printf 'TCP\t%s\t%s\t%s\t5\t5\t1.0\t200\t0\t0\t5\t25000000\n' \
           "$direction" "$percent" "$streams" >>"$output_file"
       else
         printf 'TCP\t%s\t%s\t%s\t5\t5\t1.0\t0\t0\t0\t5\t1000000\n' \
@@ -2021,10 +2109,25 @@ test_severe_stage_confirmation() {
   }
 
   reset_fixture
+  append_result TCP A_TO_B 5 100 200 0 5 25000000
+  assert_true 'large TCP sample with 200 retransmissions requires confirmation' \
+    sample_is_severe "$RESULT_FILE" TCP A_TO_B 5 1
+
+  reset_fixture
+  append_result TCP A_TO_B 5 5 20 0 5 1000000
+  assert_false 'tiny TCP sample with a few retransmissions stays below confirmation trigger' \
+    sample_is_severe "$RESULT_FILE" TCP A_TO_B 5 1
+
+  reset_fixture
+  append_result TCP A_TO_B 5 100 0 0 5 25000000
+  assert_false 'clean TCP sample does not require confirmation' \
+    sample_is_severe "$RESULT_FILE" TCP A_TO_B 5 1
+
+  reset_fixture
   TEMP_DIR=$TEST_TEMP_DIR
   NOMINAL_MBPS=100
   BUDGET_BYTES=200000000
-  append_result TCP A_TO_B 5 5 500 0 5 1000000
+  append_result TCP A_TO_B 5 100 200 0 5 25000000
   append_result TCP B_TO_A 5 5 0 0 5 1000000
   append_healthy_pair UDP 5 5
   confirm_severe_sample TCP A_TO_B 5 1 >/dev/null
@@ -2035,14 +2138,14 @@ test_severe_stage_confirmation() {
     'healthy confirmation marks the primary burst transient'
   assert_equal '0' "$(awk -F '\t' '$1=="TCP" && $2=="A_TO_B" {print $8}' "$RESULT_FILE")" \
     'transient scoring uses the clean confirmation retransmission value'
-  assert_equal '500' "$(awk -F '\t' '$1=="TCP" && $2=="A_TO_B" {print $16}' "$RESULT_FILE")" \
+  assert_equal '200' "$(awk -F '\t' '$1=="TCP" && $2=="A_TO_B" {print $16}' "$RESULT_FILE")" \
     'transient classification retains the original severe evidence'
   calculate_results
   transient_score=$TCP_SCORE
   output=$(print_results)
   assert_contains 'TRANSIENT-ANOMALY' "$LABELS" \
     'transient confirmation is exposed as a label'
-  assert_contains 'TRANSIENT (primary retrans=500, confirmation retrans=0)' "$output" \
+  assert_contains 'TRANSIENT (primary retrans=200, confirmation retrans=0)' "$output" \
     'transient confirmation is explained in final diagnostics'
   assert_equal 'EITHER' "$PREFERRED" \
     'transient TCP burst does not dominate transport recommendation'
@@ -2053,13 +2156,13 @@ test_severe_stage_confirmation() {
   BUDGET_BYTES=200000000
   confirmation_calls=0
   confirmation_mode=persistent
-  append_result TCP A_TO_B 5 5 500 0 5 1000000
+  append_result TCP A_TO_B 5 100 200 0 5 25000000
   append_result TCP B_TO_A 5 5 0 0 5 1000000
   append_healthy_pair UDP 5 5
   confirm_severe_sample TCP A_TO_B 5 1 >/dev/null
   assert_equal 'PERSISTENT' "$(awk -F '\t' '$1=="TCP" && $2=="A_TO_B" {print $13}' "$RESULT_FILE")" \
     'repeated severe confirmation marks degradation persistent'
-  assert_equal '500' "$(awk -F '\t' '$1=="TCP" && $2=="A_TO_B" {print $8}' "$RESULT_FILE")" \
+  assert_equal '200' "$(awk -F '\t' '$1=="TCP" && $2=="A_TO_B" {print $8}' "$RESULT_FILE")" \
     'persistent scoring retains the primary severe metric without double counting'
   calculate_results
   persistent_score=$TCP_SCORE
@@ -2075,7 +2178,7 @@ test_severe_stage_confirmation() {
   BUDGET_BYTES=0
   confirmation_calls=0
   confirmation_mode=budget
-  append_result TCP A_TO_B 5 5 500 0 5 1000000
+  append_result TCP A_TO_B 5 100 200 0 5 25000000
   confirm_severe_sample TCP A_TO_B 5 1 >/dev/null
   confirm_severe_sample TCP A_TO_B 5 1 >/dev/null
   assert_equal '1' "$confirmation_calls" \
@@ -2084,7 +2187,7 @@ test_severe_stage_confirmation() {
     'insufficient confirmation budget preserves primary evidence as unconfirmed'
   assert_equal 'true' "$BUDGET_LIMITED" \
     'confirmation retry respects the traffic budget'
-  assert_equal '500' "$(awk -F '\t' '$1=="TCP" {print $8}' "$RESULT_FILE")" \
+  assert_equal '200' "$(awk -F '\t' '$1=="TCP" {print $8}' "$RESULT_FILE")" \
     'budget skip leaves the original severe metric valid'
 }
 
@@ -2127,6 +2230,7 @@ test_repository_invariants() {
 test_limits_and_scaling
 test_validation
 test_json_ping_parser
+test_idle_ping_availability
 test_iperf_json_execution
 test_adaptive_healthy_early_stop
 test_udp_degradation_early_stop
