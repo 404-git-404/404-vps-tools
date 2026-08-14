@@ -144,6 +144,10 @@ type localTLSServer struct {
 }
 
 func startTLSServer(t *testing.T, domain string, curves []tls.CurveID, handler http.Handler) *localTLSServer {
+	return startTLSServerWithALPN(t, domain, curves, []string{"h2", "http/1.1"}, handler)
+}
+
+func startTLSServerWithALPN(t *testing.T, domain string, curves []tls.CurveID, nextProtos []string, handler http.Handler) *localTLSServer {
 	t.Helper()
 	certificate, roots, _ := certificateFor(t, domain, 45*24*time.Hour)
 	local := &localTLSServer{root: roots}
@@ -152,7 +156,7 @@ func startTLSServer(t *testing.T, domain string, curves []tls.CurveID, handler h
 	server.TLS = &tls.Config{
 		Certificates: []tls.Certificate{certificate}, MinVersion: tls.VersionTLS13,
 		MaxVersion: tls.VersionTLS13, CurvePreferences: curves,
-		NextProtos: []string{"h2", "http/1.1"},
+		NextProtos: nextProtos,
 		GetConfigForClient: func(hello *tls.ClientHelloInfo) (*tls.Config, error) {
 			local.mu.Lock()
 			local.snis = append(local.snis, hello.ServerName)
@@ -320,6 +324,59 @@ func TestPrimaryFallbackPreservesTLSH2AndCert(t *testing.T) {
 	}
 	if dials.Load() != 4 {
 		t.Fatalf("X25519 failure invoked READY probes: dials=%d, want TCP + PRIMARY + fallback + HTTP", dials.Load())
+	}
+}
+
+func TestH2FailureSkipsReadyButKeepsHTTPDiagnostics(t *testing.T) {
+	const domain = "no-h2.test"
+	server := startTLSServerWithALPN(t, domain, []tls.CurveID{tls.X25519}, []string{"http/1.1"}, http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		writer.WriteHeader(http.StatusNoContent)
+	}))
+	cfg := configForServer(server, &fakeResolver{ipv4: []net.IP{net.ParseIP("127.0.0.1")}})
+	realDial := (&net.Dialer{}).DialContext
+	var dials atomic.Int32
+	cfg.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
+		dials.Add(1)
+		return realDial(ctx, network, address)
+	}
+	detector, _ := New(cfg)
+	result := detector.Check(context.Background(), domain)
+
+	if result.TLS13 != Pass || result.X25519 != Pass || result.H2 != Fail || result.CertDays == "FAIL" || result.ReadyMS != "-" || result.HTTP != "204" || result.Result != Fail {
+		t.Fatalf("H2 failure diagnostics changed: %+v", result)
+	}
+	if !containsReason(result, "ALPN 未协商 h2") || containsReason(result, "连接就绪计时样本不足") {
+		t.Fatalf("unexpected H2 failure reasons: %+v", result.Reasons)
+	}
+	if dials.Load() != 3 {
+		t.Fatalf("H2 failure invoked READY probes: dials=%d, want TCP + PRIMARY + HTTP", dials.Load())
+	}
+}
+
+func TestCertificateFailureSkipsReadyButKeepsHTTPDiagnostics(t *testing.T) {
+	const domain = "expired-for-detector.test"
+	server := startTLSServer(t, domain, []tls.CurveID{tls.X25519}, http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		writer.WriteHeader(http.StatusNoContent)
+	}))
+	cfg := configForServer(server, &fakeResolver{ipv4: []net.IP{net.ParseIP("127.0.0.1")}})
+	cfg.Now = func() time.Time { return time.Now().Add(90 * 24 * time.Hour) }
+	realDial := (&net.Dialer{}).DialContext
+	var dials atomic.Int32
+	cfg.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
+		dials.Add(1)
+		return realDial(ctx, network, address)
+	}
+	detector, _ := New(cfg)
+	result := detector.Check(context.Background(), domain)
+
+	if result.TLS13 != Pass || result.X25519 != Pass || result.H2 != Pass || result.CertDays != "FAIL" || result.ReadyMS != "-" || result.HTTP != "204" || result.Result != Fail {
+		t.Fatalf("certificate failure diagnostics changed: %+v", result)
+	}
+	if !containsReason(result, "证书链、有效期或主机名验证失败") || containsReason(result, "连接就绪计时样本不足") {
+		t.Fatalf("unexpected certificate failure reasons: %+v", result.Reasons)
+	}
+	if dials.Load() != 3 {
+		t.Fatalf("certificate failure invoked READY probes: dials=%d, want TCP + PRIMARY + HTTP", dials.Load())
 	}
 }
 
