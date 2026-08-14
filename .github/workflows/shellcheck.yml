@@ -98,6 +98,15 @@ jobs:
           grep -Fq 'domain-check-linux-arm64' .github/workflows/domain-check-release.yml
           grep -Fq 'SHA256SUMS' .github/workflows/domain-check-release.yml
           grep -Fq 'stable_tag=domain-check-latest' .github/workflows/domain-check-release.yml
+          grep -Fq 'gh release view "$GITHUB_REF_NAME"' .github/workflows/domain-check-release.yml
+          grep -Fq 'gh release upload "$GITHUB_REF_NAME"' .github/workflows/domain-check-release.yml
+          grep -Fq 'gh release upload "$stable_tag"' .github/workflows/domain-check-release.yml
+          grep -Fq -- '--clobber' .github/workflows/domain-check-release.yml
+          grep -Fq -- '--draft=false' .github/workflows/domain-check-release.yml
+          grep -Fq 'Verify published release assets' .github/workflows/domain-check-release.yml
+          if grep -Fq 'gh release delete' .github/workflows/domain-check-release.yml; then
+            exit 1
+          fi
           grep -Fq 'releases/download/domain-check-latest' README.md
           grep -Fq 'sha256sum -c - >/dev/null' README.md
           if grep -Fq 'releases/latest/download' README.md 404notfound.sh \
@@ -167,6 +176,84 @@ jobs:
           ```
           EOF
           cmp -s README.md /tmp/expected-readme
+
+      - name: Test release workflow reruns
+        run: |
+          declare -A mock_releases=()
+          declare -a mock_calls=()
+          mock_fail_once=''
+          mock_stable_ref=false
+          GITHUB_REF_NAME=domain-check-v1.2.3
+          GITHUB_SHA=0123456789abcdef0123456789abcdef01234567
+          GITHUB_REPOSITORY=404-git-404/404notfound
+          export GITHUB_REF_NAME GITHUB_SHA GITHUB_REPOSITORY
+
+          extract_release_step() {
+            local step_name=$1
+            awk -v step_name="$step_name" '
+              $0 == "      - name: " step_name { found = 1; next }
+              found && /^      - name:/ { exit }
+              found && $0 == "        run: |" { run = 1; next }
+              run { sub(/^          /, ""); print }
+            ' .github/workflows/domain-check-release.yml
+          }
+
+          gh() {
+            mock_calls+=("$*")
+            if [[ -n "$mock_fail_once" && "$*" == *"$mock_fail_once"* ]]; then
+              mock_fail_once=''
+              return 97
+            fi
+            case "${1:-}:${2:-}" in
+              release:view)
+                [[ "${mock_releases[${3:-}]:-false}" == true ]]
+                ;;
+              release:create)
+                mock_releases[${3:-}]=true
+                ;;
+              release:upload | release:edit)
+                [[ "${mock_releases[${3:-}]:-false}" == true ]]
+                ;;
+              api:*)
+                if [[ " $* " == *' --method POST '* ]]; then
+                  mock_stable_ref=true
+                elif [[ " $* " == *' --method PATCH '* ]]; then
+                  [[ "$mock_stable_ref" == true ]]
+                else
+                  [[ "$mock_stable_ref" == true ]]
+                fi
+                ;;
+              *) return 1 ;;
+            esac
+          }
+
+          count_mock_calls() {
+            local call
+            local count=0
+            local needle=$1
+            for call in "${mock_calls[@]}"; do
+              if [[ "$call" == *"$needle"* ]]; then
+                ((count += 1))
+              fi
+            done
+            printf '%s\n' "$count"
+          }
+
+          eval "$(extract_release_step 'Publish versioned release')"
+          mock_fail_once='release edit domain-check-latest'
+          if eval "$(extract_release_step 'Publish domain-check stable alias')"; then
+            exit 1
+          fi
+          eval "$(extract_release_step 'Publish versioned release')"
+          eval "$(extract_release_step 'Publish domain-check stable alias')"
+
+          [[ "$(count_mock_calls 'release create domain-check-v1.2.3')" -eq 1 ]]
+          [[ "$(count_mock_calls 'release upload domain-check-v1.2.3')" -eq 4 ]]
+          [[ "$(count_mock_calls 'release edit domain-check-v1.2.3')" -eq 2 ]]
+          [[ "$(count_mock_calls 'release create domain-check-latest')" -eq 1 ]]
+          [[ "$(count_mock_calls 'release upload domain-check-latest')" -eq 4 ]]
+          [[ "$(count_mock_calls 'release edit domain-check-latest')" -eq 2 ]]
+          [[ "$(count_mock_calls 'release delete')" -eq 0 ]]
 
       - name: Install ShellCheck, jq, and mawk
         run: |

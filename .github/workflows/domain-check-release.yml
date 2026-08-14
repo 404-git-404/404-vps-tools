@@ -45,13 +45,23 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$GITHUB_REF_NAME" \
+          release_title="domain-check ${GITHUB_REF_NAME#domain-check-}"
+          if ! gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release create "$GITHUB_REF_NAME" \
+              --verify-tag \
+              --title "$release_title" \
+              --generate-notes \
+              --latest=false \
+              --draft
+          fi
+          gh release upload "$GITHUB_REF_NAME" \
             dist/domain-check-linux-amd64 \
             dist/domain-check-linux-arm64 \
-            dist/SHA256SUMS \
-            --verify-tag \
-            --title "domain-check ${GITHUB_REF_NAME#domain-check-}" \
-            --generate-notes \
+            --clobber
+          gh release upload "$GITHUB_REF_NAME" dist/SHA256SUMS --clobber
+          gh release edit "$GITHUB_REF_NAME" \
+            --title "$release_title" \
+            --draft=false \
             --latest=false
       - name: Publish domain-check stable alias
         env:
@@ -61,31 +71,60 @@ jobs:
           version=${GITHUB_REF_NAME#domain-check-}
           title="domain-check stable ($version)"
           notes="Stable domain-check download alias for $GITHUB_REF_NAME at commit $GITHUB_SHA."
-          if gh release view "$stable_tag" >/dev/null 2>&1; then
-            gh release upload "$stable_tag" \
-              dist/domain-check-linux-amd64 \
-              dist/domain-check-linux-arm64 \
-              --clobber
-            gh release upload "$stable_tag" dist/SHA256SUMS --clobber
-            gh api --method PATCH \
-              "repos/$GITHUB_REPOSITORY/git/refs/tags/$stable_tag" \
-              -f sha="$GITHUB_SHA" -F force=true
-            gh release edit "$stable_tag" --title "$title" --notes "$notes"
-          else
+          update_stable_ref() {
             if gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$stable_tag" \
               >/dev/null 2>&1; then
-              gh api --method DELETE \
-                "repos/$GITHUB_REPOSITORY/git/refs/tags/$stable_tag"
+              gh api --method PATCH \
+                "repos/$GITHUB_REPOSITORY/git/refs/tags/$stable_tag" \
+                -f sha="$GITHUB_SHA" -F force=true
+            else
+              gh api --method POST "repos/$GITHUB_REPOSITORY/git/refs" \
+                -f ref="refs/tags/$stable_tag" -f sha="$GITHUB_SHA"
             fi
+          }
+          if ! gh release view "$stable_tag" >/dev/null 2>&1; then
+            update_stable_ref
             gh release create "$stable_tag" \
-              dist/domain-check-linux-amd64 \
-              dist/domain-check-linux-arm64 \
-              dist/SHA256SUMS \
-              --target "$GITHUB_SHA" \
+              --verify-tag \
               --title "$title" \
               --notes "$notes" \
-              --latest=false
+              --latest=false \
+              --draft
           fi
+          gh release upload "$stable_tag" \
+            dist/domain-check-linux-amd64 \
+            dist/domain-check-linux-arm64 \
+            --clobber
+          gh release upload "$stable_tag" dist/SHA256SUMS --clobber
+          update_stable_ref
+          gh release edit "$stable_tag" \
+            --title "$title" \
+            --notes "$notes" \
+            --draft=false \
+            --latest=false
+      - name: Verify published release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for tag in "$GITHUB_REF_NAME" domain-check-latest; do
+            release_dir="$RUNNER_TEMP/$tag"
+            mkdir "$release_dir"
+            gh release download "$tag" \
+              --dir "$release_dir" \
+              --pattern domain-check-linux-amd64 \
+              --pattern domain-check-linux-arm64 \
+              --pattern SHA256SUMS
+            (cd "$release_dir" && sha256sum --check SHA256SUMS)
+            for asset in \
+              domain-check-linux-amd64 \
+              domain-check-linux-arm64 \
+              SHA256SUMS; do
+              cmp "dist/$asset" "$release_dir/$asset"
+            done
+          done
+          test "$(gh api \
+            "repos/$GITHUB_REPOSITORY/git/ref/tags/domain-check-latest" \
+            --jq .object.sha)" = "$GITHUB_SHA"
       - name: Verify published installer on GNU and BusyBox
         run: |
           installer=$(grep -F "bash -c 'set -Eeuo pipefail;" README.md)
