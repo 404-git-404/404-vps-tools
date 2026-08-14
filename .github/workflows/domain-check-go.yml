@@ -41,3 +41,33 @@ jobs:
           (cd dist && sha256sum domain-check-linux-amd64 domain-check-linux-arm64 > SHA256SUMS)
           (cd dist && sha256sum --check SHA256SUMS)
           test "$(wc -l < dist/SHA256SUMS)" -eq 2
+      - name: Test documented installer on GNU and BusyBox
+        run: |
+          installer=$(grep -F "bash -c 'set -Eeuo pipefail;" README.md)
+          test "$(printf '%s\n' "$installer" | wc -l)" -eq 1
+          python3 -m http.server 18080 --directory dist >/tmp/domain-check-http.log 2>&1 &
+          server_pid=$!
+          trap 'kill "$server_pid"' EXIT
+          for attempt in {1..20}; do
+            curl -fsS http://127.0.0.1:18080/SHA256SUMS >/dev/null && break
+            sleep 0.1
+          done
+          curl -fsS http://127.0.0.1:18080/SHA256SUMS >/dev/null
+          docker run --rm --network host \
+            -e INSTALLER="$installer" \
+            debian:12-slim sh -euxc '
+              apt-get update
+              apt-get install --yes --no-install-recommends bash ca-certificates coreutils curl
+              DOMAIN_CHECK_RELEASE_BASE=http://127.0.0.1:18080 bash -c "$INSTALLER"
+              /usr/local/bin/domain-check --version |
+                grep -F "domain-check Go v0.0.0-test (commit 0123456789abcdef, built 2026-08-14T00:00:00Z)"
+            '
+          docker run --rm --network host \
+            -e INSTALLER="$installer" \
+            alpine:3.21 sh -euxc '
+              apk add --no-cache bash ca-certificates curl
+              DOMAIN_CHECK_RELEASE_BASE=http://127.0.0.1:18080 \
+                bash -c "$INSTALLER"
+              /usr/local/bin/domain-check --version |
+                grep -F "domain-check Go v0.0.0-test (commit 0123456789abcdef, built 2026-08-14T00:00:00Z)"
+            '

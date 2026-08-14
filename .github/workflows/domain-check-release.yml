@@ -41,7 +41,7 @@ jobs:
             "domain-check Go $version (commit $GITHUB_SHA, built $build_date)"
           (cd dist && sha256sum domain-check-linux-amd64 domain-check-linux-arm64 > SHA256SUMS)
           (cd dist && sha256sum --check SHA256SUMS)
-      - name: Publish release
+      - name: Publish versioned release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -52,9 +52,58 @@ jobs:
             --verify-tag \
             --title "domain-check ${GITHUB_REF_NAME#domain-check-}" \
             --generate-notes \
-            --latest
-      - name: Verify production installer
+            --latest=false
+      - name: Publish domain-check stable alias
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          sudo bash -c 'set -Eeuo pipefail; case "$(uname -m)" in x86_64) arch=amd64 ;; aarch64|arm64) arch=arm64 ;; *) printf "Unsupported architecture: %s\n" "$(uname -m)" >&2; exit 1 ;; esac; asset="domain-check-linux-$arch"; base="https://github.com/404-git-404/404notfound/releases/latest/download"; dir=$(mktemp -d); trap '\''rm -rf -- "$dir"'\'' EXIT; curl -fsSL "$base/$asset" -o "$dir/$asset"; curl -fsSL "$base/SHA256SUMS" -o "$dir/SHA256SUMS"; checksum=$(grep -E "^[[:xdigit:]]{64}  ${asset}$" "$dir/SHA256SUMS"); printf "%s\n" "$checksum" | (cd "$dir" && sha256sum --check --status -); install -m 0755 "$dir/$asset" /usr/local/bin/domain-check; /usr/local/bin/domain-check --version'
-          file /usr/local/bin/domain-check | grep -E 'ELF 64-bit.*statically linked'
-          /usr/local/bin/domain-check --version | grep -F "domain-check Go ${GITHUB_REF_NAME#domain-check-}"
+          stable_tag=domain-check-latest
+          version=${GITHUB_REF_NAME#domain-check-}
+          title="domain-check stable ($version)"
+          notes="Stable domain-check download alias for $GITHUB_REF_NAME at commit $GITHUB_SHA."
+          if gh release view "$stable_tag" >/dev/null 2>&1; then
+            gh release upload "$stable_tag" \
+              dist/domain-check-linux-amd64 \
+              dist/domain-check-linux-arm64 \
+              --clobber
+            gh release upload "$stable_tag" dist/SHA256SUMS --clobber
+            gh api --method PATCH \
+              "repos/$GITHUB_REPOSITORY/git/refs/tags/$stable_tag" \
+              -f sha="$GITHUB_SHA" -F force=true
+            gh release edit "$stable_tag" --title "$title" --notes "$notes"
+          else
+            if gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$stable_tag" \
+              >/dev/null 2>&1; then
+              gh api --method DELETE \
+                "repos/$GITHUB_REPOSITORY/git/refs/tags/$stable_tag"
+            fi
+            gh release create "$stable_tag" \
+              dist/domain-check-linux-amd64 \
+              dist/domain-check-linux-arm64 \
+              dist/SHA256SUMS \
+              --target "$GITHUB_SHA" \
+              --title "$title" \
+              --notes "$notes" \
+              --latest=false
+          fi
+      - name: Verify published installer on GNU and BusyBox
+        run: |
+          installer=$(grep -F "bash -c 'set -Eeuo pipefail;" README.md)
+          test "$(printf '%s\n' "$installer" | wc -l)" -eq 1
+          for image in debian:12-slim alpine:3.21; do
+            docker run --rm \
+              -e INSTALLER="$installer" \
+              -e EXPECTED_VERSION="${GITHUB_REF_NAME#domain-check-}" \
+              "$image" sh -euxc '
+                if command -v apk >/dev/null 2>&1; then
+                  apk add --no-cache bash ca-certificates curl
+                  bash -c "$INSTALLER"
+                else
+                  apt-get update
+                  apt-get install --yes --no-install-recommends bash ca-certificates coreutils curl
+                  bash -c "$INSTALLER"
+                fi
+                /usr/local/bin/domain-check --version |
+                  grep -F "domain-check Go $EXPECTED_VERSION (commit"
+              '
+          done

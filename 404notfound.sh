@@ -15,7 +15,7 @@ readonly SSH_DROPIN="$SSH_DROPIN_DIR/00-hardening.conf"
 readonly LEGACY_SSH_DROPIN="$SSH_DROPIN_DIR/00-vps-bootstrap.conf"
 readonly AUTHORIZED_KEYS='/root/.ssh/authorized_keys'
 readonly CLOUDFLARE_UFW_TOOL='/usr/local/sbin/update-cloudflare-ufw'
-readonly DOMAIN_CHECK_RELEASE_BASE='https://github.com/404-git-404/404notfound/releases/latest/download'
+readonly DOMAIN_CHECK_RELEASE_BASE='https://github.com/404-git-404/404notfound/releases/download/domain-check-latest'
 readonly DOMAIN_CHECK_TARGET='/usr/local/bin/domain-check'
 readonly SAGER_KEY_FINGERPRINT='2C317FBD5D886B4E89BAE8DA6D9152172A2B2F0C'
 readonly SMARTDNS_CONFIG_TARGET='/etc/smartdns/smartdns.conf'
@@ -3085,7 +3085,7 @@ install_domain_check() {
   checksum_line=$(grep -E "^[[:xdigit:]]{64}  ${asset_name}$" "$checksum_file" || true)
   [[ -n "$checksum_line" ]] || die 'SHA256SUMS 中缺少当前架构的 domain-check 资产。'
   printf '%s\n' "$checksum_line" |
-    (cd "$TMP_DIR" && sha256sum --check --status -) ||
+    (cd "$TMP_DIR" && sha256sum -c -s -) ||
     die 'domain-check Go 二进制 SHA-256 校验失败。'
   [[ "$(od -An -tx1 -N4 "$downloaded_file" | tr -d '[:space:]')" == '7f454c46' ]] ||
     die '下载的 domain-check 不是 ELF 二进制。'
