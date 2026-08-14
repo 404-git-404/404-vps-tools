@@ -128,9 +128,6 @@ func (d *Detector) Check(ctx context.Context, domain string) Result {
 		return result
 	}
 
-	// READY uses an X25519-only timing handshake. Once PRIMARY has already
-	// proved X25519 unavailable, repeating that known failure three times adds
-	// no diagnostic value and can extend an invalid target by 3*ReadyTimeout.
 	if tlsResult.X25519 {
 		ready := d.collectReady(ctx, func(ctx context.Context) (time.Duration, error) {
 			return d.probeReady(ctx, domain, target.IP)
@@ -170,8 +167,6 @@ func (d *Detector) Check(ctx context.Context, domain string) Result {
 }
 
 func (d *Detector) resolve(ctx context.Context, domain string) (resolvedTarget, error) {
-	ctx, cancel := context.WithTimeout(ctx, d.cfg.DNSTimeout)
-	defer cancel()
 	type answer struct {
 		kind string
 		ips  []net.IP
@@ -227,7 +222,9 @@ func (d *Detector) lookupIP(ctx context.Context, network, domain string) ([]net.
 		return nil, ctx.Err()
 	}
 	defer func() { <-d.dnsSlots }()
-	return d.cfg.Resolver.LookupIP(ctx, network, domain)
+	lookupCtx, cancel := context.WithTimeout(ctx, d.cfg.DNSTimeout)
+	defer cancel()
+	return d.cfg.Resolver.LookupIP(lookupCtx, network, domain)
 }
 
 func (d *Detector) lookupCNAME(ctx context.Context, domain string) (string, error) {
@@ -237,7 +234,9 @@ func (d *Detector) lookupCNAME(ctx context.Context, domain string) (string, erro
 		return "", ctx.Err()
 	}
 	defer func() { <-d.dnsSlots }()
-	return d.cfg.Resolver.LookupCNAME(ctx, domain)
+	lookupCtx, cancel := context.WithTimeout(ctx, d.cfg.DNSTimeout)
+	defer cancel()
+	return d.cfg.Resolver.LookupCNAME(lookupCtx, domain)
 }
 
 func (d *Detector) endpoint(ip net.IP) string {

@@ -421,6 +421,72 @@ func TestDNSLimiterWaitHonorsCancellation(t *testing.T) {
 	}
 }
 
+func TestDNSLimiterQueueDoesNotConsumeLookupTimeout(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.DNSConcurrency = 1
+	cfg.DNSTimeout = 40 * time.Millisecond
+	resolver := &fakeResolver{ipv4: []net.IP{net.ParseIP("127.0.0.1")}}
+	cfg.Resolver = resolver
+	detector, _ := New(cfg)
+	detector.dnsSlots <- struct{}{}
+	var releaseOnce sync.Once
+	releaseSlot := func() { releaseOnce.Do(func() { <-detector.dnsSlots }) }
+	defer releaseSlot()
+
+	type resolution struct {
+		target resolvedTarget
+		err    error
+	}
+	done := make(chan resolution, 1)
+	go func() {
+		target, err := detector.resolve(context.Background(), "dns-queued.test")
+		done <- resolution{target: target, err: err}
+	}()
+
+	select {
+	case result := <-done:
+		t.Fatalf("DNS queue wait consumed lookup timeout: %+v", result)
+	case <-time.After(100 * time.Millisecond):
+	}
+	releaseSlot()
+	select {
+	case result := <-done:
+		if result.err != nil || result.target.IP == nil {
+			t.Fatalf("DNS lookup failed after queue released: %+v", result)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("DNS lookup did not run after queue released")
+	}
+	resolver.mu.Lock()
+	calls := len(resolver.calls)
+	resolver.mu.Unlock()
+	if calls != 3 {
+		t.Fatalf("DNS lookup calls=%d, want A + AAAA + CNAME", calls)
+	}
+}
+
+func TestDNSLookupExecutionStillHasTimeout(t *testing.T) {
+	release := make(chan struct{})
+	defer close(release)
+	resolver := &blockingResolver{started: make(chan struct{}, 3), release: release}
+	cfg := DefaultConfig()
+	cfg.DNSConcurrency = 3
+	cfg.DNSTimeout = 40 * time.Millisecond
+	cfg.Resolver = resolver
+	detector, _ := New(cfg)
+
+	started := time.Now()
+	if target, err := detector.resolve(context.Background(), "dns-timeout.test"); err == nil || target.IP != nil {
+		t.Fatalf("stalled DNS lookup unexpectedly succeeded: target=%+v err=%v", target, err)
+	}
+	if elapsed := time.Since(started); elapsed < 30*time.Millisecond || elapsed > 250*time.Millisecond {
+		t.Fatalf("DNS execution timeout elapsed=%v", elapsed)
+	}
+	if resolver.maximum.Load() != 3 || resolver.active.Load() != 0 {
+		t.Fatalf("stalled DNS lookup cleanup max=%d active=%d", resolver.maximum.Load(), resolver.active.Load())
+	}
+}
+
 func TestReadyAggregation(t *testing.T) {
 	tests := []struct {
 		values []time.Duration
