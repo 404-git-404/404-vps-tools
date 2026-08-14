@@ -15,7 +15,7 @@ readonly SSH_DROPIN="$SSH_DROPIN_DIR/00-hardening.conf"
 readonly LEGACY_SSH_DROPIN="$SSH_DROPIN_DIR/00-vps-bootstrap.conf"
 readonly AUTHORIZED_KEYS='/root/.ssh/authorized_keys'
 readonly CLOUDFLARE_UFW_TOOL='/usr/local/sbin/update-cloudflare-ufw'
-readonly DOMAIN_CHECK_SOURCE='https://raw.githubusercontent.com/404-git-404/404notfound/main/domain-check.sh'
+readonly DOMAIN_CHECK_RELEASE_BASE='https://github.com/404-git-404/404notfound/releases/latest/download'
 readonly DOMAIN_CHECK_TARGET='/usr/local/bin/domain-check'
 readonly SAGER_KEY_FINGERPRINT='2C317FBD5D886B4E89BAE8DA6D9152172A2B2F0C'
 readonly SMARTDNS_CONFIG_TARGET='/etc/smartdns/smartdns.conf'
@@ -3061,24 +3061,38 @@ EOF
 
 install_domain_check() {
   CURRENT_STEP='安装 domain-check'
+  local asset_name="domain-check-linux-$CPU_ARCH"
+  local checksum_file
+  local checksum_line=''
   local downloaded_file
-  local first_line=''
   local installed_metadata=''
+  local installed_version=''
 
   DOMAIN_CHECK_STATE='安装失败'
-  downloaded_file=$(mktemp "$TMP_DIR/domain-check.XXXXXXXX")
+  downloaded_file="$TMP_DIR/$asset_name"
+  checksum_file="$TMP_DIR/domain-check-SHA256SUMS"
   curl --fail --silent --show-error --location \
     --connect-timeout 5 --max-time 60 --retry 3 --retry-delay 1 \
     --retry-connrefused \
-    "$DOMAIN_CHECK_SOURCE" --output "$downloaded_file" ||
-    die '下载 domain-check.sh 失败。'
-  [[ -s "$downloaded_file" ]] || die '下载的 domain-check.sh 为空。'
-  IFS= read -r first_line <"$downloaded_file" ||
-    die '无法读取下载的 domain-check.sh。'
-  [[ "$first_line" == '#!/usr/bin/env bash' ]] ||
-    die '下载的 domain-check.sh 没有有效的 Bash shebang。'
-  bash -n "$downloaded_file" ||
-    die '下载的 domain-check.sh 未通过 bash -n。'
+    "$DOMAIN_CHECK_RELEASE_BASE/$asset_name" --output "$downloaded_file" ||
+    die '下载 domain-check Go 二进制失败。'
+  curl --fail --silent --show-error --location \
+    --connect-timeout 5 --max-time 60 --retry 3 --retry-delay 1 \
+    --retry-connrefused \
+    "$DOMAIN_CHECK_RELEASE_BASE/SHA256SUMS" --output "$checksum_file" ||
+    die '下载 domain-check SHA256SUMS 失败。'
+  [[ -s "$downloaded_file" ]] || die '下载的 domain-check Go 二进制为空。'
+  checksum_line=$(grep -E "^[[:xdigit:]]{64}  ${asset_name}$" "$checksum_file" || true)
+  [[ -n "$checksum_line" ]] || die 'SHA256SUMS 中缺少当前架构的 domain-check 资产。'
+  printf '%s\n' "$checksum_line" |
+    (cd "$TMP_DIR" && sha256sum --check --status -) ||
+    die 'domain-check Go 二进制 SHA-256 校验失败。'
+  [[ "$(od -An -tx1 -N4 "$downloaded_file" | tr -d '[:space:]')" == '7f454c46' ]] ||
+    die '下载的 domain-check 不是 ELF 二进制。'
+  chmod 0755 "$downloaded_file"
+  installed_version=$("$downloaded_file" --version 2>/dev/null || true)
+  [[ "$installed_version" == domain-check\ Go\ * ]] ||
+    die '下载的 domain-check 未通过 Go 版本标识验证。'
 
   DOMAIN_CHECK_INSTALL_STAGE=$(mktemp /usr/local/bin/.domain-check.XXXXXXXX) ||
     die '无法在 /usr/local/bin 创建 domain-check 临时安装文件。'
@@ -3095,12 +3109,13 @@ install_domain_check() {
   installed_metadata=$(stat -c '%U:%G:%a' "$DOMAIN_CHECK_TARGET" 2>/dev/null || true)
   if [[ ! -x "$DOMAIN_CHECK_TARGET" ]] ||
     [[ "$installed_metadata" != 'root:root:755' ]] ||
-    ! bash -n "$DOMAIN_CHECK_TARGET"; then
+    [[ "$(od -An -tx1 -N4 "$DOMAIN_CHECK_TARGET" | tr -d '[:space:]')" != '7f454c46' ]] ||
+    [[ "$("$DOMAIN_CHECK_TARGET" --version 2>/dev/null || true)" != domain-check\ Go\ * ]]; then
     restore_file "$DOMAIN_CHECK_TARGET" || true
     die 'domain-check 正式安装文件或权限验证失败，已尝试恢复。'
   fi
   DOMAIN_CHECK_STATE='已安装'
-  log "domain-check 已安装并验证：$DOMAIN_CHECK_TARGET"
+  log "domain-check 已安装并验证：$installed_version，$DOMAIN_CHECK_TARGET"
 }
 
 service_state() {

@@ -13,7 +13,7 @@ import (
 
 var headers = []string{"DOMAIN", "IP", "TLS1.3", "X25519", "H2", "READY(ms)", "CERT(d)", "CDN", "HTTP", "REDIRECT", "RESULT"}
 
-func PrintTable(writer io.Writer, results []Result) {
+func PrintTable(writer io.Writer, results []Result, color bool) {
 	rows := make([][]string, len(results))
 	widths := make([]int, len(headers))
 	for index, header := range headers {
@@ -37,7 +37,7 @@ func PrintTable(writer io.Writer, results []Result) {
 	printRow := func(values []string) {
 		fmt.Fprint(writer, "|")
 		for index, value := range values {
-			fmt.Fprintf(writer, " %-*s |", widths[index], value)
+			fmt.Fprintf(writer, " %s%s |", terminalValue(value, color), strings.Repeat(" ", widths[index]-len(value)))
 		}
 		fmt.Fprintln(writer)
 	}
@@ -57,6 +57,22 @@ func PrintTable(writer io.Writer, results []Result) {
 		for _, reason := range result.Reasons {
 			fmt.Fprintf(writer, "  - %s\n", reason.Text)
 		}
+	}
+}
+
+func terminalValue(value string, color bool) string {
+	if !color {
+		return value
+	}
+	switch value {
+	case string(Pass):
+		return "\x1b[32m" + value + "\x1b[0m"
+	case string(Warn):
+		return "\x1b[33m" + value + "\x1b[0m"
+	case string(Fail):
+		return "\x1b[31m" + value + "\x1b[0m"
+	default:
+		return value
 	}
 }
 

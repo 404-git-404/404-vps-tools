@@ -890,7 +890,7 @@ func TestTerminalTableContainsStableFieldsAndDetails(t *testing.T) {
 		Reasons: []Reason{{Warn, "HTTP detail"}},
 	}}
 	var output bytes.Buffer
-	PrintTable(&output, results)
+	PrintTable(&output, results, false)
 	text := output.String()
 	for _, field := range headers {
 		if !strings.Contains(text, field) {
@@ -900,6 +900,28 @@ func TestTerminalTableContainsStableFieldsAndDetails(t *testing.T) {
 	for _, value := range []string{"table.example", "203.0.113.7", "42", "DETAILS", "HTTP detail"} {
 		if !strings.Contains(text, value) {
 			t.Errorf("terminal output missing %s", value)
+		}
+	}
+	if strings.Contains(text, "\x1b[") {
+		t.Fatal("non-TTY terminal output contains ANSI color")
+	}
+}
+
+func TestTerminalTableColorsEveryStatusCell(t *testing.T) {
+	results := []Result{{
+		Domain: "color.example", IP: "203.0.113.8", TLS13: Pass, X25519: Warn, H2: Fail,
+		ReadyMS: "42", CertDays: "FAIL", CDN: "-", HTTP: "200", Redirect: "-", Result: Warn,
+	}}
+	var output bytes.Buffer
+	PrintTable(&output, results, true)
+	text := output.String()
+	for sequence, count := range map[string]int{
+		"\x1b[32mPASS\x1b[0m": 1,
+		"\x1b[33mWARN\x1b[0m": 2,
+		"\x1b[31mFAIL\x1b[0m": 2,
+	} {
+		if strings.Count(text, sequence) != count {
+			t.Fatalf("color sequence %q count = %d, want %d", sequence, strings.Count(text, sequence), count)
 		}
 	}
 }
