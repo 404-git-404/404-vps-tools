@@ -128,7 +128,7 @@ func (d *Detector) Check(ctx context.Context, domain string) Result {
 		return result
 	}
 
-	if tlsResult.X25519 {
+	if tlsResult.X25519 && tlsResult.H2 && tlsResult.Cert {
 		ready := d.collectReady(ctx, func(ctx context.Context) (time.Duration, error) {
 			return d.probeReady(ctx, domain, target.IP)
 		})
