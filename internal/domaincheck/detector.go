@@ -16,17 +16,22 @@ import (
 
 type Detector struct {
 	cfg        Config
+	dnsSlots   chan struct{}
 	readySlots chan struct{}
 }
 
 const bashCompatibleUserAgent = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0 Safari/537.36"
 
 func New(cfg Config) (*Detector, error) {
-	if cfg.Concurrency < 1 || cfg.ReadyConcurrency < 1 || cfg.Port == "" || cfg.Resolver == nil ||
+	if cfg.Concurrency < 1 || cfg.DNSConcurrency < 1 || cfg.ReadyConcurrency < 1 || cfg.Port == "" || cfg.Resolver == nil ||
 		cfg.DialContext == nil || cfg.Now == nil {
 		return nil, errors.New("invalid detector configuration")
 	}
-	return &Detector{cfg: cfg, readySlots: make(chan struct{}, cfg.ReadyConcurrency)}, nil
+	return &Detector{
+		cfg:        cfg,
+		dnsSlots:   make(chan struct{}, cfg.DNSConcurrency),
+		readySlots: make(chan struct{}, cfg.ReadyConcurrency),
+	}, nil
 }
 
 func (d *Detector) Run(ctx context.Context, domains []string, progress func(int, int, string)) []Result {
@@ -123,14 +128,19 @@ func (d *Detector) Check(ctx context.Context, domain string) Result {
 		return result
 	}
 
-	ready := d.collectReady(ctx, func(ctx context.Context) (time.Duration, error) {
-		return d.probeReady(ctx, domain, target.IP)
-	})
-	if milliseconds, ok := aggregateReady(ready); ok {
-		result.ReadyMS = fmt.Sprintf("%d", milliseconds)
-	}
-	if len(ready) < 3 {
-		result.Reasons = append(result.Reasons, Reason{Warn, fmt.Sprintf("连接就绪计时样本不足（%d/3）", len(ready))})
+	// READY uses an X25519-only timing handshake. Once PRIMARY has already
+	// proved X25519 unavailable, repeating that known failure three times adds
+	// no diagnostic value and can extend an invalid target by 3*ReadyTimeout.
+	if tlsResult.X25519 {
+		ready := d.collectReady(ctx, func(ctx context.Context) (time.Duration, error) {
+			return d.probeReady(ctx, domain, target.IP)
+		})
+		if milliseconds, ok := aggregateReady(ready); ok {
+			result.ReadyMS = fmt.Sprintf("%d", milliseconds)
+		}
+		if len(ready) < 3 {
+			result.Reasons = append(result.Reasons, Reason{Warn, fmt.Sprintf("连接就绪计时样本不足（%d/3）", len(ready))})
+		}
 	}
 
 	httpResult := d.probeHTTP(ctx, domain, target.IP)
@@ -168,13 +178,13 @@ func (d *Detector) resolve(ctx context.Context, domain string) (resolvedTarget, 
 		name string
 	}
 	answers := make(chan answer, 3)
-	go func() { ips, _ := d.cfg.Resolver.LookupIP(ctx, "ip4", domain); answers <- answer{kind: "a", ips: ips} }()
+	go func() { ips, _ := d.lookupIP(ctx, "ip4", domain); answers <- answer{kind: "a", ips: ips} }()
 	go func() {
-		ips, _ := d.cfg.Resolver.LookupIP(ctx, "ip6", domain)
+		ips, _ := d.lookupIP(ctx, "ip6", domain)
 		answers <- answer{kind: "aaaa", ips: ips}
 	}()
 	go func() {
-		name, _ := d.cfg.Resolver.LookupCNAME(ctx, domain)
+		name, _ := d.lookupCNAME(ctx, domain)
 		answers <- answer{kind: "cname", name: strings.TrimSuffix(strings.ToLower(name), ".")}
 	}()
 	var target resolvedTarget
@@ -208,6 +218,26 @@ func (d *Detector) resolve(ctx context.Context, domain string) (resolvedTarget, 
 		}
 	}
 	return target, errors.New("no usable address")
+}
+
+func (d *Detector) lookupIP(ctx context.Context, network, domain string) ([]net.IP, error) {
+	select {
+	case d.dnsSlots <- struct{}{}:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	defer func() { <-d.dnsSlots }()
+	return d.cfg.Resolver.LookupIP(ctx, network, domain)
+}
+
+func (d *Detector) lookupCNAME(ctx context.Context, domain string) (string, error) {
+	select {
+	case d.dnsSlots <- struct{}{}:
+	case <-ctx.Done():
+		return "", ctx.Err()
+	}
+	defer func() { <-d.dnsSlots }()
+	return d.cfg.Resolver.LookupCNAME(ctx, domain)
 }
 
 func (d *Detector) endpoint(ip net.IP) string {

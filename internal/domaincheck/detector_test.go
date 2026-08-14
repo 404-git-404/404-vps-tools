@@ -34,6 +34,52 @@ type fakeResolver struct {
 	calls      []string
 }
 
+type blockingResolver struct {
+	active  atomic.Int32
+	maximum atomic.Int32
+	started chan struct{}
+	release <-chan struct{}
+}
+
+func (resolver *blockingResolver) wait(ctx context.Context) error {
+	current := resolver.active.Add(1)
+	for {
+		old := resolver.maximum.Load()
+		if current <= old || resolver.maximum.CompareAndSwap(old, current) {
+			break
+		}
+	}
+	defer resolver.active.Add(-1)
+	select {
+	case resolver.started <- struct{}{}:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	select {
+	case <-resolver.release:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (resolver *blockingResolver) LookupIP(ctx context.Context, network, _ string) ([]net.IP, error) {
+	if err := resolver.wait(ctx); err != nil {
+		return nil, err
+	}
+	if network == "ip4" {
+		return []net.IP{net.ParseIP("127.0.0.1")}, nil
+	}
+	return nil, nil
+}
+
+func (resolver *blockingResolver) LookupCNAME(ctx context.Context, _ string) (string, error) {
+	if err := resolver.wait(ctx); err != nil {
+		return "", err
+	}
+	return "", nil
+}
+
 func (resolver *fakeResolver) LookupIP(_ context.Context, network, host string) ([]net.IP, error) {
 	resolver.mu.Lock()
 	resolver.calls = append(resolver.calls, network+":"+host)
@@ -171,14 +217,19 @@ func TestParseDomainsAndConcurrency(t *testing.T) {
 		}
 	}
 	defaultConfig, err := ConfigFromEnv(func(string) string { return "" })
-	if err != nil || defaultConfig.Concurrency != 24 || defaultConfig.ReadyConcurrency != 4 {
-		t.Fatalf("default concurrency: workers=%d ready=%d err=%v", defaultConfig.Concurrency, defaultConfig.ReadyConcurrency, err)
+	if err != nil || defaultConfig.Concurrency != 24 || defaultConfig.DNSConcurrency != 24 || defaultConfig.ReadyConcurrency != 4 {
+		t.Fatalf("default concurrency: workers=%d dns=%d ready=%d err=%v", defaultConfig.Concurrency, defaultConfig.DNSConcurrency, defaultConfig.ReadyConcurrency, err)
 	}
 	if defaultConfig.ResponseHeaderTimeout != 2*time.Second || defaultConfig.HTTPTimeout != 2500*time.Millisecond {
 		t.Fatalf("unexpected HTTP budgets: headers=%v overall=%v", defaultConfig.ResponseHeaderTimeout, defaultConfig.HTTPTimeout)
 	}
 	if defaultConfig.TCPTimeout != 2500*time.Millisecond {
 		t.Fatalf("unexpected TCP timeout: %v", defaultConfig.TCPTimeout)
+	}
+	invalidDNSConfig := DefaultConfig()
+	invalidDNSConfig.DNSConcurrency = 0
+	if _, err := New(invalidDNSConfig); err == nil {
+		t.Fatal("accepted zero DNS concurrency")
 	}
 }
 
@@ -249,13 +300,124 @@ func TestPrimaryFallbackPreservesTLSH2AndCert(t *testing.T) {
 		writer.WriteHeader(http.StatusNoContent)
 	}))
 	resolver := &fakeResolver{ipv4: []net.IP{net.ParseIP("127.0.0.1")}}
-	detector, _ := New(configForServer(server, resolver))
+	cfg := configForServer(server, resolver)
+	realDial := (&net.Dialer{}).DialContext
+	var dials atomic.Int32
+	cfg.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
+		dials.Add(1)
+		return realDial(ctx, network, address)
+	}
+	detector, _ := New(cfg)
 	result := detector.Check(context.Background(), domain)
-	if result.TLS13 != Pass || result.H2 != Pass || result.CertDays == "FAIL" || result.X25519 != Fail || result.Result != Fail {
+	if result.TLS13 != Pass || result.H2 != Pass || result.CertDays == "FAIL" || result.X25519 != Fail || result.ReadyMS != "-" || result.HTTP != "204" || result.Result != Fail {
 		t.Fatalf("fallback diagnostic granularity changed: %+v", result)
 	}
 	if !containsReason(result, "强制 X25519 握手失败") || containsReason(result, "TLS 1.3 握手失败") {
 		t.Fatalf("unexpected fallback reasons: %+v", result.Reasons)
+	}
+	if containsReason(result, "连接就绪计时样本不足") {
+		t.Fatalf("known X25519 failure retained a meaningless READY warning: %+v", result.Reasons)
+	}
+	if dials.Load() != 4 {
+		t.Fatalf("X25519 failure invoked READY probes: dials=%d, want TCP + PRIMARY + fallback + HTTP", dials.Load())
+	}
+}
+
+func TestDNSConcurrencyLimiter(t *testing.T) {
+	const domainWorkers = 24
+	domains := make([]string, domainWorkers)
+	for index := range domains {
+		domains[index] = fmt.Sprintf("dns-%d.test", index)
+	}
+
+	for _, limit := range []int{1, 8, DefaultConfig().DNSConcurrency} {
+		t.Run(fmt.Sprintf("limit_%d", limit), func(t *testing.T) {
+			release := make(chan struct{})
+			var releaseOnce sync.Once
+			t.Cleanup(func() { releaseOnce.Do(func() { close(release) }) })
+			resolver := &blockingResolver{
+				started: make(chan struct{}, 3*domainWorkers),
+				release: release,
+			}
+			cfg := DefaultConfig()
+			cfg.DNSConcurrency = limit
+			cfg.DNSTimeout = 2 * time.Second
+			cfg.Resolver = resolver
+			detector, err := New(cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			done := make(chan []Result, 1)
+			go func() {
+				done <- runPool(context.Background(), domains, domainWorkers, func(ctx context.Context, domain string) Result {
+					target, resolveErr := detector.resolve(ctx, domain)
+					status := Pass
+					if resolveErr != nil || target.IP == nil {
+						status = Fail
+					}
+					return Result{Domain: domain, Result: status}
+				}, nil)
+			}()
+
+			for range limit {
+				select {
+				case <-resolver.started:
+				case <-time.After(time.Second):
+					t.Fatalf("DNS limiter did not fill %d slots", limit)
+				}
+			}
+			select {
+			case <-resolver.started:
+				t.Errorf("DNS concurrency exceeded limit %d", limit)
+			case <-time.After(30 * time.Millisecond):
+			}
+			releaseOnce.Do(func() { close(release) })
+
+			select {
+			case results := <-done:
+				if len(results) != len(domains) {
+					t.Fatalf("DNS run returned %d results, want %d", len(results), len(domains))
+				}
+				for index, result := range results {
+					if result.Domain != domains[index] || result.Result != Pass {
+						t.Fatalf("DNS result %d changed: %+v", index, result)
+					}
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("DNS-limited run did not finish")
+			}
+			if resolver.maximum.Load() != int32(limit) || resolver.active.Load() != 0 {
+				t.Fatalf("DNS concurrency max=%d active=%d, want max=%d active=0", resolver.maximum.Load(), resolver.active.Load(), limit)
+			}
+		})
+	}
+}
+
+func TestDNSLimiterWaitHonorsCancellation(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.DNSConcurrency = 1
+	resolver := &fakeResolver{ipv4: []net.IP{net.ParseIP("127.0.0.1")}}
+	cfg.Resolver = resolver
+	detector, _ := New(cfg)
+	detector.dnsSlots <- struct{}{}
+	defer func() { <-detector.dnsSlots }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	if _, err := detector.resolve(ctx, "dns-cancel.test"); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("DNS wait cancellation error = %v", err)
+	}
+	if elapsed := time.Since(started); elapsed < 20*time.Millisecond || elapsed > 200*time.Millisecond {
+		t.Fatalf("DNS wait cancellation elapsed=%v", elapsed)
+	}
+	time.Sleep(10 * time.Millisecond)
+	resolver.mu.Lock()
+	calls := len(resolver.calls)
+	resolver.mu.Unlock()
+	if calls != 0 {
+		t.Fatalf("resolver was called without a DNS slot: %d calls", calls)
 	}
 }
 
@@ -731,6 +893,99 @@ func TestWorkerPoolConcurrencyCap(t *testing.T) {
 	for index, result := range results {
 		if result.Domain != domains[index] {
 			t.Fatalf("result order changed at %d: %s", index, result.Domain)
+		}
+	}
+}
+
+func TestMixedBatch100TargetsBoundedOrderedAndComplete(t *testing.T) {
+	const (
+		total   = 100
+		workers = 24
+	)
+	domains := make([]string, total)
+	indices := make(map[string]int, total)
+	for index := range domains {
+		domains[index] = fmt.Sprintf("mixed-%03d.test", index)
+		indices[domains[index]] = index
+	}
+
+	var active atomic.Int32
+	var maximum atomic.Int32
+	var entered atomic.Int32
+	var progressCalls atomic.Int32
+	var firstWave sync.WaitGroup
+	firstWave.Add(workers)
+	start := make(chan struct{})
+	var seenMu sync.Mutex
+	seen := make(map[string]int, total)
+
+	check := func(_ context.Context, domain string) Result {
+		current := active.Add(1)
+		for {
+			old := maximum.Load()
+			if current <= old || maximum.CompareAndSwap(old, current) {
+				break
+			}
+		}
+		defer active.Add(-1)
+		if entered.Add(1) <= workers {
+			firstWave.Done()
+			<-start
+		}
+		seenMu.Lock()
+		seen[domain]++
+		seenMu.Unlock()
+
+		index := indices[domain]
+		switch index % 5 {
+		case 0: // Fast PASS target.
+			return Result{Domain: domain, TLS13: Pass, X25519: Pass, H2: Pass, ReadyMS: "5", CertDays: "30", HTTP: "200", Result: Pass}
+		case 1: // Immediate TLS failure.
+			return Result{Domain: domain, ReadyMS: "-", Result: Fail, Reasons: []Reason{{Fail, "TLS 1.3 握手失败"}}}
+		case 2: // Conclusive X25519 failure; READY must remain absent.
+			return Result{Domain: domain, TLS13: Pass, X25519: Fail, H2: Pass, ReadyMS: "-", CertDays: "30", HTTP: "204", Result: Fail, Reasons: []Reason{{Fail, "强制 X25519 握手失败"}}}
+		case 3: // One bounded slow timeout, not three sequential READY waits.
+			time.Sleep(25 * time.Millisecond)
+			return Result{Domain: domain, ReadyMS: "-", Result: Fail, Reasons: []Reason{{Fail, "TCP 443 不可达"}}}
+		default: // DNS failure.
+			return Result{Domain: domain, ReadyMS: "-", Result: Fail, Reasons: []Reason{{Fail, "DNS 无法解析"}}}
+		}
+	}
+
+	done := make(chan []Result, 1)
+	started := time.Now()
+	go func() {
+		done <- runPool(context.Background(), domains, workers, check, func(_, _ int, _ string) {
+			progressCalls.Add(1)
+		})
+	}()
+	firstWave.Wait()
+	if maximum.Load() != workers {
+		t.Fatalf("mixed batch worker concurrency=%d, want %d", maximum.Load(), workers)
+	}
+	close(start)
+
+	var results []Result
+	select {
+	case results = <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("100-target mixed batch exceeded its bounded runtime")
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("100-target mixed batch took %v", elapsed)
+	}
+	if active.Load() != 0 || entered.Load() != total || progressCalls.Load() != total {
+		t.Fatalf("worker shutdown/completion mismatch: active=%d entered=%d progress=%d", active.Load(), entered.Load(), progressCalls.Load())
+	}
+	if len(results) != total || len(seen) != total {
+		t.Fatalf("missing results: results=%d unique=%d", len(results), len(seen))
+	}
+	for index, result := range results {
+		if result.Domain != domains[index] || seen[result.Domain] != 1 {
+			t.Fatalf("result ordering/duplication changed at %d: %+v seen=%d", index, result, seen[result.Domain])
+		}
+		if index%5 == 2 && (result.Result != Fail || result.ReadyMS != "-") {
+			t.Fatalf("X25519 failure classification/READY changed at %d: %+v", index, result)
 		}
 	}
 }

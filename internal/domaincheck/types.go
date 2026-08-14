@@ -48,6 +48,7 @@ type Resolver interface {
 
 type Config struct {
 	Concurrency           int
+	DNSConcurrency        int
 	ReadyConcurrency      int
 	Port                  string
 	DNSTimeout            time.Duration
@@ -67,6 +68,7 @@ func DefaultConfig() Config {
 	dialer := &net.Dialer{}
 	return Config{
 		Concurrency:           24,
+		DNSConcurrency:        24,
 		ReadyConcurrency:      4,
 		Port:                  "443",
 		DNSTimeout:            6 * time.Second,
