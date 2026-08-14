@@ -1,8 +1,8 @@
 # domain-check Go v2
 
-The Go implementation is an independent native-network successor to
-`domain-check.sh`. The Bash implementation remains available as the reference
-implementation while Go v2 is benchmarked and validated.
+The Go implementation is the production native-network successor to
+`domain-check.sh`. The Bash implementation remains available as the legacy
+reference implementation.
 
 ## Build
 
