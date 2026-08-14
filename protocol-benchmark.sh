@@ -35,6 +35,9 @@ readonly TCP_RETRANS_NOISE_MAX_PENALTY=2
 readonly TCP_RETRANS_PENALTY_PER_DOUBLING=6
 readonly TCP_RETRANS_MAX_PENALTY=50
 readonly TCP_RETRANS_DIAGNOSTIC_PENALTY=15
+readonly TCP_CONFIRM_MIN_SAMPLE_BYTES=5000000
+readonly TCP_CONFIRM_MIN_RETRANSMISSIONS=100
+readonly TCP_CONFIRM_MIN_DENSITY=200
 readonly DEFAULT_HISTORY_LIMIT=20
 readonly MAX_HISTORY_LIMIT=100
 readonly HISTORY_RETENTION=100
@@ -85,6 +88,7 @@ UDP_HIGHEST_STAGE=0
 IDLE_RTT=''
 IDLE_VARIATION=''
 IDLE_LOSS=''
+IDLE_BASELINE_AVAILABLE=false
 PING_AVG=''
 PING_VARIATION=''
 PING_LOSS=''
@@ -916,7 +920,6 @@ parse_ping_file() {
   PING_VARIATION=$(awk -F/ '/^(rtt|round-trip)/ {
     value=$7; sub(/[[:space:]].*/, "", value); print value; exit
   }' "$file")
-  PING_LOSS=${PING_LOSS:-100}
 }
 
 collect_idle_baseline() {
@@ -929,11 +932,20 @@ collect_idle_baseline() {
   status=$?
   set -e
   parse_ping_file "$ping_file"
-  IDLE_LOSS=$PING_LOSS
-  IDLE_RTT=$PING_AVG
-  IDLE_VARIATION=$PING_VARIATION
-  if (( status != 0 )) || [[ -z "$IDLE_RTT" ]]; then
-    warn 'Idle ping was incomplete; confidence will be reduced.'
+  IDLE_BASELINE_AVAILABLE=false
+  IDLE_LOSS=''
+  IDLE_RTT=''
+  IDLE_VARIATION=''
+  if (( status == 0 )) &&
+    [[ "$PING_LOSS" =~ ^[0-9]+([.][0-9]+)?$ &&
+      "$PING_AVG" =~ ^[0-9]+([.][0-9]+)?$ &&
+      "$PING_VARIATION" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+    IDLE_BASELINE_AVAILABLE=true
+    IDLE_LOSS=$PING_LOSS
+    IDLE_RTT=$PING_AVG
+    IDLE_VARIATION=$PING_VARIATION
+  else
+    warn 'Idle ICMP baseline unavailable; confidence will be reduced.'
   fi
 }
 
@@ -1316,7 +1328,10 @@ sample_is_severe() {
   local streams=$5
 
   awk -F '\t' -v protocol="$protocol" -v direction="$direction" \
-    -v percent="$percent" -v streams="$streams" '
+    -v percent="$percent" -v streams="$streams" \
+    -v min_bytes="$TCP_CONFIRM_MIN_SAMPLE_BYTES" \
+    -v min_retrans="$TCP_CONFIRM_MIN_RETRANSMISSIONS" \
+    -v min_density="$TCP_CONFIRM_MIN_DENSITY" '
     $1 == protocol && $2 == direction && $3 == percent && $4 == streams {
       found=1; ratio=$7; retrans=$8; loss=$9; jitter=$10; load=$11; bytes=$12
     }
@@ -1324,7 +1339,10 @@ sample_is_severe() {
       if (!found) exit 1;
       if (protocol == "TCP") {
         density=(bytes > 0 ? retrans*100000000/bytes : 0);
-        exit !(ratio < .50 || load >= 150 || density >= 1000);
+        density_severe=(bytes >= min_bytes && density >= 1000);
+        retrans_severe=(bytes >= min_bytes && retrans >= min_retrans &&
+          density >= min_density);
+        exit !(ratio < .50 || load >= 150 || density_severe || retrans_severe);
       }
       exit !(ratio < .70 || loss >= 2 || jitter >= 30 || load >= 120);
     }
@@ -1932,7 +1950,7 @@ calculate_results() {
     return 0
   fi
   RESULT_STATE='COMPLETE'
-  if [[ -n "$IDLE_LOSS" ]]; then
+  if [[ "$IDLE_BASELINE_AVAILABLE" == true ]]; then
     idle_penalty=$(awk -v loss="$IDLE_LOSS" -v variation="${IDLE_VARIATION:-0}" '
       BEGIN {
         penalty=loss*1.5;
@@ -1970,7 +1988,7 @@ calculate_results() {
   sample_count=$(awk 'END {print NR+0}' "$RESULT_FILE")
   if (( sample_count >= 8 && TEST_FAILURES == 0 &&
     $(protocol_count TCP) >= 4 && $(protocol_count UDP) >= 4 )) &&
-    [[ -n "$IDLE_RTT" && "$CPU_LIMITED" == false ]]; then
+    [[ "$IDLE_BASELINE_AVAILABLE" == true && "$CPU_LIMITED" == false ]]; then
     CONFIDENCE='HIGH'
   elif (( sample_count >= 4 )); then
     CONFIDENCE='MEDIUM'
@@ -1980,6 +1998,8 @@ calculate_results() {
   if [[ "$BUDGET_LIMITED" == true || "$CPU_LIMITED" == true ]]; then
     [[ "$CONFIDENCE" == 'HIGH' ]] && CONFIDENCE='MEDIUM'
   fi
+  [[ "$IDLE_BASELINE_AVAILABLE" == true ]] ||
+    append_label 'ICMP-BASELINE-UNAVAILABLE'
   [[ "$CONFIDENCE" != 'LOW' ]] || append_label 'LOW-CONFIDENCE'
 
   if (( LINK_HEALTH >= 80 )); then
@@ -2031,11 +2051,17 @@ adaptive_stop_summary() {
 print_results() {
   local idle_display='unavailable'
   local variation_display='unavailable'
+  local idle_loss_display='unavailable'
+  local icmp_baseline_display='unavailable'
   local labels_display='none'
   local retrans_direction_display
 
   [[ -z "$IDLE_RTT" ]] || idle_display="${IDLE_RTT} ms"
   [[ -z "$IDLE_VARIATION" ]] || variation_display="${IDLE_VARIATION} ms"
+  if [[ "$IDLE_BASELINE_AVAILABLE" == true ]]; then
+    idle_loss_display="${IDLE_LOSS}%"
+    icmp_baseline_display='available'
+  fi
   [[ -z "$LABELS" ]] || labels_display=$LABELS
   case "$TCP_RETRANS_WORST_DIRECTION" in
     A_TO_B) retrans_direction_display='CLIENT->SERVER' ;;
@@ -2055,7 +2081,8 @@ print_results() {
   printf 'UDP adaptive stop: %s\n' "$(adaptive_stop_summary UDP)"
   printf '\nIdle RTT:      %s\n' "$idle_display"
   printf 'RTT variation: %s\n' "$variation_display"
-  printf 'Idle loss:     %s%%\n' "${IDLE_LOSS:-unavailable}"
+  printf 'Idle loss:     %s\n' "$idle_loss_display"
+  printf 'ICMP baseline: %s\n' "$icmp_baseline_display"
   printf 'Load RTT:      +%s ms max\n' "$MAX_LOAD_INCREASE"
   printf 'Peak CPU:      %s%%\n' "$MAX_CPU"
   printf 'Max load avg:  %s\n' "$MAX_LOAD_AVERAGE"
