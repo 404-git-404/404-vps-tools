@@ -3085,7 +3085,7 @@ install_domain_check() {
   checksum_line=$(grep -E "^[[:xdigit:]]{64}  ${asset_name}$" "$checksum_file" || true)
   [[ -n "$checksum_line" ]] || die 'SHA256SUMS 中缺少当前架构的 domain-check 资产。'
   printf '%s\n' "$checksum_line" |
-    (cd "$TMP_DIR" && sha256sum -c -s -) ||
+    (cd "$TMP_DIR" && sha256sum -c - >/dev/null) ||
     die 'domain-check Go 二进制 SHA-256 校验失败。'
   [[ "$(od -An -tx1 -N4 "$downloaded_file" | tr -d '[:space:]')" == '7f454c46' ]] ||
     die '下载的 domain-check 不是 ELF 二进制。'
