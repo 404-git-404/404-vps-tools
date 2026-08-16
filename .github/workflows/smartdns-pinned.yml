@@ -9,7 +9,7 @@ permissions:
 
 env:
   RELEASE_TAG: smartdns-debian-pinned-2026-07
-  RELEASE_BASE: https://github.com/404-git-404/404notfound/releases/download/smartdns-debian-pinned-2026-07
+  RELEASE_BASE: https://github.com/404-git-404/404-vps-tools/releases/download/smartdns-debian-pinned-2026-07
 
 jobs:
   release-assets:
@@ -24,7 +24,7 @@ jobs:
           curl --fail --location --silent --show-error \
             --connect-timeout 10 --max-time 120 --retry 3 --retry-delay 2 \
             --retry-connrefused \
-            "https://api.github.com/repos/404-git-404/404notfound/releases/tags/$RELEASE_TAG" \
+            "https://api.github.com/repos/404-git-404/404-vps-tools/releases/tags/$RELEASE_TAG" \
             -o /tmp/release.json
           jq -e '
             .tag_name == "smartdns-debian-pinned-2026-07" and
@@ -65,7 +65,7 @@ jobs:
             --header 'Cache-Control: no-cache' \
             --connect-timeout 10 --max-time 120 --retry 3 --retry-delay 2 \
             --retry-connrefused \
-            https://api.github.com/repos/404-git-404/404notfound/releases/latest \
+            https://api.github.com/repos/404-git-404/404-vps-tools/releases/latest \
             --output /tmp/latest.json --write-out '%{http_code}')
           case "$http_code" in
             200) test "$(jq -r .tag_name /tmp/latest.json)" != "$RELEASE_TAG" ;;

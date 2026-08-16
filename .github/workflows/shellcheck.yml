@@ -84,7 +84,7 @@ jobs:
           test ! -e smartdns.conf
           test -s domain-check.sh
           grep -Fq "readonly DOMAIN_CHECK_TARGET='/usr/local/bin/domain-check'" 404notfound.sh
-          grep -Fq "readonly DOMAIN_CHECK_RELEASE_BASE='https://github.com/404-git-404/404notfound/releases/download/domain-check-latest'" 404notfound.sh
+          grep -Fq "readonly DOMAIN_CHECK_RELEASE_BASE='https://github.com/404-git-404/404-vps-tools/releases/download/domain-check-latest'" 404notfound.sh
           grep -Fq 'domain-check-linux-$CPU_ARCH' 404notfound.sh
           grep -Fq 'sha256sum -c - >/dev/null' 404notfound.sh
           grep -Fq "== '7f454c46'" 404notfound.sh
@@ -142,15 +142,15 @@ jobs:
         run: |
           cat > /tmp/expected-readme <<'EOF'
           ```bash
-          bash <(curl -fsSL https://raw.githubusercontent.com/404-git-404/404notfound/main/404notfound.sh)
+          bash <(curl -fsSL https://raw.githubusercontent.com/404-git-404/404-vps-tools/main/404notfound.sh)
           ```
 
           ```bash
-          bash <(curl -fsSL https://raw.githubusercontent.com/404-git-404/404notfound/main/scripts/update-smartdns.sh)
+          bash <(curl -fsSL https://raw.githubusercontent.com/404-git-404/404-vps-tools/main/scripts/update-smartdns.sh)
           ```
 
           ```bash
-          bash <(curl -fsSL https://raw.githubusercontent.com/404-git-404/404notfound/main/scripts/install-domain-check.sh)
+          bash <(curl -fsSL https://raw.githubusercontent.com/404-git-404/404-vps-tools/main/scripts/install-domain-check.sh)
           ```
 
           ```bash
@@ -158,23 +158,23 @@ jobs:
           ```
 
           ```bash
-          bash <(curl -fsSL https://raw.githubusercontent.com/404-git-404/404notfound/main/node-config-wizard.sh)
+          bash <(curl -fsSL https://raw.githubusercontent.com/404-git-404/404-vps-tools/main/node-config-wizard.sh)
           ```
 
           ```bash
-          bash <(curl -fsSL https://raw.githubusercontent.com/404-git-404/404notfound/main/protocol-benchmark.sh) --server
+          bash <(curl -fsSL https://raw.githubusercontent.com/404-git-404/404-vps-tools/main/protocol-benchmark.sh) --server
           ```
 
           ```bash
-          bash <(curl -fsSL https://raw.githubusercontent.com/404-git-404/404notfound/main/protocol-benchmark.sh) <server-IP> --port <PORT>
+          bash <(curl -fsSL https://raw.githubusercontent.com/404-git-404/404-vps-tools/main/protocol-benchmark.sh) <server-IP> --port <PORT>
           ```
 
           ```bash
-          bash <(curl -fsSL https://raw.githubusercontent.com/404-git-404/404notfound/main/protocol-benchmark.sh) --history <peer-IP>
+          bash <(curl -fsSL https://raw.githubusercontent.com/404-git-404/404-vps-tools/main/protocol-benchmark.sh) --history <peer-IP>
           ```
 
           ```sh
-          curl -fsSL https://raw.githubusercontent.com/404-git-404/404notfound/main/gg-status -o gg-status && chmod +x gg-status && ./gg-status
+          curl -fsSL https://raw.githubusercontent.com/404-git-404/404-vps-tools/main/gg-status -o gg-status && chmod +x gg-status && ./gg-status
           ```
           EOF
           cmp -s README.md /tmp/expected-readme
@@ -187,7 +187,7 @@ jobs:
           mock_stable_ref=false
           GITHUB_REF_NAME=domain-check-v1.2.3
           GITHUB_SHA=0123456789abcdef0123456789abcdef01234567
-          GITHUB_REPOSITORY=404-git-404/404notfound
+          GITHUB_REPOSITORY=404-git-404/404-vps-tools
           export GITHUB_REF_NAME GITHUB_SHA GITHUB_REPOSITORY
 
           extract_release_step() {

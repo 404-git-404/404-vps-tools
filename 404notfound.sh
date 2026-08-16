@@ -15,12 +15,12 @@ readonly SSH_DROPIN="$SSH_DROPIN_DIR/00-hardening.conf"
 readonly LEGACY_SSH_DROPIN="$SSH_DROPIN_DIR/00-vps-bootstrap.conf"
 readonly AUTHORIZED_KEYS='/root/.ssh/authorized_keys'
 readonly CLOUDFLARE_UFW_TOOL='/usr/local/sbin/update-cloudflare-ufw'
-readonly DOMAIN_CHECK_RELEASE_BASE='https://github.com/404-git-404/404notfound/releases/download/domain-check-latest'
+readonly DOMAIN_CHECK_RELEASE_BASE='https://github.com/404-git-404/404-vps-tools/releases/download/domain-check-latest'
 readonly DOMAIN_CHECK_TARGET='/usr/local/bin/domain-check'
 readonly SAGER_KEY_FINGERPRINT='2C317FBD5D886B4E89BAE8DA6D9152172A2B2F0C'
 readonly SMARTDNS_CONFIG_TARGET='/etc/smartdns/smartdns.conf'
 readonly SMARTDNS_RELEASE_TAG='smartdns-debian-pinned-2026-07'
-readonly SMARTDNS_RELEASE_BASE='https://github.com/404-git-404/404notfound/releases/download/smartdns-debian-pinned-2026-07'
+readonly SMARTDNS_RELEASE_BASE='https://github.com/404-git-404/404-vps-tools/releases/download/smartdns-debian-pinned-2026-07'
 readonly IPV6_DISABLE_CONFIG='/etc/sysctl.d/99-disable-ipv6.conf'
 readonly NETWORK_STACK_UNIT='/etc/systemd/system/404-network-stack.service'
 readonly NETWORK_STACK_UNIT_NAME='404-network-stack.service'
@@ -1209,7 +1209,7 @@ neutralize_ssh_conflicts() {
         global_scope = 0
       }
       if (global_scope && blocked[keyword]) {
-        print "# Disabled by 404notfound bootstrap: " $0
+        print "# Disabled by 404-vps-tools bootstrap: " $0
         next
       }
       print
@@ -1314,7 +1314,7 @@ write_ssh_dropin() {
   staged_content=$(mktemp "$TMP_DIR/ssh-hardening.XXXXXXXX")
   {
     printf '%s\n' \
-      '# Managed by 404notfound/404notfound.sh.' \
+      '# Managed by 404-vps-tools/404notfound.sh.' \
       '# Proxy application configuration intentionally does not belong here.'
     if [[ "$KEEP_SSH_22" == true ]]; then
       printf '%s\n' 'Port 22'
@@ -2439,7 +2439,7 @@ install_ipv4_network_stack_unit() {
   write_network_stack_helper "$staged_helper"
   cat >"$staged_unit" <<'EOF'
 [Unit]
-Description=Apply 404notfound IPv4-only network stack
+Description=Apply 404-vps-tools IPv4-only network stack
 After=networking.service
 Before=smartdns.service sing-box.service
 

@@ -11,6 +11,8 @@ readonly DEEP_BUDGET_HEADROOM_PERCENT=25
 readonly DEEP_BUDGET_MAX_MB=4000
 readonly DEFAULT_SERVER_WAIT=600
 readonly SERVER_SESSION_IDLE=20
+readonly SERVER_ACTIVE_SESSION_TIMEOUT=120
+readonly SERVER_TIMEOUT_KILL_GRACE=5
 readonly SERVER_ERROR_LIMIT=3
 readonly DEFAULT_MAX_PERCENT=20
 readonly DEEP_MAX_PERCENT=35
@@ -106,13 +108,17 @@ TCP_TRANSFERRED_BYTES_B_TO_A=0
 TCP_RETRANSMISSIONS_A_TO_B=0
 TCP_RETRANSMISSIONS_B_TO_A=0
 LINK_HEALTH=0
-CONFIDENCE='LOW'
+LINK_HEALTH_AVAILABLE=false
+CONFIDENCE='NONE'
+RECOMMENDATION_CONFIDENCE='NONE'
 STATUS='POOR'
 PREFERRED='FIX LINK'
 REASON='Insufficient evidence to classify this VPS-to-VPS link.'
 RESULT_STATE='COMPLETE'
 TCP_EVALUABLE=false
 UDP_EVALUABLE=false
+TCP_EVIDENCE_STATE='INSUFFICIENT'
+UDP_EVIDENCE_STATE='INSUFFICIENT'
 ASYMMETRY_REASON=''
 LABELS=''
 PLATFORM_FAMILY=''
@@ -806,8 +812,7 @@ setup_firewall() {
 
 run_server() {
   local consecutive_errors=0
-  local deadline
-  local now
+  local active_deadline
   local wait_seconds
   local status
   local server_log
@@ -822,25 +827,25 @@ run_server() {
   printf 'Firewall:     %s\n' "$FIREWALL_STATUS"
   printf 'First wait:   %s seconds\n' "$SERVER_WAIT"
   printf 'Auto-close:   %s seconds after the last test\n' "$SERVER_SESSION_IDLE"
+  printf 'Active guard: %s seconds beyond each idle window\n' \
+    "$SERVER_ACTIVE_SESSION_TIMEOUT"
   printf '\nClient command:\n'
-  printf 'bash <(curl -fsSL https://raw.githubusercontent.com/404-git-404/404notfound/main/protocol-benchmark.sh) SERVER_IP --port %s\n' "$PORT"
+  printf 'bash <(curl -fsSL https://raw.githubusercontent.com/404-git-404/404-vps-tools/main/protocol-benchmark.sh) SERVER_IP --port %s\n' "$PORT"
   printf '\nStop: Ctrl+C (cleanup is automatic)\n\n'
 
-  now=$(date +%s)
-  deadline=$((now + SERVER_WAIT))
   while true; do
-    now=$(date +%s)
-    if (( now >= deadline )); then
-      if (( SERVER_TESTS == 0 )); then
-        printf 'Server closed: idle timeout before the first client session; no listener retained.\n'
-      else
-        printf 'Server closed: idle timeout after the last test (%ss, %d completed); no listener retained.\n' \
-          "$SERVER_SESSION_IDLE" "$SERVER_TESTS"
-      fi
-      return 0
+    if (( SERVER_TESTS == 0 )); then
+      wait_seconds=$SERVER_WAIT
+    else
+      wait_seconds=$SERVER_SESSION_IDLE
     fi
-    wait_seconds=$((deadline - now))
-    timeout --foreground "$wait_seconds" iperf3 -s -1 -J -p "$PORT" \
+    active_deadline=$((wait_seconds + SERVER_ACTIVE_SESSION_TIMEOUT))
+    : >"$server_log"
+    # iperf3's one-off idle timeout applies only while waiting in IPERF_START;
+    # after accept, the separate outer guard leaves a full active allowance.
+    timeout --foreground --kill-after="$SERVER_TIMEOUT_KILL_GRACE" \
+      "$active_deadline" iperf3 -s -1 -J --idle-timeout "$wait_seconds" \
+      -p "$PORT" \
       >"$server_log" 2>&1 &
     ACTIVE_IPERF_PID=$!
     if wait "$ACTIVE_IPERF_PID"; then
@@ -849,7 +854,13 @@ run_server() {
       status=$?
     fi
     ACTIVE_IPERF_PID=''
-    if (( status == 124 )); then
+    if (( status == 124 || status == 137 )); then
+      printf 'Server stopped: active session timeout (hard limit %ss: %ss idle window + %ss active allowance); listener and firewall cleanup are automatic.\n' \
+        "$active_deadline" "$wait_seconds" "$SERVER_ACTIVE_SESSION_TIMEOUT" >&2
+      return 1
+    fi
+    if (( status == 0 )) &&
+      ! grep -Eq '"end"[[:space:]]*:' "$server_log"; then
       if (( SERVER_TESTS == 0 )); then
         printf 'Server closed: idle timeout before the first client session; no listener retained.\n'
       else
@@ -861,8 +872,6 @@ run_server() {
     if (( status == 0 )); then
       (( SERVER_TESTS += 1 ))
       consecutive_errors=0
-      now=$(date +%s)
-      deadline=$((now + SERVER_SESSION_IDLE))
       printf 'Completed test %d; waiting %ss for the next stage.\n' \
         "$SERVER_TESTS" "$SERVER_SESSION_IDLE"
       continue
@@ -1066,24 +1075,77 @@ failure_has_no_transfer() {
     "$reason" == *'temporary failure in name resolution'* ]]
 }
 
-failure_indicates_server_unavailable() {
+failure_is_transport_error() {
   local reason=${1,,}
 
-  failure_has_no_transfer "$reason" ||
-    [[ "$reason" == *'unable to read from stream socket'* ||
-      "$reason" == *'unable to receive control message'* ||
-      "$reason" == *'control socket has closed unexpectedly'* ]]
+  [[ "$reason" == *'unable to read from stream socket'* ||
+    "$reason" == *'unable to write to stream socket'* ||
+    "$reason" == *'unable to receive control message'* ||
+    "$reason" == *'control socket has closed unexpectedly'* ||
+    "$reason" == *'stream socket has closed unexpectedly'* ]]
+}
+
+classify_failure_kind() {
+  local reason=$1
+
+  if failure_has_no_transfer "$reason"; then
+    printf 'INFRASTRUCTURE\n'
+  elif failure_is_transport_error "$reason"; then
+    printf 'TRANSPORT\n'
+  else
+    printf 'ENVIRONMENT\n'
+  fi
+}
+
+protocol_failure_count_by_kind() {
+  local protocol=$1
+  local kind=$2
+
+  [[ -n "$FAILURE_FILE" && -s "$FAILURE_FILE" ]] || {
+    printf '0\n'
+    return 0
+  }
+  awk -F '\t' -v protocol="$protocol" -v kind="$kind" \
+    '$1 == protocol && $6 == kind {count++} END {print count+0}' \
+    "$FAILURE_FILE"
+}
+
+protocol_transport_failure_directions() {
+  local protocol=$1
+
+  [[ -n "$FAILURE_FILE" && -s "$FAILURE_FILE" ]] || {
+    printf '0\n'
+    return 0
+  }
+  awk -F '\t' -v protocol="$protocol" '
+    $1 == protocol && $6 == "TRANSPORT" &&
+      ($2 == "A_TO_B" || $2 == "B_TO_A") {failed[$2]=1}
+    END {print failed["A_TO_B"]+failed["B_TO_A"]}
+  ' "$FAILURE_FILE"
+}
+
+protocol_evidence_state() {
+  local protocol=$1
+
+  if protocol_is_evaluable "$protocol"; then
+    printf 'EVALUABLE\n'
+  elif (( $(protocol_count "$protocol") == 0 &&
+    $(protocol_transport_failure_directions "$protocol") == 2 )); then
+    printf 'TRANSPORT_FAILED\n'
+  else
+    printf 'INSUFFICIENT\n'
+  fi
 }
 
 benchmark_server_became_unavailable() {
-  local protocol direction percent status reason
+  local protocol direction percent status origin kind reason
   local tcp_connection_failure=false
   local udp_connection_failure=false
 
   [[ -n "$RESULT_FILE" && -s "$RESULT_FILE" &&
     -n "$FAILURE_FILE" && -s "$FAILURE_FILE" ]] || return 1
-  while IFS=$'\t' read -r protocol direction percent status reason; do
-    failure_indicates_server_unavailable "$reason" || continue
+  while IFS=$'\t' read -r protocol direction percent status origin kind reason; do
+    [[ "$kind" == 'INFRASTRUCTURE' ]] || continue
     case "$protocol" in
       TCP) tcp_connection_failure=true ;;
       UDP) udp_connection_failure=true ;;
@@ -1127,6 +1189,10 @@ record_failure() {
   local percent=${3:-0}
   local status=${4:-1}
   local reason=${5:-'iperf3 execution failed'}
+  local origin=${6:-process}
+  local kind
+
+  kind=$(classify_failure_kind "$reason")
 
   (( TEST_FAILURES += 1 ))
   if [[ "$protocol" == 'TCP' ]]; then
@@ -1135,8 +1201,8 @@ record_failure() {
     (( UDP_FAILURES += 1 ))
   fi
   if [[ -n "$FAILURE_FILE" ]]; then
-    printf '%s\t%s\t%s\t%s\t%s\n' "$protocol" "$direction" \
-      "$percent" "$status" "$reason" >>"$FAILURE_FILE"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$protocol" "$direction" \
+      "$percent" "$status" "$origin" "$kind" "$reason" >>"$FAILURE_FILE"
   fi
 }
 
@@ -1169,6 +1235,7 @@ run_controlled_test() {
   local load_increase=0
   local error
   local json_valid=false
+  local failure_origin=process
   local -a command=(iperf3 -c "$PEER" -p "$PORT" -J -t "$DURATION")
 
   rate_mbps=$(rate_for_percent "$percent")
@@ -1207,10 +1274,16 @@ run_controlled_test() {
     error=''
   fi
   if (( status != 0 )) || [[ "$json_valid" == false || -n "$error" ]]; then
+    if [[ "$json_valid" == true && -n "$error" ]]; then
+      failure_origin=iperf3
+    elif (( status == 0 )); then
+      failure_origin=result-validation
+    fi
     error=$(extract_failure_reason "$json_file" "$status")
     printf 'FAILED: %s\n' "$error"
     account_failed_test "$reserve" "$json_file" "$error"
-    record_failure "$protocol" "$direction" "$percent" "$status" "$error"
+    record_failure "$protocol" "$direction" "$percent" "$status" "$error" \
+      "$failure_origin"
     sleep "$COOLDOWN"
     return "$TEST_RESULT_FAILED"
   fi
@@ -1866,13 +1939,13 @@ choose_preferred_transport() {
     REASON='UDP is materially degraded while TCP remains the more usable transport.'
   elif (( UDP_SCORE >= PREFERENCE_USABLE_SCORE &&
     TCP_SCORE < PREFERENCE_USABLE_SCORE )); then
-    PREFERRED='HY2'
+    PREFERRED='UDP'
     REASON='UDP quality is materially better than TCP on this path.'
   elif [[ "$udp_degraded" == true && "$tcp_degraded" == false ]]; then
     PREFERRED='TCP'
     REASON='UDP is materially degraded while TCP remains the more usable transport.'
   elif [[ "$tcp_degraded" == true && "$udp_degraded" == false ]]; then
-    PREFERRED='HY2'
+    PREFERRED='UDP'
     REASON='UDP quality is materially better than TCP on this path.'
   elif (( TCP_SCORE >= UDP_SCORE + PREFERENCE_MATERIAL_MARGIN )); then
     PREFERRED='TCP'
@@ -1882,11 +1955,28 @@ choose_preferred_transport() {
       REASON='TCP quality is materially better than UDP on this path.'
     fi
   elif (( UDP_SCORE >= TCP_SCORE + PREFERENCE_MATERIAL_MARGIN )); then
-    PREFERRED='HY2'
+    PREFERRED='UDP'
     REASON='UDP quality is materially better than TCP on this path.'
   else
     PREFERRED='EITHER'
     REASON='TCP and UDP are both healthy with no material quality advantage.'
+  fi
+}
+
+partial_recommendation_confidence() {
+  local protocol=$1
+  local failures
+
+  if [[ "$protocol" == 'TCP' ]]; then
+    failures=$TCP_FAILURES
+  else
+    failures=$UDP_FAILURES
+  fi
+  if (( $(protocol_count "$protocol") >= 4 && failures == 0 )) &&
+    [[ "$CPU_LIMITED" == false ]]; then
+    printf 'HIGH\n'
+  else
+    printf 'MEDIUM\n'
   fi
 }
 
@@ -1895,14 +1985,22 @@ calculate_results() {
   local idle_penalty=0
   local load_average
   local cpu_count
+  local tcp_transport_failures
+  local udp_transport_failures
 
   TCP_EVALUABLE=false
   UDP_EVALUABLE=false
   protocol_is_evaluable TCP && TCP_EVALUABLE=true
   protocol_is_evaluable UDP && UDP_EVALUABLE=true
+  TCP_EVIDENCE_STATE=$(protocol_evidence_state TCP)
+  UDP_EVIDENCE_STATE=$(protocol_evidence_state UDP)
+  LINK_HEALTH_AVAILABLE=false
+  CONFIDENCE='NONE'
+  RECOMMENDATION_CONFIDENCE='NONE'
+  tcp_transport_failures=$(protocol_failure_count_by_kind TCP TRANSPORT)
+  udp_transport_failures=$(protocol_failure_count_by_kind UDP TRANSPORT)
   if benchmark_server_became_unavailable; then
     RESULT_STATE='INFRASTRUCTURE_FAILURE'
-    CONFIDENCE='NONE'
     STATUS='INCOMPLETE'
     PREFERRED='INCONCLUSIVE'
     REASON='Benchmark server became unavailable during the test; protocol classification is invalid/incomplete.'
@@ -1911,10 +2009,18 @@ calculate_results() {
   fi
   if [[ "$TCP_EVALUABLE" == false && "$UDP_EVALUABLE" == false ]]; then
     RESULT_STATE='FAILED'
-    CONFIDENCE='NONE'
     STATUS='NO VALID DATA'
-    PREFERRED='INCONCLUSIVE'
-    REASON='Unable to complete controlled iperf3 tests; no link-quality conclusion is available.'
+    if [[ "$TCP_EVIDENCE_STATE" == 'TRANSPORT_FAILED' &&
+      "$UDP_EVIDENCE_STATE" == 'TRANSPORT_FAILED' ]]; then
+      PREFERRED='FIX LINK'
+      RECOMMENDATION_CONFIDENCE='MEDIUM'
+      REASON='TCP and UDP both failed in both directions before producing valid samples; fix the underlying path before selecting a transport.'
+      append_label 'TCP-TRANSPORT-FAILED'
+      append_label 'UDP-TRANSPORT-FAILED'
+    else
+      PREFERRED='INCONCLUSIVE'
+      REASON='Unable to complete controlled iperf3 tests; the available failures are insufficient for a transport recommendation.'
+    fi
     append_label 'EXECUTION-FAILED'
     return 0
   fi
@@ -1927,18 +2033,15 @@ calculate_results() {
   TCP_SCORE=0
   UDP_SCORE=0
   if [[ "$TCP_EVALUABLE" == true ]]; then
-    TCP_SCORE=$(calculate_protocol_score 'TCP' "$TCP_FAILURES" \
+    TCP_SCORE=$(calculate_protocol_score 'TCP' "$tcp_transport_failures" \
       "$TCP_RETRANS_PENALTY")
   fi
   if [[ "$UDP_EVALUABLE" == true ]]; then
-    UDP_SCORE=$(calculate_protocol_score 'UDP' "$UDP_FAILURES")
+    UDP_SCORE=$(calculate_protocol_score 'UDP' "$udp_transport_failures")
   fi
   if [[ "$TCP_EVALUABLE" != "$UDP_EVALUABLE" ]]; then
     RESULT_STATE='PARTIAL'
-    CONFIDENCE='LOW'
     STATUS='INCOMPLETE'
-    PREFERRED='INCONCLUSIVE'
-    REASON='Only one protocol produced valid bidirectional samples; no combined link-quality score or transport recommendation was produced.'
     append_label 'PARTIAL-DATA'
     [[ "$CPU_LIMITED" == false ]] || append_label 'CPU-LIMITED'
     if [[ "$TCP_EVALUABLE" == true ]] && (( TCP_SCORE < 65 )); then
@@ -1947,9 +2050,26 @@ calculate_results() {
     if [[ "$UDP_EVALUABLE" == true ]] && (( UDP_SCORE < 65 )); then
       append_label 'UDP-DEGRADED'
     fi
+    if [[ "$TCP_EVALUABLE" == true &&
+      "$UDP_EVIDENCE_STATE" == 'TRANSPORT_FAILED' ]]; then
+      PREFERRED='TCP'
+      RECOMMENDATION_CONFIDENCE=$(partial_recommendation_confidence TCP)
+      REASON='TCP produced valid bidirectional samples. UDP failed in both directions before producing a valid sample; TCP is therefore the preferred transport for this link.'
+      append_label 'UDP-TRANSPORT-FAILED'
+    elif [[ "$UDP_EVALUABLE" == true &&
+      "$TCP_EVIDENCE_STATE" == 'TRANSPORT_FAILED' ]]; then
+      PREFERRED='UDP'
+      RECOMMENDATION_CONFIDENCE=$(partial_recommendation_confidence UDP)
+      REASON='UDP produced valid bidirectional samples. TCP failed in both directions before producing a valid sample; UDP is therefore the preferred transport for this link.'
+      append_label 'TCP-TRANSPORT-FAILED'
+    else
+      PREFERRED='INCONCLUSIVE'
+      REASON='Only one protocol produced valid bidirectional samples; the other protocol has insufficient attributable evidence, so no transport recommendation was produced.'
+    fi
     return 0
   fi
   RESULT_STATE='COMPLETE'
+  LINK_HEALTH_AVAILABLE=true
   if [[ "$IDLE_BASELINE_AVAILABLE" == true ]]; then
     idle_penalty=$(awk -v loss="$IDLE_LOSS" -v variation="${IDLE_VARIATION:-0}" '
       BEGIN {
@@ -1984,6 +2104,8 @@ calculate_results() {
   fi
   (( TCP_SCORE < 65 )) && append_label 'TCP-DEGRADED'
   (( UDP_SCORE < 65 )) && append_label 'UDP-DEGRADED'
+  (( tcp_transport_failures == 0 )) || append_label 'TCP-TRANSPORT-ERROR'
+  (( udp_transport_failures == 0 )) || append_label 'UDP-TRANSPORT-ERROR'
 
   sample_count=$(awk 'END {print NR+0}' "$RESULT_FILE")
   if (( sample_count >= 8 && TEST_FAILURES == 0 &&
@@ -2011,6 +2133,7 @@ calculate_results() {
   fi
 
   choose_preferred_transport
+  RECOMMENDATION_CONFIDENCE=$CONFIDENCE
 }
 
 human_bandwidth() {
@@ -2048,7 +2171,29 @@ adaptive_stop_summary() {
   fi
 }
 
+print_protocol_score() {
+  local protocol=$1
+  local evidence_state
+  local score
+
+  if [[ "$protocol" == 'TCP' ]]; then
+    evidence_state=$TCP_EVIDENCE_STATE
+    score=$TCP_SCORE
+  else
+    evidence_state=$UDP_EVIDENCE_STATE
+    score=$UDP_SCORE
+  fi
+  case "$evidence_state" in
+    EVALUABLE) printf '%s SCORE:     %s / 100\n' "$protocol" "$score" ;;
+    TRANSPORT_FAILED)
+      printf '%s SCORE:     unavailable (transport failed)\n' "$protocol"
+      ;;
+    *) printf '%s SCORE:     unavailable (insufficient evidence)\n' "$protocol" ;;
+  esac
+}
+
 print_results() {
+  local LC_ALL=C
   local idle_display='unavailable'
   local variation_display='unavailable'
   local idle_loss_display='unavailable'
@@ -2084,11 +2229,12 @@ print_results() {
   printf 'Idle loss:     %s\n' "$idle_loss_display"
   printf 'ICMP baseline: %s\n' "$icmp_baseline_display"
   printf 'Load RTT:      +%s ms max\n' "$MAX_LOAD_INCREASE"
-  printf 'Peak CPU:      %s%%\n' "$MAX_CPU"
+  printf 'Peak CPU:      %.2f%%\n' "$MAX_CPU"
   printf 'Max load avg:  %s\n' "$MAX_LOAD_AVERAGE"
   if [[ "$RESULT_STATE" == 'INFRASTRUCTURE_FAILURE' ]]; then
     printf '\nTEST RESULT:   INCOMPLETE / INFRASTRUCTURE FAILURE\n'
-    printf 'CONFIDENCE:    NONE\n'
+    printf 'LINK CONFIDENCE: NONE\n'
+    printf 'RECOMMENDATION CONFIDENCE: NONE\n'
     printf 'TCP SCORE:     not produced\n'
     printf 'UDP SCORE:     not produced\n'
     printf 'LINK HEALTH:   not produced\n'
@@ -2102,31 +2248,29 @@ print_results() {
   fi
   if [[ "$RESULT_STATE" == 'FAILED' ]]; then
     printf '\nTEST RESULT:   FAILED\n'
-    printf 'CONFIDENCE:    NONE\n'
+    printf 'LINK CONFIDENCE: NONE\n'
+    printf 'RECOMMENDATION CONFIDENCE: %s\n' "$RECOMMENDATION_CONFIDENCE"
     printf 'Budget stop:   %s\n' "$BUDGET_LIMITED"
+    print_protocol_score TCP
+    print_protocol_score UDP
+    printf 'LINK HEALTH:   not produced\n'
+    printf 'STATUS:        %s\n' "$STATUS"
+    printf '\nPreferred:     %s\n' "$PREFERRED"
     printf '\nNo valid bidirectional TCP or UDP benchmark samples were collected.\n'
-    printf '\nReason:\nUnable to complete controlled iperf3 tests.\n'
-    printf 'Check the temporary server, port, firewall, or connectivity.\n'
+    printf '\nReason:\n%s\n' "$REASON"
     print_failure_summary
-    printf '\nNo link-quality score or transport recommendation was produced.\n'
+    printf '\nNo combined link-quality score was produced.\n'
     return 0
   fi
   if [[ "$RESULT_STATE" == 'PARTIAL' ]]; then
-    printf '\nTEST RESULT:   INCOMPLETE / PARTIAL DATA\n'
-    printf 'CONFIDENCE:    LOW\n'
-    if [[ "$TCP_EVALUABLE" == true ]]; then
-      printf 'TCP SCORE:     %s / 100\n' "$TCP_SCORE"
-    else
-      printf 'TCP SCORE:     not evaluable\n'
-    fi
-    if [[ "$UDP_EVALUABLE" == true ]]; then
-      printf 'UDP SCORE:     %s / 100\n' "$UDP_SCORE"
-    else
-      printf 'UDP SCORE:     not evaluable\n'
-    fi
+    printf '\nTEST RESULT:   PARTIAL DATA\n'
+    printf 'LINK CONFIDENCE: NONE\n'
+    printf 'RECOMMENDATION CONFIDENCE: %s\n' "$RECOMMENDATION_CONFIDENCE"
+    print_protocol_score TCP
+    print_protocol_score UDP
     printf 'LINK HEALTH:   not produced\n'
     printf 'STATUS:        INCOMPLETE\n'
-    printf '\nPreferred:     INCONCLUSIVE\n'
+    printf '\nPreferred:     %s\n' "$PREFERRED"
     printf '\nReason:\n%s\n' "$REASON"
     print_failure_summary
     if [[ "$BUDGET_LIMITED" == true ]]; then
@@ -2151,8 +2295,14 @@ print_results() {
   printf '  Penalty:     %s / %s\n' "$TCP_RETRANS_PENALTY" \
     "$TCP_RETRANS_MAX_PENALTY"
   printf 'UDP SCORE:     %s / 100\n' "$UDP_SCORE"
-  printf 'LINK HEALTH:   %s / 100\n' "$LINK_HEALTH"
-  printf 'CONFIDENCE:    %s\n' "$CONFIDENCE"
+  if [[ "$LINK_HEALTH_AVAILABLE" == true ]]; then
+    printf 'LINK HEALTH:   %s / 100\n' "$LINK_HEALTH"
+  else
+    printf 'LINK HEALTH:   not produced\n'
+  fi
+  printf 'LINK CONFIDENCE: %s\n' "$CONFIDENCE"
+  printf 'RECOMMENDATION CONFIDENCE: %s\n' \
+    "$RECOMMENDATION_CONFIDENCE"
   printf 'STATUS:        %s\n' "$STATUS"
   printf 'LABELS:        %s\n' "$labels_display"
   printf '\nPreferred:     %s\n' "$PREFERRED"
@@ -2234,13 +2384,23 @@ print_successful_sample_summary() {
 }
 
 print_failure_summary() {
-  local protocol direction percent status reason
+  local protocol direction percent status origin kind reason
 
   [[ -n "$FAILURE_FILE" && -s "$FAILURE_FILE" ]] || return 0
   printf '\nExecution failures:\n'
-  while IFS=$'\t' read -r protocol direction percent status reason; do
-    printf '  %s %s %s%% (exit %s): %s\n' "$protocol" \
-      "$(display_direction "$direction")" "$percent" "$status" "$reason"
+  while IFS=$'\t' read -r protocol direction percent status origin kind reason; do
+    if [[ "$origin" == 'iperf3' ]]; then
+      printf '  %s %s %s%% (iperf3 reported error; process exit %s): %s\n' \
+        "$protocol" "$(display_direction "$direction")" "$percent" \
+        "$status" "$reason"
+    elif [[ "$origin" == 'result-validation' ]]; then
+      printf '  %s %s %s%% (invalid result; process exit %s): %s\n' \
+        "$protocol" "$(display_direction "$direction")" "$percent" \
+        "$status" "$reason"
+    else
+      printf '  %s %s %s%% (process exit %s): %s\n' "$protocol" \
+        "$(display_direction "$direction")" "$percent" "$status" "$reason"
+    fi
   done <"$FAILURE_FILE"
 }
 

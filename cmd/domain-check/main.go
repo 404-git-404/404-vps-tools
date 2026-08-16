@@ -6,7 +6,7 @@ import (
 	"io"
 	"os"
 
-	"github.com/404-git-404/404notfound/internal/domaincheck"
+	"github.com/404-git-404/404-vps-tools/internal/domaincheck"
 )
 
 var version = "dev"
