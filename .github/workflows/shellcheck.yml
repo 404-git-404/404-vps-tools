@@ -26,6 +26,7 @@ jobs:
             domain-check.sh
             node-config-wizard.sh
             protocol-benchmark.sh
+            scripts/install-domain-check.sh
             scripts/update-smartdns.sh
             scripts/domain-check-go-benchmark.sh
             request-cloudflare-certificate.sh
@@ -89,9 +90,9 @@ jobs:
           grep -Fq "== '7f454c46'" 404notfound.sh
           grep -Fq 'domain-check Go' 404notfound.sh
           grep -Fq 'mktemp /usr/local/bin/.domain-check.' 404notfound.sh
-          grep -Fq 'x86_64) arch=amd64' README.md
-          grep -Fq 'aarch64|arm64) arch=arm64' README.md
-          grep -Fq 'Unsupported architecture:' README.md
+          grep -Fq 'x86_64) arch=amd64' scripts/install-domain-check.sh
+          grep -Fq 'aarch64 | arm64) arch=arm64' scripts/install-domain-check.sh
+          grep -Fq 'Unsupported architecture:' scripts/install-domain-check.sh
           grep -Fq 'for arch in amd64 arm64; do' .github/workflows/domain-check-release.yml
           grep -Fq 'GOARCH="$arch"' .github/workflows/domain-check-release.yml
           grep -Fq 'domain-check-linux-amd64' .github/workflows/domain-check-release.yml
@@ -107,9 +108,10 @@ jobs:
           if grep -Fq 'gh release delete' .github/workflows/domain-check-release.yml; then
             exit 1
           fi
-          grep -Fq 'releases/download/domain-check-latest' README.md
-          grep -Fq 'sha256sum -c - >/dev/null' README.md
+          grep -Fq 'releases/download/domain-check-latest' scripts/install-domain-check.sh
+          grep -Fq 'sha256sum -c - >/dev/null' scripts/install-domain-check.sh
           if grep -Fq 'releases/latest/download' README.md 404notfound.sh \
+            scripts/install-domain-check.sh \
             .github/workflows/domain-check-release.yml; then
             exit 1
           fi
@@ -148,7 +150,7 @@ jobs:
           ```
 
           ```bash
-          bash -c 'set -Eeuo pipefail; case "$(uname -m)" in x86_64) arch=amd64 ;; aarch64|arm64) arch=arm64 ;; *) printf "Unsupported architecture: %s\n" "$(uname -m)" >&2; exit 1 ;; esac; asset="domain-check-linux-$arch"; base="${DOMAIN_CHECK_RELEASE_BASE:-https://github.com/404-git-404/404notfound/releases/download/domain-check-latest}"; dir=$(mktemp -d); trap '\''rm -rf -- "$dir"'\'' EXIT; curl -fsSL "$base/$asset" -o "$dir/$asset"; curl -fsSL "$base/SHA256SUMS" -o "$dir/SHA256SUMS"; checksum=$(grep -E "^[[:xdigit:]]{64}  ${asset}$" "$dir/SHA256SUMS"); printf "%s\n" "$checksum" | (cd "$dir" && sha256sum -c - >/dev/null); install -m 0755 "$dir/$asset" /usr/local/bin/domain-check; /usr/local/bin/domain-check --version'
+          bash <(curl -fsSL https://raw.githubusercontent.com/404-git-404/404notfound/main/scripts/install-domain-check.sh)
           ```
 
           ```bash
@@ -284,6 +286,7 @@ jobs:
             domain-check.sh \
             node-config-wizard.sh \
             protocol-benchmark.sh \
+            scripts/install-domain-check.sh \
             scripts/update-smartdns.sh \
             scripts/domain-check-go-benchmark.sh \
             request-cloudflare-certificate.sh \
