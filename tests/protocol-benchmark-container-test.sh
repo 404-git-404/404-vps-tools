@@ -74,9 +74,20 @@ run_closed_port_failure() {
   grep -Fq 'Traffic used:  0.0 MB' "$log" || fail "$label reported traffic for immediate refusal."
   grep -Fq 'Budget stop:   false' "$log" || fail "$label did not distinguish failure from budget denial."
   ! grep -Fq 'Budget stop: no further' "$log" || fail "$label produced a false budget stop."
-  ! grep -Fq 'TCP SCORE:' "$log" || fail "$label produced a false TCP score."
-  ! grep -Fq 'UDP SCORE:' "$log" || fail "$label produced a false UDP score."
-  ! grep -Fq 'LINK HEALTH:' "$log" || fail "$label produced a false link score."
+  grep -Fq 'TCP SCORE:     unavailable (insufficient evidence)' "$log" ||
+    fail "$label did not report unavailable TCP evidence."
+  grep -Fq 'UDP SCORE:     unavailable (insufficient evidence)' "$log" ||
+    fail "$label did not report unavailable UDP evidence."
+  grep -Fq 'LINK HEALTH:   not produced' "$log" ||
+    fail "$label did not suppress combined link health."
+  ! grep -Eq '^TCP SCORE:[[:space:]]*[0-9]+' "$log" ||
+    fail "$label produced a false numeric TCP score."
+  ! grep -Eq '^UDP SCORE:[[:space:]]*[0-9]+' "$log" ||
+    fail "$label produced a false numeric UDP score."
+  ! grep -Eq '^LINK HEALTH:[[:space:]]*[0-9]+' "$log" ||
+    fail "$label produced a false numeric link score."
+  grep -Fq 'Preferred:     INCONCLUSIVE' "$log" ||
+    fail "$label produced an unsupported transport preference."
   ! grep -Fq 'FIX LINK' "$log" || fail "$label produced a false transport recommendation."
   ! grep -Eq '^  (TCP|UDP)[[:space:]]+[^[:space:]]+[[:space:]]+10%' "$log" ||
     fail "$label escalated after every 5 percent test failed."
