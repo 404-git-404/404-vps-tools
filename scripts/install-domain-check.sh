@@ -12,7 +12,7 @@ case "$(uname -m)" in
 esac
 
 asset="domain-check-linux-$arch"
-base="${DOMAIN_CHECK_RELEASE_BASE:-https://github.com/404-git-404/404notfound/releases/download/domain-check-latest}"
+base="${DOMAIN_CHECK_RELEASE_BASE:-https://github.com/404-git-404/404-vps-tools/releases/download/domain-check-latest}"
 dir=$(mktemp -d)
 trap 'rm -rf -- "$dir"' EXIT
 

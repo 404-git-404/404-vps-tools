@@ -121,6 +121,11 @@ reset_fixture() {
   RESULT_STATE='COMPLETE'
   TCP_EVALUABLE=false
   UDP_EVALUABLE=false
+  TCP_EVIDENCE_STATE='INSUFFICIENT'
+  UDP_EVIDENCE_STATE='INSUFFICIENT'
+  LINK_HEALTH_AVAILABLE=false
+  CONFIDENCE='NONE'
+  RECOMMENDATION_CONFIDENCE='NONE'
   FIREWALL_RULE_ADDED=false
   FIREWALL_COMMENT=''
   FIREWALL_STATUS='unchanged'
@@ -504,9 +509,12 @@ test_failure_control_flow_and_evaluability() {
     'no-data output distinguishes execution failure from budget denial'
   assert_contains 'No valid bidirectional TCP or UDP' "$output" \
     'no-data output explanation'
-  assert_not_contains 'TCP SCORE:' "$output" 'no-data omits TCP score'
-  assert_not_contains 'UDP SCORE:' "$output" 'no-data omits UDP score'
-  assert_not_contains 'LINK HEALTH:' "$output" 'no-data omits link health'
+  assert_contains 'TCP SCORE:     unavailable (insufficient evidence)' "$output" \
+    'no-data identifies insufficient TCP evidence'
+  assert_contains 'UDP SCORE:     unavailable (insufficient evidence)' "$output" \
+    'no-data identifies insufficient UDP evidence'
+  assert_contains 'LINK HEALTH:   not produced' "$output" \
+    'no-data does not fabricate combined health'
   assert_not_contains 'Preferred:     FIX LINK' "$output" \
     'no-data omits false transport conclusion'
   assert_not_contains 'link appears poor' "$output" \
@@ -529,7 +537,7 @@ test_failure_control_flow_and_evaluability() {
   assert_equal 'PARTIAL' "$RESULT_STATE" 'UDP-only result is partial'
   assert_equal 'false' "$TCP_EVALUABLE" 'failed TCP is not evaluable'
   assert_equal 'true' "$UDP_EVALUABLE" 'bidirectional UDP is evaluable'
-  assert_contains 'TCP SCORE:     not evaluable' "$output" \
+  assert_contains 'TCP SCORE:     unavailable (insufficient evidence)' "$output" \
     'partial output does not turn missing TCP into zero'
   assert_contains 'Preferred:     INCONCLUSIVE' "$output" \
     'partial UDP-only result is inconclusive'
@@ -549,7 +557,7 @@ test_failure_control_flow_and_evaluability() {
   assert_equal 'PARTIAL' "$RESULT_STATE" 'TCP-only result is partial'
   assert_equal 'true' "$TCP_EVALUABLE" 'bidirectional TCP is evaluable'
   assert_equal 'false' "$UDP_EVALUABLE" 'failed UDP is not evaluable'
-  assert_contains 'UDP SCORE:     not evaluable' "$output" \
+  assert_contains 'UDP SCORE:     unavailable (insufficient evidence)' "$output" \
     'partial output does not turn missing UDP into zero'
   assert_contains 'LINK HEALTH:   not produced' "$output" \
     'partial output omits combined score'
@@ -675,6 +683,36 @@ test_failure_reason_and_reservation_lifecycle() {
   assert_equal 'false' "$BUDGET_LIMITED" \
     'connection refusal does not create a fake budget stop'
 
+  reset_fixture
+  TEMP_DIR=$TEST_TEMP_DIR
+  NOMINAL_MBPS=100
+  PEER=192.0.2.200
+  PORT=55000
+  DURATION=1
+  COOLDOWN=0
+  BUDGET_BYTES=200000000
+  iperf3() {
+    printf '%s\n' \
+      '{"error":"unable to read from stream socket: Resource temporarily unavailable"}'
+    return 0
+  }
+  if run_controlled_test UDP A_TO_B 5 1 >"$output_file" 2>&1; then
+    status=0
+  else
+    status=$?
+  fi
+  assert_equal "$TEST_RESULT_FAILED" "$status" \
+    'iperf3 JSON error is failure even when process exit is zero'
+  assert_equal 'iperf3' "$(awk -F '\t' 'NR==1 {print $5}' "$FAILURE_FILE")" \
+    'JSON error records iperf3 as the failure source'
+  assert_equal 'TRANSPORT' "$(awk -F '\t' 'NR==1 {print $6}' "$FAILURE_FILE")" \
+    'stream socket JSON error is transport evidence'
+  output=$(print_failure_summary)
+  assert_contains '(iperf3 reported error; process exit 0)' "$output" \
+    'exit-zero JSON error output explains the apparent contradiction'
+  assert_not_contains '(exit 0):' "$output" \
+    'exit-zero JSON error is not displayed as a bare misleading exit status'
+
   printf '%s\n' '{"error":"server terminated by policy"}' >"$json_file"
   printf '%s\n' 'stderr fallback must lose' >"$json_file.stderr"
   failure_reason=$(extract_failure_reason "$json_file" 1)
@@ -690,6 +728,167 @@ test_failure_reason_and_reservation_lifecycle() {
   printf -v long_text '%0200d' 0
   failure_reason=$(sanitize_failure_text "$long_text")
   assert_equal '180' "${#failure_reason}" 'failure reason length is bounded'
+}
+
+setup_result_matrix_case() {
+  local scenario=$1
+
+  case "$scenario" in
+    tcp_valid_udp_transport)
+      append_healthy_pair TCP 5 5
+      append_healthy_pair TCP 10 10
+      record_failure UDP A_TO_B 5 0 \
+        'unable to read from stream socket: Resource temporarily unavailable' iperf3
+      record_failure UDP B_TO_A 5 0 \
+        'unable to read from stream socket: Resource temporarily unavailable' iperf3
+      ;;
+    udp_valid_tcp_transport)
+      append_healthy_pair UDP 5 5
+      append_healthy_pair UDP 10 10
+      record_failure TCP A_TO_B 5 1 'stream socket has closed unexpectedly'
+      record_failure TCP B_TO_A 5 1 'stream socket has closed unexpectedly'
+      ;;
+    both_transport_failed)
+      record_failure TCP A_TO_B 5 1 'stream socket has closed unexpectedly'
+      record_failure TCP B_TO_A 5 1 'stream socket has closed unexpectedly'
+      record_failure UDP A_TO_B 5 1 'unable to read from stream socket'
+      record_failure UDP B_TO_A 5 1 'unable to read from stream socket'
+      ;;
+    tcp_valid_udp_budget)
+      append_healthy_pair TCP 5 5
+      BUDGET_LIMITED=true
+      ;;
+    udp_valid_tcp_environment)
+      append_healthy_pair UDP 5 5
+      record_failure TCP A_TO_B 5 1 'unable to allocate local socket buffer'
+      record_failure TCP B_TO_A 5 1 'unable to allocate local socket buffer'
+      ;;
+    tcp_materially_better)
+      append_healthy_pair TCP 5 5
+      append_result UDP A_TO_B 5 5 0 5 5 1000000
+      append_result UDP B_TO_A 5 5 0 5 5 1000000
+      ;;
+    udp_materially_better)
+      append_result TCP A_TO_B 5 5 1000 0 5 1000000
+      append_result TCP B_TO_A 5 5 1000 0 5 1000000
+      append_healthy_pair UDP 5 5
+      ;;
+    equal_transports)
+      append_healthy_pair TCP 5 5
+      append_healthy_pair UDP 5 5
+      ;;
+    single_direction_udp)
+      append_healthy_pair TCP 5 5
+      append_result UDP A_TO_B 5 5 0 0 5 1000000
+      record_failure UDP B_TO_A 5 1 'unable to read from stream socket'
+      ;;
+    adaptive_transport_evidence)
+      append_healthy_pair TCP 5 5
+      append_healthy_pair TCP 10 10
+      record_failure UDP A_TO_B 5 1 'unable to read from stream socket'
+      record_failure UDP B_TO_A 5 1 'unable to read from stream socket'
+      EARLY_STOP=true
+      ;;
+    degradation_with_environment_error)
+      append_healthy_pair TCP 5 5
+      append_result UDP A_TO_B 5 5 0 5 5 1000000
+      append_result UDP B_TO_A 5 5 0 5 5 1000000
+      record_failure UDP A_TO_B 10 1 'unable to allocate local socket buffer'
+      ;;
+    evaluated_with_transport_error)
+      append_healthy_pair TCP 5 5
+      append_healthy_pair UDP 5 5
+      record_failure UDP A_TO_B 10 1 'unable to read from stream socket'
+      ;;
+    *) fail "unknown result matrix scenario: $scenario" ;;
+  esac
+}
+
+test_result_decision_matrix() {
+  local scenario expected_state expected_tcp_evidence expected_udp_evidence
+  local expected_preferred expected_link_available expected_link_confidence
+  local expected_rec_confidence expected_status
+  local output
+  local matrix=$'tcp_valid_udp_transport|PARTIAL|EVALUABLE|TRANSPORT_FAILED|TCP|false|NONE|HIGH|INCOMPLETE\n'
+  matrix+=$'udp_valid_tcp_transport|PARTIAL|TRANSPORT_FAILED|EVALUABLE|UDP|false|NONE|HIGH|INCOMPLETE\n'
+  matrix+=$'both_transport_failed|FAILED|TRANSPORT_FAILED|TRANSPORT_FAILED|FIX LINK|false|NONE|MEDIUM|NO VALID DATA\n'
+  matrix+=$'tcp_valid_udp_budget|PARTIAL|EVALUABLE|INSUFFICIENT|INCONCLUSIVE|false|NONE|NONE|INCOMPLETE\n'
+  matrix+=$'udp_valid_tcp_environment|PARTIAL|INSUFFICIENT|EVALUABLE|INCONCLUSIVE|false|NONE|NONE|INCOMPLETE\n'
+  matrix+=$'tcp_materially_better|COMPLETE|EVALUABLE|EVALUABLE|TCP|true|MEDIUM|MEDIUM|DEGRADED\n'
+  matrix+=$'udp_materially_better|COMPLETE|EVALUABLE|EVALUABLE|UDP|true|MEDIUM|MEDIUM|DEGRADED\n'
+  matrix+=$'equal_transports|COMPLETE|EVALUABLE|EVALUABLE|EITHER|true|MEDIUM|MEDIUM|HEALTHY\n'
+  matrix+=$'single_direction_udp|PARTIAL|EVALUABLE|INSUFFICIENT|INCONCLUSIVE|false|NONE|NONE|INCOMPLETE\n'
+  matrix+=$'adaptive_transport_evidence|PARTIAL|EVALUABLE|TRANSPORT_FAILED|TCP|false|NONE|HIGH|INCOMPLETE\n'
+  matrix+=$'degradation_with_environment_error|COMPLETE|EVALUABLE|EVALUABLE|TCP|true|MEDIUM|MEDIUM|DEGRADED\n'
+  matrix+=$'evaluated_with_transport_error|COMPLETE|EVALUABLE|EVALUABLE|EITHER|true|MEDIUM|MEDIUM|HEALTHY'
+
+  while IFS='|' read -r scenario expected_state expected_tcp_evidence \
+    expected_udp_evidence expected_preferred expected_link_available \
+    expected_link_confidence expected_rec_confidence expected_status; do
+    reset_fixture
+    setup_result_matrix_case "$scenario"
+    calculate_results
+    output=$(print_results)
+    assert_equal "$expected_state" "$RESULT_STATE" "$scenario result state"
+    assert_equal "$expected_tcp_evidence" "$TCP_EVIDENCE_STATE" \
+      "$scenario TCP evidence"
+    assert_equal "$expected_udp_evidence" "$UDP_EVIDENCE_STATE" \
+      "$scenario UDP evidence"
+    assert_equal "$expected_preferred" "$PREFERRED" "$scenario preference"
+    assert_equal "$expected_link_available" "$LINK_HEALTH_AVAILABLE" \
+      "$scenario combined health availability"
+    assert_equal "$expected_link_confidence" "$CONFIDENCE" \
+      "$scenario combined health confidence"
+    assert_equal "$expected_rec_confidence" "$RECOMMENDATION_CONFIDENCE" \
+      "$scenario recommendation confidence"
+    assert_equal "$expected_status" "$STATUS" "$scenario status"
+    if [[ "$expected_link_available" == false ]]; then
+      assert_contains 'LINK HEALTH:   not produced' "$output" \
+        "$scenario does not fabricate combined health"
+    fi
+  done <<<"$matrix"
+
+  reset_fixture
+  setup_result_matrix_case tcp_valid_udp_transport
+  calculate_results
+  output=$(print_results)
+  assert_contains 'UDP SCORE:     unavailable (transport failed)' "$output" \
+    'transport failure is distinct from a missing score'
+  assert_contains 'Preferred:     TCP' "$output" \
+    'partial combined data can still select TCP'
+  assert_contains 'TCP produced valid bidirectional samples.' "$output" \
+    'partial recommendation explains the positive TCP evidence'
+  assert_contains 'UDP failed in both directions' "$output" \
+    'partial recommendation explains the negative UDP evidence'
+  assert_contains 'LINK CONFIDENCE: NONE' "$output" \
+    'partial result has no combined-score confidence'
+  assert_contains 'RECOMMENDATION CONFIDENCE: HIGH' "$output" \
+    'partial transport selection has explicit independent confidence'
+
+  MAX_CPU=1.7786940454371938
+  output=$(print_results)
+  assert_contains 'Peak CPU:      1.78%' "$output" \
+    'peak CPU is formatted to two decimal places'
+  assert_not_contains 'Peak CPU:      1.7786940454371938%' "$output" \
+    'peak CPU does not expose raw sampling precision'
+
+  reset_fixture
+  setup_result_matrix_case degradation_with_environment_error
+  calculate_results
+  assert_contains 'UDP-DEGRADED' "$LABELS" \
+    'measured degradation remains a score classification'
+  assert_not_contains 'UDP-TRANSPORT-ERROR' "$LABELS" \
+    'environment failure is not mislabeled as transport failure'
+  assert_equal '40' "$UDP_SCORE" \
+    'environment failure does not add a transport score penalty'
+
+  reset_fixture
+  setup_result_matrix_case evaluated_with_transport_error
+  calculate_results
+  assert_contains 'UDP-TRANSPORT-ERROR' "$LABELS" \
+    'transport execution error remains distinct after valid samples'
+  assert_not_contains 'UDP-DEGRADED' "$LABELS" \
+    'one transport execution error is not mislabeled as measured degradation'
 }
 
 test_scores_and_recommendation() {
@@ -726,7 +925,7 @@ test_preferred_transport_model() {
   assert_preference EITHER 100 100 HEALTHY '' 'A-B equal healthy scores'
   assert_preference EITHER 98 100 HEALTHY '' 'A-C near-equal healthy scores'
   assert_preference EITHER 100 100 HEALTHY '' 'A-D equal healthy scores'
-  assert_preference HY2 75 93 HEALTHY ASYMMETRIC \
+  assert_preference UDP 75 93 HEALTHY ASYMMETRIC \
     'A-E material UDP advantage'
   assert_preference TCP 75 40 DEGRADED \
     'TCP-DEGRADED,UDP-DEGRADED,ASYMMETRIC' \
@@ -740,9 +939,9 @@ test_preferred_transport_model() {
     'equal healthy transports remain neutral'
   assert_preference TCP 90 60 DEGRADED UDP-DEGRADED \
     'degraded UDP with healthy TCP'
-  assert_preference HY2 60 90 DEGRADED TCP-DEGRADED \
+  assert_preference UDP 60 90 DEGRADED TCP-DEGRADED \
     'degraded TCP with healthy UDP'
-  assert_preference HY2 95 80 DEGRADED TCP-DEGRADED \
+  assert_preference UDP 95 80 DEGRADED TCP-DEGRADED \
     'one-sided TCP degradation overrides a conflicting score margin'
   assert_preference TCP 80 95 DEGRADED UDP-DEGRADED \
     'one-sided UDP degradation overrides a conflicting score margin'
@@ -750,7 +949,7 @@ test_preferred_transport_model() {
     'TCP-DEGRADED,UDP-DEGRADED' 'both transports severely degraded'
   assert_preference TCP 90 20 POOR UDP-DEGRADED \
     'POOR status does not override usable TCP'
-  assert_preference HY2 20 90 POOR TCP-DEGRADED \
+  assert_preference UDP 20 90 POOR TCP-DEGRADED \
     'POOR status does not override usable UDP'
   assert_preference FIX\ LINK 60 50 DEGRADED \
     'TCP-DEGRADED,UDP-DEGRADED' 'both scores below usable threshold'
@@ -886,7 +1085,7 @@ test_directional_asymmetry_regressions() {
   assert_equal '93' "$UDP_SCORE" 'A-E fixture UDP score remains unchanged'
   assert_equal '80' "$LINK_HEALTH" 'A-E fixture link health'
   assert_equal 'HEALTHY' "$STATUS" 'A-E fixture status'
-  assert_equal 'HY2' "$PREFERRED" 'A-E fixture preferred transport'
+  assert_equal 'UDP' "$PREFERRED" 'A-E fixture preferred transport'
   assert_contains 'ASYMMETRIC' "$LABELS" 'A-E asymmetric label'
   PEER=fixture-ae
   PORT=55000
@@ -1597,15 +1796,16 @@ EOF
     MODE=server; PORT=""; SERVER_WAIT=30
     random_port() { printf "54036\\n"; }
     setup_firewall() { FIREWALL_STATUS="temporary TCP/UDP allow added"; }
-    timeout() { return 124; }
+    timeout() { return 0; }
     run_server
   ' _ "$BENCHMARK_SCRIPT")
   assert_contains 'Port:         54036 (TCP and UDP)' "$output" \
     'server output shows generated port'
   assert_contains 'Firewall:     temporary TCP/UDP allow added' "$output" \
     'server output shows firewall lifecycle'
-  assert_contains 'SERVER_IP --port 54036' "$output" \
-    'server output gives copyable placeholder command'
+  assert_contains \
+    'https://raw.githubusercontent.com/404-git-404/404-vps-tools/main/protocol-benchmark.sh) SERVER_IP --port 54036' \
+    "$output" 'server output gives a current copyable placeholder command'
   assert_contains 'idle timeout before the first client session' "$output" \
     'server distinguishes first-client idle timeout'
 }
@@ -1615,7 +1815,6 @@ test_server_supervisor_lifecycle() {
   local case_dir
   local output
   local status
-  local index
 
   cat >"$helper" <<'EOF'
 #!/usr/bin/env bash
@@ -1636,20 +1835,39 @@ next_value() {
   sed -n "${current}p" "$value_file"
 }
 
-date() {
-  [[ "${1:-}" == '+%s' ]] || command date "$@"
-  next_value "$case_dir/times"
-}
-
 timeout() {
-  local result
-  printf '%s\n' "$2" >>"$case_dir/waits"
+  local result scenario
+  printf '%s\n' "$*" >>"$case_dir/commands"
+  scenario=$(next_value "$case_dir/scenarios")
+  case "$scenario" in
+    completed)
+      printf '{"end": {"sum_received": {}}}\n'
+      return 0
+      ;;
+    idle)
+      return 0
+      ;;
+    active-timeout)
+      return 124
+      ;;
+    killed-timeout)
+      return 137
+      ;;
+  esac
   result=$(next_value "$case_dir/statuses")
   return "$result"
 }
 
 sleep() { :; }
-setup_firewall() { FIREWALL_STATUS='unchanged (test)'; }
+setup_firewall() {
+  FIREWALL_STATUS='temporary TCP/UDP allow added (test)'
+  FIREWALL_RULE_ADDED=true
+}
+cleanup_firewall() {
+  [[ "$FIREWALL_RULE_ADDED" == true ]] || return 0
+  printf 'cleaned\n' >>"$case_dir/cleanup"
+  FIREWALL_RULE_ADDED=false
+}
 MODE=server
 PORT=55120
 SERVER_WAIT=600
@@ -1657,38 +1875,84 @@ run_server
 EOF
   chmod +x "$helper"
 
-  case_dir="$TEST_TEMP_DIR/server-complete"
+  case_dir="$TEST_TEMP_DIR/server-four-stage"
   mkdir -p "$case_dir"
   : >"$case_dir/statuses"
-  for (( index=1; index<=8; index++ )); do printf '0\n' >>"$case_dir/statuses"; done
-  printf '124\n' >>"$case_dir/statuses"
-  printf '1000\n1000\n' >"$case_dir/times"
-  for (( index=1; index<=8; index++ )); do
-    printf '%s\n%s\n' "$((1000 + index))" "$((1000 + index))" \
-      >>"$case_dir/times"
-  done
+  printf 'completed\ncompleted\ncompleted\ncompleted\nidle\n' \
+    >"$case_dir/scenarios"
   output=$(bash "$helper" "$BENCHMARK_SCRIPT" "$case_dir" 2>&1)
-  assert_contains 'Completed test 8; waiting 20s for the next stage.' "$output" \
-    'complete multi-stage benchmark keeps restarting one-shot listener'
-  assert_contains 'idle timeout after the last test (20s, 8 completed)' "$output" \
+  assert_contains 'Completed test 4; waiting 20s for the next stage.' "$output" \
+    'TCP forward/reverse and UDP forward/reverse all complete'
+  assert_contains 'idle timeout after the last test (20s, 4 completed)' "$output" \
     'server reports last-test idle timeout explicitly'
-  assert_equal '9' "$(wc -l <"$case_dir/waits" | tr -d ' ')" \
-    'eight sessions plus final idle watchdog are supervised'
+  assert_equal '5' "$(wc -l <"$case_dir/commands" | tr -d ' ')" \
+    'four sessions plus final idle listener are supervised'
+  assert_contains '--idle-timeout 600' "$(sed -n '1p' "$case_dir/commands")" \
+    'first client keeps the 600-second idle wait'
+  assert_contains '--idle-timeout 20' "$(sed -n '2p' "$case_dir/commands")" \
+    'subsequent listeners use the 20-second idle wait'
+  assert_contains '--kill-after=5 720 iperf3 -s -1' \
+    "$(sed -n '1p' "$case_dir/commands")" \
+    'first listener reserves the independent active-session allowance'
+  assert_contains '--kill-after=5 140 iperf3 -s -1' \
+    "$(sed -n '2p' "$case_dir/commands")" \
+    'next listener is not bounded by the old 20-second idle deadline'
+  assert_true 'client cooldown stays below the expected server idle window' \
+    test "$DEFAULT_COOLDOWN" -lt "$SERVER_SESSION_IDLE"
+  assert_equal '1' "$(wc -l <"$case_dir/cleanup" | tr -d ' ')" \
+    'normal idle exit cleans temporary UFW rules once'
 
-  case_dir="$TEST_TEMP_DIR/server-gap"
+  case_dir="$TEST_TEMP_DIR/server-crosses-old-idle-deadline"
   mkdir -p "$case_dir"
-  printf '0\n0\n124\n' >"$case_dir/statuses"
-  printf '1000\n1000\n1002\n1014\n1016\n1016\n' >"$case_dir/times"
+  : >"$case_dir/statuses"
+  printf 'completed\ncompleted\nidle\n' >"$case_dir/scenarios"
   output=$(bash "$helper" "$BENCHMARK_SCRIPT" "$case_dir" 2>&1)
-  assert_equal $'600\n8\n20' "$(cat "$case_dir/waits")" \
-    '12-second inter-test gap remains inside the 20-second watchdog'
   assert_contains 'Completed test 2' "$output" \
-    'server remains available after a legitimate 12-second logical gap'
+    'a started session can complete after the prior 20-second deadline'
+  assert_not_contains 'active session timeout' "$output" \
+    'old idle deadline cannot kill an active session'
+  assert_contains '--kill-after=5 140 iperf3 -s -1' \
+    "$(sed -n '2p' "$case_dir/commands")" \
+    'active work receives 120 seconds beyond its idle acceptance window'
+
+  case_dir="$TEST_TEMP_DIR/server-idle-after-one"
+  mkdir -p "$case_dir"
+  : >"$case_dir/statuses"
+  printf 'completed\nidle\n' >"$case_dir/scenarios"
+  output=$(bash "$helper" "$BENCHMARK_SCRIPT" "$case_dir" 2>&1)
+  assert_contains 'idle timeout after the last test (20s, 1 completed)' "$output" \
+    'no next connection still closes after the post-test idle timeout'
+
+  case_dir="$TEST_TEMP_DIR/server-first-idle"
+  mkdir -p "$case_dir"
+  : >"$case_dir/statuses"
+  printf 'idle\n' >"$case_dir/scenarios"
+  output=$(bash "$helper" "$BENCHMARK_SCRIPT" "$case_dir" 2>&1)
+  assert_contains 'idle timeout before the first client session' "$output" \
+    'no first connection still closes after SERVER_WAIT'
+  assert_contains '--idle-timeout 600' "$(cat "$case_dir/commands")" \
+    'first-client timeout remains SERVER_WAIT'
+
+  for timeout_scenario in active-timeout killed-timeout; do
+    case_dir="$TEST_TEMP_DIR/server-$timeout_scenario"
+    mkdir -p "$case_dir"
+    : >"$case_dir/statuses"
+    printf '%s\n' "$timeout_scenario" >"$case_dir/scenarios"
+    set +e
+    output=$(bash "$helper" "$BENCHMARK_SCRIPT" "$case_dir" 2>&1)
+    status=$?
+    set -e
+    assert_equal '1' "$status" "$timeout_scenario exits unsuccessfully"
+    assert_contains 'active session timeout (hard limit 720s: 600s idle window + 120s active allowance)' "$output" \
+      "$timeout_scenario has a distinct exit reason"
+    assert_equal '1' "$(wc -l <"$case_dir/cleanup" | tr -d ' ')" \
+      "$timeout_scenario cleans temporary UFW rules"
+  done
 
   case_dir="$TEST_TEMP_DIR/server-recoverable-error"
   mkdir -p "$case_dir"
-  printf '0\n1\n0\n124\n' >"$case_dir/statuses"
-  printf '1000\n1000\n1001\n1002\n1003\n1004\n1004\n' >"$case_dir/times"
+  printf '1\n' >"$case_dir/statuses"
+  printf 'completed\nerror\ncompleted\nidle\n' >"$case_dir/scenarios"
   output=$(bash "$helper" "$BENCHMARK_SCRIPT" "$case_dir" 2>&1)
   assert_contains 'retrying listener (1/3)' "$output" \
     'one failed iperf3 session is recoverable'
@@ -1700,7 +1964,7 @@ EOF
   case_dir="$TEST_TEMP_DIR/server-unrecoverable-error"
   mkdir -p "$case_dir"
   printf '1\n1\n1\n' >"$case_dir/statuses"
-  printf '1000\n1000\n1001\n1002\n' >"$case_dir/times"
+  printf 'error\nerror\nerror\n' >"$case_dir/scenarios"
   set +e
   output=$(bash "$helper" "$BENCHMARK_SCRIPT" "$case_dir" 2>&1)
   status=$?
@@ -2238,6 +2502,7 @@ test_independent_adaptive_stop_diagnostics
 test_failure_control_flow_and_evaluability
 test_server_disappearance_classification
 test_failure_reason_and_reservation_lifecycle
+test_result_decision_matrix
 test_scores_and_recommendation
 test_preferred_transport_model
 test_tcp_retransmission_scoring_model

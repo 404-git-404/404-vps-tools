@@ -74,9 +74,20 @@ run_closed_port_failure() {
   grep -Fq 'Traffic used:  0.0 MB' "$log" || fail "$label reported traffic for immediate refusal."
   grep -Fq 'Budget stop:   false' "$log" || fail "$label did not distinguish failure from budget denial."
   ! grep -Fq 'Budget stop: no further' "$log" || fail "$label produced a false budget stop."
-  ! grep -Fq 'TCP SCORE:' "$log" || fail "$label produced a false TCP score."
-  ! grep -Fq 'UDP SCORE:' "$log" || fail "$label produced a false UDP score."
-  ! grep -Fq 'LINK HEALTH:' "$log" || fail "$label produced a false link score."
+  grep -Fq 'TCP SCORE:     unavailable (insufficient evidence)' "$log" ||
+    fail "$label did not report unavailable TCP evidence."
+  grep -Fq 'UDP SCORE:     unavailable (insufficient evidence)' "$log" ||
+    fail "$label did not report unavailable UDP evidence."
+  grep -Fq 'LINK HEALTH:   not produced' "$log" ||
+    fail "$label did not suppress combined link health."
+  ! grep -Eq '^TCP SCORE:[[:space:]]*[0-9]+' "$log" ||
+    fail "$label produced a false numeric TCP score."
+  ! grep -Eq '^UDP SCORE:[[:space:]]*[0-9]+' "$log" ||
+    fail "$label produced a false numeric UDP score."
+  ! grep -Eq '^LINK HEALTH:[[:space:]]*[0-9]+' "$log" ||
+    fail "$label produced a false numeric link score."
+  grep -Fq 'Preferred:     INCONCLUSIVE' "$log" ||
+    fail "$label produced an unsupported transport preference."
   ! grep -Fq 'FIX LINK' "$log" || fail "$label produced a false transport recommendation."
   ! grep -Eq '^  (TCP|UDP)[[:space:]]+[^[:space:]]+[[:space:]]+10%' "$log" ||
     fail "$label escalated after every 5 percent test failed."
@@ -197,10 +208,70 @@ run_real_pair() {
   printf 'PASS: %s real bidirectional TCP/UDP benchmark\n' "$label"
 }
 
+run_active_session_deadline_regression() {
+  local image='debian:12-slim'
+  local label='debian12-active-deadline'
+  local server="$RUN_ID-$label-server"
+  local server_log="$TEMP_DIR/$label-server.log"
+  local port=55220
+  local status
+  local attempt
+
+  CONTAINERS+=("$server")
+  docker run -d --name "$server" --network "$NETWORK_NAME" \
+    --mount "type=bind,src=$REPO_ROOT,dst=/work,readonly" \
+    "$image" sh -ec "exec bash /work/protocol-benchmark.sh --server \
+      --port $port --server-wait 30" >/dev/null
+  for (( attempt=1; attempt<=120; attempt++ )); do
+    docker logs "$server" >"$server_log" 2>&1 || true
+    grep -Fq "Port:         $port (TCP and UDP)" "$server_log" && break
+    docker inspect -f '{{.State.Running}}' "$server" 2>/dev/null | grep -qx true ||
+      fail "$label server exited before becoming ready."
+    sleep 1
+  done
+  grep -Fq "Port:         $port (TCP and UDP)" "$server_log" ||
+    fail "$label server did not become ready."
+
+  docker exec "$server" iperf3 -c 127.0.0.1 -p "$port" -J -t 1 \
+    >"$TEMP_DIR/$label-first.json"
+  for (( attempt=1; attempt<=20; attempt++ )); do
+    docker logs "$server" >"$server_log" 2>&1 || true
+    grep -Fq 'Completed test 1; waiting 20s for the next stage.' \
+      "$server_log" && break
+    sleep 1
+  done
+  grep -Fq 'Completed test 1; waiting 20s for the next stage.' "$server_log" ||
+    fail "$label first stage was not completed."
+
+  docker exec "$server" iperf3 -c 127.0.0.1 -p "$port" -J -t 25 \
+    >"$TEMP_DIR/$label-crossing.json" || {
+      docker logs "$server" >&2 || true
+      fail "$label active session was killed at the old 20-second idle deadline."
+    }
+  docker logs "$server" >"$server_log" 2>&1 || true
+  grep -Fq 'Completed test 2; waiting 20s for the next stage.' "$server_log" ||
+    fail "$label crossing session was not counted as completed."
+  ! grep -Fq 'active session timeout' "$server_log" ||
+    fail "$label misclassified the crossing session as an active timeout."
+
+  set +e
+  timeout 30 docker wait "$server" >"$TEMP_DIR/$label-server-status"
+  status=$?
+  set -e
+  (( status == 0 )) || fail "$label server did not close after its final idle window."
+  [[ "$(cat "$TEMP_DIR/$label-server-status")" == '0' ]] ||
+    fail "$label server exited unsuccessfully."
+  docker logs "$server" >"$server_log" 2>&1 || true
+  grep -Fq 'idle timeout after the last test (20s, 2 completed)' "$server_log" ||
+    fail "$label final idle timeout was not reported accurately."
+  printf 'PASS: Debian 12 active session crosses old idle deadline\n'
+}
+
 run_closed_port_failure 'debian:13-slim' 'debian13'
 run_closed_port_failure 'alpine:3.21' 'alpine321'
 run_closed_port_failure 'alpine:3.22' 'alpine322'
 run_alpine324_dependency_probe
+run_active_session_deadline_regression
 run_real_pair 'debian:12-slim' 'debian12'
 run_real_pair 'alpine:3.23' 'alpine323'
 run_real_pair 'alpine:3.24' 'alpine324'

@@ -64,7 +64,7 @@ mapping_for() {
 
   {
     printf '%s\n' "set -Eeuo pipefail"
-    printf '%s\n' "SMARTDNS_RELEASE_BASE='https://github.com/404-git-404/404notfound/releases/download/smartdns-debian-pinned-2026-07'"
+    printf '%s\n' "SMARTDNS_RELEASE_BASE='https://github.com/404-git-404/404-vps-tools/releases/download/smartdns-debian-pinned-2026-07'"
     printf '%s\n' "SMARTDNS_EXPECTED_VERSION=''; SMARTDNS_CONFIG_VARIANT=''; SMARTDNS_ASSET_NAME=''; SMARTDNS_EXPECTED_SHA256=''; SMARTDNS_DOWNLOAD_URL=''"
     printf '%s\n' "EXPECTED_VERSION=''; CONFIG_VARIANT=''; ASSET_NAME=''; EXPECTED_SHA256=''; DOWNLOAD_URL=''"
     printf '%s\n' 'die() { printf "%s\n" "$*" >&2; exit 1; }'
@@ -118,7 +118,7 @@ test_fixed_mapping() {
       esac
       [[ "$installer_result" == "$expected|"* ]] ||
         fail "固定映射错误（$os_version/$architecture）：$installer_result"
-      [[ "$installer_result" == *'https://github.com/404-git-404/404notfound/releases/download/smartdns-debian-pinned-2026-07/'* ]] ||
+      [[ "$installer_result" == *'https://github.com/404-git-404/404-vps-tools/releases/download/smartdns-debian-pinned-2026-07/'* ]] ||
         fail "固定 Release URL 错误（$os_version/$architecture）。"
     done
   done

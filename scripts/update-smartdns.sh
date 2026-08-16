@@ -12,7 +12,7 @@ umask 077
 readonly CONFIG_TARGET='/etc/smartdns/smartdns.conf'
 readonly CA_FILE='/etc/ssl/certs/ca-certificates.crt'
 readonly SMARTDNS_RELEASE_TAG='smartdns-debian-pinned-2026-07'
-readonly SMARTDNS_RELEASE_BASE='https://github.com/404-git-404/404notfound/releases/download/smartdns-debian-pinned-2026-07'
+readonly SMARTDNS_RELEASE_BASE='https://github.com/404-git-404/404-vps-tools/releases/download/smartdns-debian-pinned-2026-07'
 readonly IPV6_DISABLE_CONFIG='/etc/sysctl.d/99-disable-ipv6.conf'
 readonly NETWORK_STACK_UNIT='/etc/systemd/system/404-network-stack.service'
 readonly NETWORK_STACK_UNIT_NAME='404-network-stack.service'
@@ -983,7 +983,7 @@ install_ipv4_network_stack_unit() {
 
   cat >"$staged_unit" <<'EOF'
 [Unit]
-Description=Apply 404notfound IPv4-only network stack
+Description=Apply 404-vps-tools IPv4-only network stack
 After=networking.service
 Before=smartdns.service sing-box.service
 
