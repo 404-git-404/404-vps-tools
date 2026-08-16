@@ -4,7 +4,27 @@ set -Eeuo pipefail
 
 readonly PROGRAM_NAME='domain-check'
 readonly USAGE_TEXT='Usage: domain-check domain1.com/domain2.com/domain3.com'
-readonly MAX_CONCURRENCY=8
+
+detect_max_concurrency() {
+  local cpu_count=''
+
+  if command -v nproc >/dev/null 2>&1; then
+    cpu_count=$(nproc 2>/dev/null || :)
+  fi
+  if [[ ! "$cpu_count" =~ ^[1-9][0-9]*$ ]] &&
+    command -v getconf >/dev/null 2>&1; then
+    cpu_count=$(getconf _NPROCESSORS_ONLN 2>/dev/null || :)
+  fi
+  [[ "$cpu_count" =~ ^[1-9][0-9]*$ ]] || cpu_count=1
+  case "$cpu_count" in
+    1|2|3|4) ;;
+    *) cpu_count=4 ;;
+  esac
+  printf '%s\n' "$cpu_count"
+}
+
+MAX_CONCURRENCY=$(detect_max_concurrency)
+readonly MAX_CONCURRENCY
 readonly DOMAIN_HARD_TIMEOUT=90
 readonly DOMAIN_TERMINATE_GRACE=2
 readonly DNS_TIMEOUT=6
@@ -12,6 +32,13 @@ readonly TCP_TIMEOUT=6
 readonly TLS_TIMEOUT=4
 readonly HTTP_TIMEOUT=10
 readonly HTTP_USER_AGENT='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0 Safari/537.36'
+readonly -a PROFILE_HEADERS=(
+  DOMAIN TOTAL DNS_A DNS_AAAA DNS_CNAME TCP TLS_PRIMARY TLS_FALLBACK
+  READY_LOCK_WAIT_1 READY_PROBE_1 READY_LOCK_WAIT_2 READY_PROBE_2
+  READY_LOCK_WAIT_3 READY_PROBE_3
+  HTTP_1 HTTP_1_EXIT HTTP_1_CODE HTTP_2 HTTP_2_EXIT HTTP_2_CODE
+  HTTP_3 HTTP_3_EXIT HTTP_3_CODE
+)
 
 declare -a DOMAIN_INPUTS=()
 declare -a WORKER_PIDS=()
@@ -50,6 +77,8 @@ CERTIFICATE_WARNING=''
 HTML_LOG_PATH=''
 HTML_ESCAPED_VALUE=''
 HTML_CSS_CLASS=''
+PROFILE_ENABLED=false
+PROFILE_LOG_PATH=''
 BORDER_HORIZONTAL='-'
 BORDER_VERTICAL='|'
 BORDER_TOP_LEFT='+'
@@ -69,6 +98,66 @@ readonly -a TABLE_HEADERS=(
 )
 readonly -a TABLE_MIN_WIDTHS=(18 15 6 6 4 9 7 4 4 8 6)
 readonly -a TABLE_MAX_WIDTHS=(48 39 0 0 0 0 0 0 0 0 0)
+
+initialize_profile() {
+  PROFILE_ENABLED=false
+  [[ ${DOMAIN_CHECK_PROFILE:-0} == '1' ]] && PROFILE_ENABLED=true
+  return 0
+}
+
+profile_now_ns() {
+  local timestamp=''
+  local seconds=''
+
+  timestamp=$(date +%s%N 2>/dev/null || :)
+  if [[ "$timestamp" =~ ^[0-9]{16,}$ ]]; then
+    printf '%s\n' "$timestamp"
+    return 0
+  fi
+  seconds=$(date +%s 2>/dev/null || :)
+  [[ "$seconds" =~ ^[0-9]+$ ]] || return 1
+  printf '%s000000000\n' "$seconds"
+}
+
+profile_elapsed_ms() {
+  local started_ns=$1
+  local finished_ns=''
+  local elapsed_ns
+
+  finished_ns=$(profile_now_ns) || {
+    printf '%s\n' '-'
+    return 0
+  }
+  if [[ ! "$started_ns" =~ ^[0-9]+$ ]] ||
+    (( finished_ns < started_ns )); then
+    printf '%s\n' '-'
+    return 0
+  fi
+  elapsed_ns=$(( finished_ns - started_ns ))
+  printf '%d\n' "$(( (elapsed_ns + 500000) / 1000000 ))"
+}
+
+write_profile_values() {
+  local index=$1
+  shift
+
+  [[ "$PROFILE_ENABLED" == true ]] || return 0
+  (IFS=$'\t'; printf '%s\n' "$*") >"$TEMP_DIR/profile-$index"
+}
+
+write_empty_profile_result() {
+  local index=$1
+  local domain=$2
+  local total=${3:--}
+  local -a values=("$domain" "$total")
+
+  [[ "$PROFILE_ENABLED" == true ]] || return 0
+  [[ -s "$TEMP_DIR/profile-$index" ]] && return 0
+  while (( ${#values[@]} < ${#PROFILE_HEADERS[@]} )); do
+    values+=('-')
+  done
+  write_profile_values "$index" "${values[@]}"
+}
 
 print_usage() {
   printf '%s\n' "$USAGE_TEXT" >&2
@@ -795,9 +884,12 @@ check_domain() {
   local http_check_attempted=false
   local ready_command_status=0
   local ready_check_attempted=false
+  local primary_command_ok=false
+  local primary_fast_path=false
+  local fallback_command_ok=false
   local tls_command_ok=false
   local tls_handshake_available=false
-  local x25519_command_ok=false
+  local tls_evidence_file=''
   local openssl_target=''
   local curl_resolve=''
   local attempt
@@ -812,7 +904,21 @@ check_domain() {
   local certificate_enddate=''
   local expiry_epoch=''
   local current_epoch=''
+  local profile_total_started=''
+  local profile_stage_started=''
+  local profile_total='-'
+  local profile_dns_a='-'
+  local profile_dns_aaaa='-'
+  local profile_dns_cname='-'
+  local profile_tcp='-'
+  local profile_tls_primary='-'
+  local profile_tls_fallback='-'
   local -a ready_samples=()
+  local -a profile_ready_lock_wait=('-' '-' '-')
+  local -a profile_ready_probe=('-' '-' '-')
+  local -a profile_http=('-' '-' '-')
+  local -a profile_http_exit=('-' '-' '-')
+  local -a profile_http_code=('-' '-' '-')
   local -a curl_common_args=()
   local -a curl_address_family=()
   local ready_output_file
@@ -820,8 +926,8 @@ check_domain() {
   local dns_aaaa_file="$TEMP_DIR/dns-aaaa-$index"
   local dns_cname_file="$TEMP_DIR/dns-cname-$index"
   local tcp_file="$TEMP_DIR/tcp-$index"
-  local tls_file="$TEMP_DIR/tls-$index"
-  local x25519_file="$TEMP_DIR/x25519-$index"
+  local tls_primary_file="$TEMP_DIR/tls-primary-$index"
+  local tls_fallback_file="$TEMP_DIR/tls-fallback-$index"
   local leaf_certificate_file="$TEMP_DIR/leaf-certificate-$index"
   local http_output_file
   local http_header_file
@@ -831,19 +937,37 @@ check_domain() {
   ACTIVE_PID_FILE="$TEMP_DIR/active-pid-$index"
   READY_SAMPLE_LOCK_HELD=false
   REASONS=''
+  if [[ "$PROFILE_ENABLED" == true ]]; then
+    profile_total_started=$(profile_now_ns || :)
+  fi
 
   if command -v dig >/dev/null 2>&1; then
+    [[ "$PROFILE_ENABLED" != true ]] || profile_stage_started=$(profile_now_ns || :)
     run_network_command "$dns_a_file" "$DNS_TIMEOUT" \
       dig +time=5 +tries=1 +short A "$domain" || :
+    [[ "$PROFILE_ENABLED" != true ]] || \
+      profile_dns_a=$(profile_elapsed_ms "$profile_stage_started")
+    [[ "$PROFILE_ENABLED" != true ]] || profile_stage_started=$(profile_now_ns || :)
     run_network_command "$dns_aaaa_file" "$DNS_TIMEOUT" \
       dig +time=5 +tries=1 +short AAAA "$domain" || :
+    [[ "$PROFILE_ENABLED" != true ]] || \
+      profile_dns_aaaa=$(profile_elapsed_ms "$profile_stage_started")
+    [[ "$PROFILE_ENABLED" != true ]] || profile_stage_started=$(profile_now_ns || :)
     run_network_command "$dns_cname_file" "$DNS_TIMEOUT" \
       dig +time=5 +tries=1 +short CNAME "$domain" || :
+    [[ "$PROFILE_ENABLED" != true ]] || \
+      profile_dns_cname=$(profile_elapsed_ms "$profile_stage_started")
   else
+    [[ "$PROFILE_ENABLED" != true ]] || profile_stage_started=$(profile_now_ns || :)
     run_network_command "$dns_a_file" "$DNS_TIMEOUT" \
       getent ahostsv4 "$domain" || :
+    [[ "$PROFILE_ENABLED" != true ]] || \
+      profile_dns_a=$(profile_elapsed_ms "$profile_stage_started")
+    [[ "$PROFILE_ENABLED" != true ]] || profile_stage_started=$(profile_now_ns || :)
     run_network_command "$dns_aaaa_file" "$DNS_TIMEOUT" \
       getent ahostsv6 "$domain" || :
+    [[ "$PROFILE_ENABLED" != true ]] || \
+      profile_dns_aaaa=$(profile_elapsed_ms "$profile_stage_started")
     printf '' >"$dns_cname_file"
   fi
   ipv4=$(first_ipv4_from_file "$dns_a_file")
@@ -861,11 +985,14 @@ check_domain() {
 
   reset_http_retry_state
   if [[ "$dns_status" == 'PASS' ]]; then
+    [[ "$PROFILE_ENABLED" != true ]] || profile_stage_started=$(profile_now_ns || :)
     if run_network_command "$tcp_file" "$TCP_TIMEOUT" \
       bash -c "exec 3<>\"/dev/tcp/\$1/443\"; exec 3<&-; exec 3>&-" \
         bash "$ip"; then
       tcp_status='PASS'
     fi
+    [[ "$PROFILE_ENABLED" != true ]] || \
+      profile_tcp=$(profile_elapsed_ms "$profile_stage_started")
 
     if [[ "$tcp_status" == 'PASS' ]]; then
       openssl_target=$(openssl_target_for_ip "$ip")
@@ -884,14 +1011,38 @@ check_domain() {
         --user-agent "$HTTP_USER_AGENT" "https://$domain/"
       )
 
-      if run_network_command "$tls_file" "$TLS_TIMEOUT" \
+      [[ "$PROFILE_ENABLED" != true ]] || profile_stage_started=$(profile_now_ns || :)
+      if run_network_command "$tls_primary_file" "$TLS_TIMEOUT" \
         openssl s_client -connect "$openssl_target" -servername "$domain" \
-          -tls1_3 -alpn h2 -verify_hostname "$domain" -verify_return_error \
-          -showcerts; then
+          -tls1_3 -groups X25519 -alpn h2 -verify_hostname "$domain" \
+          -verify_return_error -showcerts; then
+        primary_command_ok=true
+      fi
+      [[ "$PROFILE_ENABLED" != true ]] || \
+        profile_tls_primary=$(profile_elapsed_ms "$profile_stage_started")
+
+      if [[ "$primary_command_ok" == true ]] &&
+        x25519_evidence_present "$tls_primary_file"; then
+        primary_fast_path=true
         tls_command_ok=true
+        tls_evidence_file=$tls_primary_file
+        x25519_status='PASS'
+      else
+        [[ "$PROFILE_ENABLED" != true ]] || \
+          profile_stage_started=$(profile_now_ns || :)
+        if run_network_command "$tls_fallback_file" "$TLS_TIMEOUT" \
+          openssl s_client -connect "$openssl_target" -servername "$domain" \
+            -tls1_3 -alpn h2 -verify_hostname "$domain" \
+            -verify_return_error -showcerts; then
+          fallback_command_ok=true
+        fi
+        [[ "$PROFILE_ENABLED" != true ]] || \
+          profile_tls_fallback=$(profile_elapsed_ms "$profile_stage_started")
+        tls_command_ok=$fallback_command_ok
+        tls_evidence_file=$tls_fallback_file
       fi
 
-      if tls13_evidence_present "$tls_file"; then
+      if tls13_evidence_present "$tls_evidence_file"; then
         tls_handshake_available=true
         tcp_status='PASS'
       fi
@@ -901,13 +1052,13 @@ check_domain() {
         tcp_status='PASS'
       fi
       if [[ "$tls_command_ok" == true ]] &&
-        h2_evidence_present "$tls_file"; then
+        h2_evidence_present "$tls_evidence_file"; then
         h2_status='PASS'
       fi
       if [[ "$tls_command_ok" == true ]] &&
-        certificate_verified_evidence_present "$tls_file"; then
+        certificate_verified_evidence_present "$tls_evidence_file"; then
         certificate_status='PASS'
-        if extract_leaf_certificate "$tls_file" "$leaf_certificate_file" &&
+        if extract_leaf_certificate "$tls_evidence_file" "$leaf_certificate_file" &&
           certificate_enddate=$(openssl x509 -noout -enddate \
             -in "$leaf_certificate_file" 2>/dev/null) &&
           [[ "$certificate_enddate" == notAfter=* ]] &&
@@ -924,34 +1075,40 @@ check_domain() {
       fi
 
       if [[ "$tls_handshake_available" == true ]]; then
-        if run_network_command "$x25519_file" "$TLS_TIMEOUT" \
-          openssl s_client -connect "$openssl_target" -servername "$domain" \
-            -tls1_3 -groups X25519; then
-          x25519_command_ok=true
-        fi
-        if [[ "$x25519_command_ok" == true ]] &&
-          x25519_evidence_present "$x25519_file"; then
-          x25519_status='PASS'
-          tcp_status='PASS'
-        fi
+        [[ "$primary_fast_path" != true ]] || tcp_status='PASS'
 
         # READY deliberately skips CA verification for timing purposes.
         # Certificate trust, hostname, and expiry are validated separately by
-        # the strict OpenSSL check above. Acquire the global lock per sample so
+        # the strict OpenSSL check above. HEAD prevents the serialized READY
+        # probe from downloading a response body. Acquire the global lock per
+        # sample; its scope ends when that HEAD command exits, so
         # a failing target cannot monopolize it across three timeouts.
         ready_check_attempted=true
         for attempt in 1 2 3; do
           attempt_time_appconnect=''
           ready_command_status=0
           ready_output_file="$TEMP_DIR/ready-output-$index-$attempt"
+          [[ "$PROFILE_ENABLED" != true ]] || \
+            profile_stage_started=$(profile_now_ns || :)
           acquire_ready_sample_lock
+          if [[ "$PROFILE_ENABLED" == true ]]; then
+            profile_ready_lock_wait[attempt - 1]=$(
+              profile_elapsed_ms "$profile_stage_started"
+            )
+            profile_stage_started=$(profile_now_ns || :)
+          fi
           if run_network_command "$ready_output_file" "$HTTP_TIMEOUT" \
-            curl --insecure \
+            curl --insecure --head \
               --write-out 'DOMAIN_CHECK_METRICS\t%{http_code}\t%{time_connect}\t%{time_appconnect}\n' \
               "${curl_common_args[@]}"; then
             ready_command_status=0
           else
             ready_command_status=$?
+          fi
+          if [[ "$PROFILE_ENABLED" == true ]]; then
+            profile_ready_probe[attempt - 1]=$(
+              profile_elapsed_ms "$profile_stage_started"
+            )
           fi
           release_ready_sample_lock
           attempt_time_appconnect=$(extract_curl_metric \
@@ -980,6 +1137,8 @@ check_domain() {
           http_command_status=0
           http_output_file="$TEMP_DIR/http-output-$index-$attempt"
           http_header_file="$TEMP_DIR/http-header-$index-$attempt"
+          [[ "$PROFILE_ENABLED" != true ]] || \
+            profile_stage_started=$(profile_now_ns || :)
           if run_network_command "$http_output_file" "$HTTP_TIMEOUT" \
             curl --dump-header "$http_header_file" \
               --write-out 'DOMAIN_CHECK_METRICS\t%{http_code}\t%{time_connect}\t%{time_appconnect}\n' \
@@ -988,8 +1147,17 @@ check_domain() {
           else
             http_command_status=$?
           fi
+          if [[ "$PROFILE_ENABLED" == true ]]; then
+            profile_http[attempt - 1]=$(
+              profile_elapsed_ms "$profile_stage_started"
+            )
+            profile_http_exit[attempt - 1]=$http_command_status
+          fi
 
           attempt_http_code=$(extract_http_code "$http_output_file")
+          if [[ "$PROFILE_ENABLED" == true ]]; then
+            profile_http_code[attempt - 1]=${attempt_http_code:--}
+          fi
           attempt_time_connect=$(extract_curl_metric "$http_output_file" 3)
           if positive_seconds "$attempt_time_connect"; then
             tcp_status='PASS'
@@ -1089,6 +1257,21 @@ check_domain() {
     "$domain" "$ip" "$tls_status" "$x25519_status" "$h2_status" \
     "$ready_ms" "$certificate_days" "$cdn_status" "$http_status" \
     "$redirect_code" "$final_status" "$REASONS" >"$result_file"
+  if [[ "$PROFILE_ENABLED" == true ]]; then
+    profile_total=$(profile_elapsed_ms "$profile_total_started")
+    write_profile_values "$index" \
+      "$domain" "$profile_total" "$profile_dns_a" "$profile_dns_aaaa" \
+      "$profile_dns_cname" "$profile_tcp" "$profile_tls_primary" \
+      "$profile_tls_fallback" \
+      "${profile_ready_lock_wait[0]}" "${profile_ready_probe[0]}" \
+      "${profile_ready_lock_wait[1]}" "${profile_ready_probe[1]}" \
+      "${profile_ready_lock_wait[2]}" "${profile_ready_probe[2]}" \
+      "${profile_http[0]}" "${profile_http_exit[0]}" \
+      "${profile_http_code[0]}" "${profile_http[1]}" \
+      "${profile_http_exit[1]}" "${profile_http_code[1]}" \
+      "${profile_http[2]}" "${profile_http_exit[2]}" \
+      "${profile_http_code[2]}"
+  fi
   rm -f -- "$ACTIVE_PID_FILE"
 }
 
@@ -1139,9 +1322,14 @@ run_domain_worker() {
   local domain=$2
   local completed_pid=''
   local child_status=0
+  local profile_worker_started=''
+  local profile_worker_total='-'
 
   DOMAIN_ACTIVE_PID_FILE="$TEMP_DIR/active-pid-$index"
   trap domain_worker_signal INT TERM
+  if [[ "$PROFILE_ENABLED" == true ]]; then
+    profile_worker_started=$(profile_now_ns || :)
+  fi
 
   check_domain "$index" "$domain" &
   DOMAIN_CHILD_PID=$!
@@ -1166,6 +1354,12 @@ run_domain_worker() {
     if (( child_status != 0 )) || [[ ! -s "$TEMP_DIR/result-$index" ]]; then
       write_domain_failure_result "$index" "$domain" '域名检测内部失败'
     fi
+  fi
+
+  if [[ "$PROFILE_ENABLED" == true &&
+    ! -s "$TEMP_DIR/profile-$index" ]]; then
+    profile_worker_total=$(profile_elapsed_ms "$profile_worker_started")
+    write_empty_profile_result "$index" "$domain" "$profile_worker_total"
   fi
 
   DOMAIN_CHILD_PID=''
@@ -1983,6 +2177,64 @@ write_html_log() {
   printf 'HTML log: %s\n' "$HTML_LOG_PATH" >&2
 }
 
+write_profile_log() {
+  local log_home=${HOME:-}
+  local log_dir
+  local log_timestamp
+  local reservation_attempt
+  local reserved=false
+  local index
+  local row
+
+  [[ "$PROFILE_ENABLED" == true ]] || return 0
+  PROFILE_LOG_PATH=''
+  if [[ -z "$log_home" || "$log_home" != /* ]]; then
+    printf '%s: WARN: unable to create profile log: HOME is not absolute.\n' \
+      "$PROGRAM_NAME" >&2
+    return 0
+  fi
+  log_dir="$log_home/domain-check-logs"
+  if ! mkdir -p -- "$log_dir"; then
+    printf '%s: WARN: unable to create profile log directory: %s\n' \
+      "$PROGRAM_NAME" "$log_dir" >&2
+    return 0
+  fi
+
+  for reservation_attempt in 1 2 3; do
+    log_timestamp=$(date '+%Y%m%d-%H%M%S') || log_timestamp=''
+    if [[ "$log_timestamp" =~ ^[0-9]{8}-[0-9]{6}$ ]]; then
+      PROFILE_LOG_PATH="$log_dir/domain-check-profile-$log_timestamp.tsv"
+      if (set -o noclobber; : >"$PROFILE_LOG_PATH") 2>/dev/null; then
+        reserved=true
+        break
+      fi
+    fi
+    (( reservation_attempt < 3 )) && sleep 1
+  done
+  if [[ "$reserved" != true ]]; then
+    PROFILE_LOG_PATH=''
+    printf '%s: WARN: unable to reserve a unique profile log file in: %s\n' \
+      "$PROGRAM_NAME" "$log_dir" >&2
+    return 0
+  fi
+
+  if ! {
+    (IFS=$'\t'; printf '%s\n' "${PROFILE_HEADERS[*]}")
+    for index in "${!DOMAIN_INPUTS[@]}"; do
+      write_empty_profile_result "$index" "${DOMAIN_INPUTS[$index]}"
+      IFS= read -r row <"$TEMP_DIR/profile-$index"
+      printf '%s\n' "$row"
+    done
+  } >"$PROFILE_LOG_PATH"; then
+    rm -f -- "$PROFILE_LOG_PATH"
+    printf '%s: WARN: unable to write profile log: %s\n' \
+      "$PROGRAM_NAME" "$PROFILE_LOG_PATH" >&2
+    PROFILE_LOG_PATH=''
+    return 0
+  fi
+  printf 'Profile log: %s\n' "$PROFILE_LOG_PATH" >&2
+}
+
 main() {
   local index
   local final_exit_code=0
@@ -1993,6 +2245,7 @@ main() {
   fi
   check_dependencies
   initialize_output_style
+  initialize_profile
 
   if ! TEMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/domain-check.XXXXXXXX"); then
     printf '%s: unable to create temporary directory.\n' "$PROGRAM_NAME" >&2
@@ -2034,6 +2287,7 @@ main() {
     final_exit_code=1
   fi
   write_html_log
+  write_profile_log
   exit "$final_exit_code"
 }
 
