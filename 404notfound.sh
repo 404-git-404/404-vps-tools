@@ -15,8 +15,6 @@ readonly SSH_DROPIN="$SSH_DROPIN_DIR/00-hardening.conf"
 readonly LEGACY_SSH_DROPIN="$SSH_DROPIN_DIR/00-vps-bootstrap.conf"
 readonly AUTHORIZED_KEYS='/root/.ssh/authorized_keys'
 readonly CLOUDFLARE_UFW_TOOL='/usr/local/sbin/update-cloudflare-ufw'
-readonly DOMAIN_CHECK_RELEASE_BASE='https://github.com/404-git-404/404-vps-tools/releases/download/domain-check-latest'
-readonly DOMAIN_CHECK_TARGET='/usr/local/bin/domain-check'
 readonly SAGER_KEY_FINGERPRINT='2C317FBD5D886B4E89BAE8DA6D9152172A2B2F0C'
 readonly SMARTDNS_CONFIG_TARGET='/etc/smartdns/smartdns.conf'
 readonly SMARTDNS_RELEASE_TAG='smartdns-debian-pinned-2026-07'
@@ -75,8 +73,6 @@ SMARTDNS_READY=false
 DNS_READY=false
 SYSTEM_UPDATE_READY=false
 BASE_TOOLS_READY=false
-DOMAIN_CHECK_STATE='未安装'
-DOMAIN_CHECK_INSTALL_STAGE=''
 SSH_ROLLBACK_STATE='未触发'
 FAILURE_STEP=''
 FAILURE_REASON=''
@@ -244,10 +240,6 @@ cleanup() {
   set +e
   if (( exit_code != 0 )) && [[ "$RESULT_REPORTED" == false ]]; then
     print_failure_report >&2
-  fi
-  if [[ -n "$DOMAIN_CHECK_INSTALL_STAGE" &&
-    "$DOMAIN_CHECK_INSTALL_STAGE" == /usr/local/bin/.domain-check.* ]]; then
-    rm -f -- "$DOMAIN_CHECK_INSTALL_STAGE"
   fi
   if [[ -n "$TMP_DIR" && -d "$TMP_DIR" ]]; then
     rm -rf -- "$TMP_DIR"
@@ -3059,65 +3051,6 @@ EOF
   log '系统 DNS 已验证仅使用 127.0.0.1；未配置任何备用 nameserver。'
 }
 
-install_domain_check() {
-  CURRENT_STEP='安装 domain-check'
-  local asset_name="domain-check-linux-$CPU_ARCH"
-  local checksum_file
-  local checksum_line=''
-  local downloaded_file
-  local installed_metadata=''
-  local installed_version=''
-
-  DOMAIN_CHECK_STATE='安装失败'
-  downloaded_file="$TMP_DIR/$asset_name"
-  checksum_file="$TMP_DIR/domain-check-SHA256SUMS"
-  curl --fail --silent --show-error --location \
-    --connect-timeout 5 --max-time 60 --retry 3 --retry-delay 1 \
-    --retry-connrefused \
-    "$DOMAIN_CHECK_RELEASE_BASE/$asset_name" --output "$downloaded_file" ||
-    die '下载 domain-check Go 二进制失败。'
-  curl --fail --silent --show-error --location \
-    --connect-timeout 5 --max-time 60 --retry 3 --retry-delay 1 \
-    --retry-connrefused \
-    "$DOMAIN_CHECK_RELEASE_BASE/SHA256SUMS" --output "$checksum_file" ||
-    die '下载 domain-check SHA256SUMS 失败。'
-  [[ -s "$downloaded_file" ]] || die '下载的 domain-check Go 二进制为空。'
-  checksum_line=$(grep -E "^[[:xdigit:]]{64}  ${asset_name}$" "$checksum_file" || true)
-  [[ -n "$checksum_line" ]] || die 'SHA256SUMS 中缺少当前架构的 domain-check 资产。'
-  printf '%s\n' "$checksum_line" |
-    (cd "$TMP_DIR" && sha256sum -c - >/dev/null) ||
-    die 'domain-check Go 二进制 SHA-256 校验失败。'
-  [[ "$(od -An -tx1 -N4 "$downloaded_file" | tr -d '[:space:]')" == '7f454c46' ]] ||
-    die '下载的 domain-check 不是 ELF 二进制。'
-  chmod 0755 "$downloaded_file"
-  installed_version=$("$downloaded_file" --version 2>/dev/null || true)
-  [[ "$installed_version" == domain-check\ Go\ * ]] ||
-    die '下载的 domain-check 未通过 Go 版本标识验证。'
-
-  DOMAIN_CHECK_INSTALL_STAGE=$(mktemp /usr/local/bin/.domain-check.XXXXXXXX) ||
-    die '无法在 /usr/local/bin 创建 domain-check 临时安装文件。'
-  install -o root -g root -m 0755 \
-    "$downloaded_file" "$DOMAIN_CHECK_INSTALL_STAGE" ||
-    die '无法准备 domain-check 原子安装文件。'
-  backup_file "$DOMAIN_CHECK_TARGET"
-  if ! mv -f -- "$DOMAIN_CHECK_INSTALL_STAGE" "$DOMAIN_CHECK_TARGET"; then
-    restore_file "$DOMAIN_CHECK_TARGET" || true
-    die '无法将 domain-check 原子安装到正式路径。'
-  fi
-  DOMAIN_CHECK_INSTALL_STAGE=''
-
-  installed_metadata=$(stat -c '%U:%G:%a' "$DOMAIN_CHECK_TARGET" 2>/dev/null || true)
-  if [[ ! -x "$DOMAIN_CHECK_TARGET" ]] ||
-    [[ "$installed_metadata" != 'root:root:755' ]] ||
-    [[ "$(od -An -tx1 -N4 "$DOMAIN_CHECK_TARGET" | tr -d '[:space:]')" != '7f454c46' ]] ||
-    [[ "$("$DOMAIN_CHECK_TARGET" --version 2>/dev/null || true)" != domain-check\ Go\ * ]]; then
-    restore_file "$DOMAIN_CHECK_TARGET" || true
-    die 'domain-check 正式安装文件或权限验证失败，已尝试恢复。'
-  fi
-  DOMAIN_CHECK_STATE='已安装'
-  log "domain-check 已安装并验证：$installed_version，$DOMAIN_CHECK_TARGET"
-}
-
 service_state() {
   local unit=$1
   local state
@@ -3270,7 +3203,6 @@ print_final_report() {
   local ufw_state=''
   local smartdns_state=''
   local dns_state=''
-  local domain_check_metadata=''
   local sing_enabled
   local sing_active
   [[ -e /var/run/reboot-required ]] &&
@@ -3385,15 +3317,6 @@ print_final_report() {
     [[ -n "$dns_state" ]] || dns_state='未通过安装流程验证'
     result_row FAIL '系统 DNS' "$dns_state"
   fi
-  domain_check_metadata=$(
-    stat -c '%U:%G:%a' "$DOMAIN_CHECK_TARGET" 2>/dev/null || true
-  )
-  if [[ "$DOMAIN_CHECK_STATE" == '已安装' && -x "$DOMAIN_CHECK_TARGET" ]] &&
-    [[ "$domain_check_metadata" == 'root:root:755' ]]; then
-    result_row OK 'domain-check' "$DOMAIN_CHECK_STATE：$DOMAIN_CHECK_TARGET"
-  else
-    result_row FAIL 'domain-check' "$DOMAIN_CHECK_STATE：$DOMAIN_CHECK_TARGET"
-  fi
   result_row INFO '备份目录' "$(current_backup_state)"
   if [[ "$NETWORK_RESULT" == SUCCESS ]]; then
     result_row OK 'Result' "$NETWORK_RESULT"
@@ -3422,7 +3345,7 @@ custom_phase_one() {
     case "$choice" in
       1) return 0 ;;
       2)
-        printf '\n已在基础工具阶段停止：软件包保留；未修改 SSH、UFW、BBR、SmartDNS 或系统 DNS，也未安装 Cloudflare UFW 工具、sing-box 或 domain-check。\n'
+        printf '\n已在基础工具阶段停止：软件包保留；未修改 SSH、UFW、BBR、SmartDNS 或系统 DNS，也未安装 Cloudflare UFW 工具或 sing-box。\n'
         exit 0
         ;;
       *) printf '无效选择。\n' >/dev/tty ;;
@@ -3437,7 +3360,6 @@ run_remaining_initialization() {
   install_sing_box
   install_smartdns
   configure_system_dns
-  install_domain_check
   configure_ssh
   configure_ufw
   print_final_report

@@ -23,14 +23,10 @@ jobs:
         run: |
           scripts=(
             404notfound.sh
-            domain-check.sh
             node-config-wizard.sh
             protocol-benchmark.sh
-            scripts/install-domain-check.sh
             scripts/update-smartdns.sh
-            scripts/domain-check-go-benchmark.sh
             request-cloudflare-certificate.sh
-            tests/domain-check-test.sh
             tests/gg-status-container-test.sh
             tests/gg-status-test.sh
             tests/node-config-wizard-test.sh
@@ -47,11 +43,8 @@ jobs:
             bash -n "$script"
           done
           for executable_script in \
-            domain-check.sh \
             node-config-wizard.sh \
-            scripts/domain-check-go-benchmark.sh \
             scripts/update-smartdns.sh \
-            tests/domain-check-test.sh \
             tests/gg-status-container-test.sh \
             tests/gg-status-test.sh \
             tests/node-config-wizard-test.sh \
@@ -82,43 +75,6 @@ jobs:
         run: |
           test ! -e configs/smartdns.conf
           test ! -e smartdns.conf
-          test -s domain-check.sh
-          grep -Fq "readonly DOMAIN_CHECK_TARGET='/usr/local/bin/domain-check'" 404notfound.sh
-          grep -Fq "readonly DOMAIN_CHECK_RELEASE_BASE='https://github.com/404-git-404/404-vps-tools/releases/download/domain-check-latest'" 404notfound.sh
-          grep -Fq 'domain-check-linux-$CPU_ARCH' 404notfound.sh
-          grep -Fq 'sha256sum -c - >/dev/null' 404notfound.sh
-          grep -Fq "== '7f454c46'" 404notfound.sh
-          grep -Fq 'domain-check Go' 404notfound.sh
-          grep -Fq 'mktemp /usr/local/bin/.domain-check.' 404notfound.sh
-          grep -Fq 'x86_64) arch=amd64' scripts/install-domain-check.sh
-          grep -Fq 'aarch64 | arm64) arch=arm64' scripts/install-domain-check.sh
-          grep -Fq 'Unsupported architecture:' scripts/install-domain-check.sh
-          grep -Fq 'for arch in amd64 arm64; do' .github/workflows/domain-check-release.yml
-          grep -Fq 'GOARCH="$arch"' .github/workflows/domain-check-release.yml
-          grep -Fq 'domain-check-linux-amd64' .github/workflows/domain-check-release.yml
-          grep -Fq 'domain-check-linux-arm64' .github/workflows/domain-check-release.yml
-          grep -Fq 'SHA256SUMS' .github/workflows/domain-check-release.yml
-          grep -Fq 'stable_tag=domain-check-latest' .github/workflows/domain-check-release.yml
-          grep -Fq 'gh release view "$GITHUB_REF_NAME"' .github/workflows/domain-check-release.yml
-          grep -Fq 'gh release upload "$GITHUB_REF_NAME"' .github/workflows/domain-check-release.yml
-          grep -Fq 'gh release upload "$stable_tag"' .github/workflows/domain-check-release.yml
-          grep -Fq -- '--clobber' .github/workflows/domain-check-release.yml
-          grep -Fq -- '--draft=false' .github/workflows/domain-check-release.yml
-          grep -Fq 'Verify published release assets' .github/workflows/domain-check-release.yml
-          if grep -Fq 'gh release delete' .github/workflows/domain-check-release.yml; then
-            exit 1
-          fi
-          grep -Fq 'releases/download/domain-check-latest' scripts/install-domain-check.sh
-          grep -Fq 'sha256sum -c - >/dev/null' scripts/install-domain-check.sh
-          if grep -Fq 'releases/latest/download' README.md 404notfound.sh \
-            scripts/install-domain-check.sh \
-            .github/workflows/domain-check-release.yml; then
-            exit 1
-          fi
-          if grep -Fq 'domain-check-go-v2-test' README.md 404notfound.sh \
-            .github/workflows/domain-check-release.yml; then
-            exit 1
-          fi
           legacy_name="Reality""Checker"
           legacy_command="reality""-checker"
           if grep -RniE --exclude-dir=.git \
@@ -150,14 +106,6 @@ jobs:
           ```
 
           ```bash
-          bash <(curl -fsSL https://raw.githubusercontent.com/404-git-404/404-vps-tools/main/scripts/install-domain-check.sh)
-          ```
-
-          ```bash
-          domain-check domain1.com/domain2.com
-          ```
-
-          ```bash
           bash <(curl -fsSL https://raw.githubusercontent.com/404-git-404/404-vps-tools/main/node-config-wizard.sh)
           ```
 
@@ -179,84 +127,6 @@ jobs:
           EOF
           cmp -s README.md /tmp/expected-readme
 
-      - name: Test release workflow reruns
-        run: |
-          declare -A mock_releases=()
-          declare -a mock_calls=()
-          mock_fail_once=''
-          mock_stable_ref=false
-          GITHUB_REF_NAME=domain-check-v1.2.3
-          GITHUB_SHA=0123456789abcdef0123456789abcdef01234567
-          GITHUB_REPOSITORY=404-git-404/404-vps-tools
-          export GITHUB_REF_NAME GITHUB_SHA GITHUB_REPOSITORY
-
-          extract_release_step() {
-            local step_name=$1
-            awk -v step_name="$step_name" '
-              $0 == "      - name: " step_name { found = 1; next }
-              found && /^      - name:/ { exit }
-              found && $0 == "        run: |" { run = 1; next }
-              run { sub(/^          /, ""); print }
-            ' .github/workflows/domain-check-release.yml
-          }
-
-          gh() {
-            mock_calls+=("$*")
-            if [[ -n "$mock_fail_once" && "$*" == *"$mock_fail_once"* ]]; then
-              mock_fail_once=''
-              return 97
-            fi
-            case "${1:-}:${2:-}" in
-              release:view)
-                [[ "${mock_releases[${3:-}]:-false}" == true ]]
-                ;;
-              release:create)
-                mock_releases[${3:-}]=true
-                ;;
-              release:upload | release:edit)
-                [[ "${mock_releases[${3:-}]:-false}" == true ]]
-                ;;
-              api:*)
-                if [[ " $* " == *' --method POST '* ]]; then
-                  mock_stable_ref=true
-                elif [[ " $* " == *' --method PATCH '* ]]; then
-                  [[ "$mock_stable_ref" == true ]]
-                else
-                  [[ "$mock_stable_ref" == true ]]
-                fi
-                ;;
-              *) return 1 ;;
-            esac
-          }
-
-          count_mock_calls() {
-            local call
-            local count=0
-            local needle=$1
-            for call in "${mock_calls[@]}"; do
-              if [[ "$call" == *"$needle"* ]]; then
-                ((count += 1))
-              fi
-            done
-            printf '%s\n' "$count"
-          }
-
-          eval "$(extract_release_step 'Publish versioned release')"
-          mock_fail_once='release edit domain-check-latest'
-          if eval "$(extract_release_step 'Publish domain-check stable alias')"; then
-            exit 1
-          fi
-          eval "$(extract_release_step 'Publish versioned release')"
-          eval "$(extract_release_step 'Publish domain-check stable alias')"
-
-          [[ "$(count_mock_calls 'release create domain-check-v1.2.3')" -eq 1 ]]
-          [[ "$(count_mock_calls 'release upload domain-check-v1.2.3')" -eq 4 ]]
-          [[ "$(count_mock_calls 'release edit domain-check-v1.2.3')" -eq 2 ]]
-          [[ "$(count_mock_calls 'release create domain-check-latest')" -eq 1 ]]
-          [[ "$(count_mock_calls 'release upload domain-check-latest')" -eq 4 ]]
-          [[ "$(count_mock_calls 'release edit domain-check-latest')" -eq 2 ]]
-          [[ "$(count_mock_calls 'release delete')" -eq 0 ]]
-
       - name: Install ShellCheck, jq, and mawk
         run: |
           sudo apt-get update
@@ -267,7 +137,6 @@ jobs:
           mkdir -p "$RUNNER_TEMP/mawk-bin"
           ln -s "$(command -v mawk)" "$RUNNER_TEMP/mawk-bin/awk"
           PATH="$RUNNER_TEMP/mawk-bin:$PATH" awk -W version
-          PATH="$RUNNER_TEMP/mawk-bin:$PATH" bash tests/domain-check-test.sh
           PATH="$RUNNER_TEMP/mawk-bin:$PATH" bash tests/gg-status-test.sh
           GG_STATUS_SHELL=/bin/dash PATH="$RUNNER_TEMP/mawk-bin:$PATH" bash tests/gg-status-test.sh
           PATH="$RUNNER_TEMP/mawk-bin:$PATH" bash tests/node-config-wizard-test.sh
@@ -283,14 +152,10 @@ jobs:
         run: |
           shellcheck \
             404notfound.sh \
-            domain-check.sh \
             node-config-wizard.sh \
             protocol-benchmark.sh \
-            scripts/install-domain-check.sh \
             scripts/update-smartdns.sh \
-            scripts/domain-check-go-benchmark.sh \
             request-cloudflare-certificate.sh \
-            tests/domain-check-test.sh \
             tests/gg-status-container-test.sh \
             tests/gg-status-test.sh \
             tests/node-config-wizard-test.sh \

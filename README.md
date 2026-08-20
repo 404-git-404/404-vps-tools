@@ -7,14 +7,6 @@ bash <(curl -fsSL https://raw.githubusercontent.com/404-git-404/404-vps-tools/ma
 ```
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/404-git-404/404-vps-tools/main/scripts/install-domain-check.sh)
-```
-
-```bash
-domain-check domain1.com/domain2.com
-```
-
-```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/404-git-404/404-vps-tools/main/node-config-wizard.sh)
 ```
 
