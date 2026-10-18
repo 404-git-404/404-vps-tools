@@ -22,7 +22,6 @@ jobs:
       - name: Check script files
         run: |
           scripts=(
-            404notfound.sh
             debian-init.sh
             request-cloudflare-certificate.sh
             tests/gg-status-container-test.sh
@@ -45,7 +44,7 @@ jobs:
             tests/smartdns-test.sh; do
             test -x "$executable_script"
           done
-          for script in yt-region gg-status; do
+          for script in yt-region gg-status alpine-init.sh; do
             test -s "$script"
             if grep -q $'\r' "$script"; then
               echo "$script contains CRLF." >&2
@@ -89,10 +88,11 @@ jobs:
       - name: Check README and entry points
         run: |
           test "$(head -n 1 README.md)" = '```bash'
-          grep -Fxq 'bash <(curl -fsSL https://raw.githubusercontent.com/404-git-404/404-vps-tools/main/404notfound.sh)' README.md
+          grep -Fxq 'bash <(curl -fsSL https://raw.githubusercontent.com/404-git-404/404-vps-tools/main/debian-init.sh)' README.md
+          grep -Fxq 'wget -qO alpine-init.sh https://raw.githubusercontent.com/404-git-404/404-vps-tools/main/alpine-init.sh && sh alpine-init.sh' README.md
+          test ! -e 404notfound.sh
           test ! -e node-config-wizard.sh
           test ! -e scripts/update-smartdns.sh
-          bash 404notfound.sh --help
           bash debian-init.sh --help
 
       - name: Install ShellCheck, jq, and mawk
@@ -117,7 +117,6 @@ jobs:
       - name: Run ShellCheck
         run: |
           shellcheck \
-            404notfound.sh \
             debian-init.sh \
             request-cloudflare-certificate.sh \
             tests/gg-status-container-test.sh \
@@ -126,4 +125,4 @@ jobs:
             tests/smartdns-test.sh \
             /tmp/node-wizard.sh \
             /tmp/update-cloudflare-ufw
-          shellcheck -s sh yt-region gg-status
+          shellcheck -s sh yt-region gg-status alpine-init.sh

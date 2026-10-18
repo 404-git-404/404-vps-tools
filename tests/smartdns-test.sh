@@ -139,29 +139,8 @@ fi
   assert_eq false "$SINGBOX_RUNTIME_MASK" 'runtime mask released'
 )
 
-# Exercise the downloaded entry point with a fake curl and no system changes.
-mkdir -p "$TEST_TMP/bootstrap" "$TEST_TMP/bin" "$TEST_TMP/downloads"
-cp "$REPO_ROOT/404notfound.sh" "$TEST_TMP/bootstrap/404notfound.sh"
-cat >"$TEST_TMP/bin/curl" <<'MOCK_CURL'
-#!/usr/bin/env bash
-set -Eeuo pipefail
-while (( $# )); do
-  if [[ "$1" == -o ]]; then
-    printf '%s\n' '#!/usr/bin/env bash' 'set -Eeuo pipefail' 'printf "%s\n" "$@"' >"$2"
-    exit 0
-  fi
-  shift
-done
-exit 1
-MOCK_CURL
-chmod +x "$TEST_TMP/bin/curl"
-result=$(PATH="$TEST_TMP/bin:$PATH" TMPDIR="$TEST_TMP/downloads" bash "$TEST_TMP/bootstrap/404notfound.sh" --smartdns-only)
-assert_eq --smartdns-only "$result" 'downloaded entry point argument forwarding'
-[[ -z "$(ls -A "$TEST_TMP/downloads")" ]] || fail 'bootstrap leaked temporary files'
-printf '%s\n' '#!/usr/bin/env bash' 'exit 23' >"$TEST_TMP/bin/curl"
-if PATH="$TEST_TMP/bin:$PATH" TMPDIR="$TEST_TMP/downloads" bash "$TEST_TMP/bootstrap/404notfound.sh" >"$TEST_TMP/download-failure.log" 2>&1; then
-  fail 'bootstrap ignored download failure'
-fi
-[[ -z "$(ls -A "$TEST_TMP/downloads")" ]] || fail 'failed bootstrap leaked temporary files'
+# The Debian entry point can display help without running initialization.
+help_output=$(bash "$REPO_ROOT/debian-init.sh" --help)
+[[ "$help_output" == *'bash debian-init.sh'* && "$help_output" == *'--smartdns-only'* && "$help_output" == *'--sing-box-only'* ]] || fail 'direct entry point help is incomplete'
 
-printf 'PASS: Debian dispatch, DNS health, sing-box startup gates and bootstrap cleanup\n'
+printf 'PASS: Debian dispatch, DNS health, sing-box startup gates and direct entry point\n'

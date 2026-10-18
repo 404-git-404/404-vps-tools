@@ -90,8 +90,8 @@ warn() { printf '[WARN] %s\n' "$*" >&2; }
 usage() {
   cat <<'EOF'
 用法：
-  bash 404notfound.sh
-  bash 404notfound.sh [选项]
+  bash debian-init.sh
+  bash debian-init.sh [选项]
 
 交互菜单：快速安装、自定义安装、退出、仅安装/更新 SmartDNS、仅部署 sing-box。
 仅部署 sing-box 独立运行节点配置向导；完整初始化只安装 sing-box，不创建节点。
