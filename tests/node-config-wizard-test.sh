@@ -6,12 +6,12 @@ TEST_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 readonly TEST_DIR
 REPO_ROOT=$(cd -- "$TEST_DIR/.." && pwd)
 readonly REPO_ROOT
-readonly WIZARD_SCRIPT="$REPO_ROOT/node-config-wizard.sh"
-readonly INSTALL_SCRIPT="$REPO_ROOT/404notfound.sh"
+readonly WIZARD_SCRIPT="$REPO_ROOT/debian-init.sh"
+readonly INSTALL_SCRIPT="$REPO_ROOT/debian-init.sh"
 
 # The path is anchored to this test file, rather than the caller's directory.
 # shellcheck disable=SC1090
-source "$WIZARD_SCRIPT"
+source <(sed -n "/^  bash \/dev\/fd\/3 3<<'SINGBOX_WIZARD'$/,/^SINGBOX_WIZARD$/ { /SINGBOX_WIZARD/d; p; }" "$WIZARD_SCRIPT")
 trap - EXIT INT TERM
 
 TEST_COUNT=0
@@ -1041,7 +1041,7 @@ test_outbound_menu_order_and_sudo_package() {
     [[ "$existing_menu" == *"$expected_menu"* ]] || fail 'existing-config outbound menu order is incorrect'
     ((TEST_COUNT += 1))
 
-    if ! sed -n '/readonly -a BASE_PACKAGES=(/,/^)/p' "$INSTALL_SCRIPT" | grep -qw sudo; then
+    if ! sed -n '/^update_system_and_tools() {/,/^}/p' "$INSTALL_SCRIPT" | grep -qw sudo; then
         fail 'sudo is missing from BASE_PACKAGES'
     fi
     ((TEST_COUNT += 1))
