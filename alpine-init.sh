@@ -252,7 +252,9 @@ EOF_SSH
         if ! rc-service sshd restart; then
             if [ -f "$BACKUP_DIR/sshd_config.before" ]; then
                 cp "$BACKUP_DIR/sshd_config.before" "$SSH_CONFIG"
-                sshd -t >/dev/null 2>&1 && rc-service sshd restart >/dev/null 2>&1 || true
+                if sshd -t >/dev/null 2>&1; then
+                    rc-service sshd restart >/dev/null 2>&1 || true
+                fi
             fi
             die 'sshd 重启失败，已尝试恢复原配置。'
         fi
