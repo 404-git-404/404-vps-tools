@@ -23,8 +23,7 @@ jobs:
         run: |
           scripts=(
             404notfound.sh
-            node-config-wizard.sh
-            scripts/update-smartdns.sh
+            debian-init.sh
             request-cloudflare-certificate.sh
             tests/gg-status-container-test.sh
             tests/gg-status-test.sh
@@ -40,8 +39,6 @@ jobs:
             bash -n "$script"
           done
           for executable_script in \
-            node-config-wizard.sh \
-            scripts/update-smartdns.sh \
             tests/gg-status-container-test.sh \
             tests/gg-status-test.sh \
             tests/node-config-wizard-test.sh \
@@ -57,15 +54,14 @@ jobs:
             sh -n "$script"
           done
 
-      - name: Extract and check embedded Cloudflare tool
+      - name: Extract and check embedded tools
         run: |
-          awk '
-            index($0, "<<") && index($0, "CLOUDFLARE_UFW_TOOL") { capture = 1; next }
-            capture && $0 == "CLOUDFLARE_UFW_TOOL" { exit }
-            capture { print }
-          ' 404notfound.sh > /tmp/update-cloudflare-ufw
-          test -s /tmp/update-cloudflare-ufw
-          bash -n /tmp/update-cloudflare-ufw
+          sed -n "/^  bash \/dev\/fd\/3 3<<'SINGBOX_WIZARD'$/,/^SINGBOX_WIZARD$/ { /SINGBOX_WIZARD/d; p; }" debian-init.sh > /tmp/node-wizard.sh
+          awk '/<<.CFEOF./ { capture=1; next } capture && $0 == "CFEOF" { exit } capture { print }' debian-init.sh > /tmp/update-cloudflare-ufw
+          for script in /tmp/node-wizard.sh /tmp/update-cloudflare-ufw; do
+            test -s "$script"
+            bash -n "$script"
+          done
 
       - name: Check repository invariants
         run: |
@@ -78,38 +74,26 @@ jobs:
             exit 1
           fi
           if grep -Eq '(/lib|/usr/lib)/systemd/system/smartdns\.service' \
-            404notfound.sh scripts/update-smartdns.sh; then
+            debian-init.sh; then
             exit 1
           fi
           if grep -Fq 'https://api.github.com/repos/pymumu/smartdns/releases/latest' \
-            404notfound.sh scripts/update-smartdns.sh; then
+            debian-init.sh; then
             exit 1
           fi
           if grep -Fq 'install -y ca-certificates dnsutils smartdns' \
-            404notfound.sh scripts/update-smartdns.sh; then
+            debian-init.sh; then
             exit 1
           fi
 
-      - name: Check README
+      - name: Check README and entry points
         run: |
-          cat > /tmp/expected-readme <<'EOF'
-          ```bash
-          bash <(curl -fsSL https://raw.githubusercontent.com/404-git-404/404-vps-tools/main/404notfound.sh)
-          ```
-
-          ```bash
-          bash <(curl -fsSL https://raw.githubusercontent.com/404-git-404/404-vps-tools/main/scripts/update-smartdns.sh)
-          ```
-
-          ```bash
-          bash <(curl -fsSL https://raw.githubusercontent.com/404-git-404/404-vps-tools/main/node-config-wizard.sh)
-          ```
-
-          ```sh
-          curl -fsSL https://raw.githubusercontent.com/404-git-404/404-vps-tools/main/gg-status -o gg-status && chmod +x gg-status && ./gg-status
-          ```
-          EOF
-          cmp -s README.md /tmp/expected-readme
+          test "$(head -n 1 README.md)" = '```bash'
+          grep -Fxq 'bash <(curl -fsSL https://raw.githubusercontent.com/404-git-404/404-vps-tools/main/404notfound.sh)' README.md
+          test ! -e node-config-wizard.sh
+          test ! -e scripts/update-smartdns.sh
+          bash 404notfound.sh --help
+          bash debian-init.sh --help
 
       - name: Install ShellCheck, jq, and mawk
         run: |
@@ -134,12 +118,12 @@ jobs:
         run: |
           shellcheck \
             404notfound.sh \
-            node-config-wizard.sh \
-            scripts/update-smartdns.sh \
+            debian-init.sh \
             request-cloudflare-certificate.sh \
             tests/gg-status-container-test.sh \
             tests/gg-status-test.sh \
             tests/node-config-wizard-test.sh \
             tests/smartdns-test.sh \
+            /tmp/node-wizard.sh \
             /tmp/update-cloudflare-ufw
           shellcheck -s sh yt-region gg-status
