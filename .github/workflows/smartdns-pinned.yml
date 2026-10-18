@@ -7,7 +7,136 @@ on:
 permissions:
   contents: read
 
+env:
+  RELEASE_BASE: https://github.com/404-git-404/404-vps-tools/releases/download/smartdns-debian-pinned-2026-07
+  RELEASE_TAG: smartdns-debian-pinned-2026-07
+
 jobs:
+  release-assets:
+    name: Release assets and package metadata
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Fetch actual Release asset names and URLs
+        run: |
+          curl --fail --location --silent --show-error \
+            --connect-timeout 10 --max-time 120 --retry 3 --retry-delay 2 \
+            --retry-connrefused \
+            "https://api.github.com/repos/404-git-404/404-vps-tools/releases/tags/$RELEASE_TAG" \
+            -o /tmp/release.json
+          jq -e '
+            .tag_name == "smartdns-debian-pinned-2026-07" and
+            .draft == false and
+            .prerelease == true and
+            (.assets | length == 12) and
+            ([.assets[].name] | unique | length == 12) and
+            ([.assets[].state] | all(. == "uploaded"))
+          ' /tmp/release.json
+          jq -r '.assets[].name' /tmp/release.json | sort > /tmp/actual-assets
+          cat > /tmp/expected-assets <<'EOF'
+          SHA256SUMS
+          SOURCES.md
+          smartdns_40+dfsg-1.debian.tar.xz
+          smartdns_40+dfsg-1.dsc
+          smartdns_40+dfsg-1_bookworm_amd64.deb
+          smartdns_40+dfsg-1_bookworm_arm64.deb
+          smartdns_40+dfsg.orig.tar.xz
+          smartdns_46.1+dfsg-1.1.deb13u1.debian.tar.xz
+          smartdns_46.1+dfsg-1.1.deb13u1.dsc
+          smartdns_46.1+dfsg-1.1.deb13u1_trixie_amd64.deb
+          smartdns_46.1+dfsg-1.1.deb13u1_trixie_arm64.deb
+          smartdns_46.1+dfsg.orig.tar.xz
+          EOF
+          sort -o /tmp/expected-assets /tmp/expected-assets
+          diff -u /tmp/expected-assets /tmp/actual-assets
+          if grep -Eq '(~|starter)' /tmp/actual-assets; then
+            exit 1
+          fi
+          jq -e --arg base "$RELEASE_BASE/" '
+            [.assets[]
+              | (.browser_download_url | startswith($base))] | all
+          ' /tmp/release.json
+
+      - name: Confirm Release is not latest
+        run: |
+          http_code=$(curl --location --silent --show-error \
+            --header 'Cache-Control: no-cache' \
+            --connect-timeout 10 --max-time 120 --retry 3 --retry-delay 2 \
+            --retry-connrefused \
+            https://api.github.com/repos/404-git-404/404-vps-tools/releases/latest \
+            --output /tmp/latest.json --write-out '%{http_code}')
+          case "$http_code" in
+            200) test "$(jq -r .tag_name /tmp/latest.json)" != "$RELEASE_TAG" ;;
+            404) ;;
+            *)
+              echo "Unexpected latest Release API status: $http_code" >&2
+              exit 1
+              ;;
+          esac
+
+      - name: Download through API-returned anonymous URLs
+        run: |
+          mkdir /tmp/assets
+          jq -r '.assets[] | [.name, .browser_download_url] | @tsv' \
+            /tmp/release.json |
+            while IFS=$'\t' read -r name url; do
+              curl --fail --location --silent --show-error \
+                --connect-timeout 10 --max-time 120 --retry 3 --retry-delay 2 \
+                --retry-connrefused "$url" -o "/tmp/assets/$name"
+              test -s "/tmp/assets/$name"
+            done
+          cd /tmp/assets
+          sha256sum --check SHA256SUMS
+          test "$(sha256sum SOURCES.md | awk '{print $1}')" = \
+            58ed7c09f565a382a1f6f5dafde34068fea2557defcd823110968982b4fc1984
+
+      - name: Verify all binary package metadata
+        run: |
+          cat > /tmp/package-expectations <<'EOF'
+          smartdns_40+dfsg-1_bookworm_amd64.deb|40+dfsg-1|amd64|8388fb543f870fc77d17dbaa9874277d2ef37d120ad2ab24af730d7032a80bcb
+          smartdns_40+dfsg-1_bookworm_arm64.deb|40+dfsg-1|arm64|7aadb6fb0e6d2f38d8ce11db60561c2c8c7c9d0aacf1e54f9e27f44a4abfb9ca
+          smartdns_46.1+dfsg-1.1.deb13u1_trixie_amd64.deb|46.1+dfsg-1.1~deb13u1|amd64|d2dfe591dbdabf3655c2ead30975ee20f6720346552bda989b212ccffde5ba4e
+          smartdns_46.1+dfsg-1.1.deb13u1_trixie_arm64.deb|46.1+dfsg-1.1~deb13u1|arm64|d9eeb9050ab6e0c95011de83955f65ca8020779c8c32aba90d708bc54c33823f
+          EOF
+          while IFS='|' read -r name version architecture digest; do
+            package="/tmp/assets/$name"
+            test "$(sha256sum "$package" | awk '{print $1}')" = "$digest"
+            dpkg-deb --info "$package" >/dev/null
+            test "$(dpkg-deb --field "$package" Package)" = smartdns
+            test "$(dpkg-deb --field "$package" Version)" = "$version"
+            test "$(dpkg-deb --field "$package" Architecture)" = "$architecture"
+          done < /tmp/package-expectations
+          grep -Fq 'smartdns_46.1+dfsg-1.1.deb13u1_trixie_amd64.deb' \
+            /tmp/assets/SOURCES.md
+          grep -Fq '46.1+dfsg-1.1~deb13u1' /tmp/assets/SOURCES.md
+
+      - name: Reject tampering and architecture mismatch
+        run: |
+          package=/tmp/assets/smartdns_40+dfsg-1_bookworm_amd64.deb
+          cp "$package" /tmp/tampered.deb
+          printf X | dd of=/tmp/tampered.deb bs=1 seek=0 conv=notrunc status=none
+          if printf '%s  %s\n' \
+            8388fb543f870fc77d17dbaa9874277d2ef37d120ad2ab24af730d7032a80bcb \
+            /tmp/tampered.deb | sha256sum --check --status; then
+            echo 'Tampered package unexpectedly passed SHA-256 validation.' >&2
+            exit 1
+          fi
+          verify_metadata() {
+            local candidate=$1
+            local expected_version=$2
+            local expected_architecture=$3
+            test "$(dpkg-deb --field "$candidate" Package)" = smartdns
+            test "$(dpkg-deb --field "$candidate" Version)" = "$expected_version"
+            test "$(dpkg-deb --field "$candidate" Architecture)" = \
+              "$expected_architecture"
+          }
+          if verify_metadata "$package" 40+dfsg-1 arm64; then
+            echo 'amd64 package unexpectedly passed the arm64 mapping.' >&2
+            exit 1
+          fi
+
   release-package:
     name: Debian ${{ matrix.debian }} / ${{ matrix.arch }} pinned package
     runs-on: ubuntu-latest
@@ -65,3 +194,95 @@ jobs:
               trap - EXIT
             done
           done
+
+  migration:
+    # These required check names describe the starting Debian package version.
+    name: ${{ matrix.check }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - check: Debian 12 v40 integration
+            debian: '12'
+            package: smartdns_40+dfsg-1_bookworm_amd64.deb
+            sha: 8388fb543f870fc77d17dbaa9874277d2ef37d120ad2ab24af730d7032a80bcb
+            repeat: 'false'
+          - check: Debian 13 v46 integration
+            debian: '13'
+            package: smartdns_46.1+dfsg-1.1.deb13u1_trixie_amd64.deb
+            sha: d2dfe591dbdabf3655c2ead30975ee20f6720346552bda989b212ccffde5ba4e
+            repeat: 'false'
+          - check: Debian 12 amd64 full updater regression
+            debian: '12'
+            package: smartdns_40+dfsg-1_bookworm_amd64.deb
+            sha: 8388fb543f870fc77d17dbaa9874277d2ef37d120ad2ab24af730d7032a80bcb
+            repeat: 'true'
+    steps:
+      - uses: actions/checkout@v6
+      - name: Start Debian with systemd
+        env:
+          DEBIAN_VERSION: ${{ matrix.debian }}
+        run: |
+          cat > "$RUNNER_TEMP/Dockerfile.smartdns" <<'EOF'
+          ARG DEBIAN_VERSION
+          FROM debian:${DEBIAN_VERSION}
+          ENV container=docker
+          RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y ca-certificates curl dnsutils iproute2 procps systemd systemd-sysv && apt-get clean
+          STOPSIGNAL SIGRTMIN+3
+          CMD ["/sbin/init"]
+          EOF
+          docker build --build-arg "DEBIAN_VERSION=$DEBIAN_VERSION" -f "$RUNNER_TEMP/Dockerfile.smartdns" -t smartdns-systemd "$RUNNER_TEMP"
+          docker run -d --privileged --cgroupns=host --name smartdns-migration --tmpfs /run --tmpfs /run/lock -v /sys/fs/cgroup:/sys/fs/cgroup:rw smartdns-systemd
+          for _ in {1..30}; do
+            state=$(docker exec smartdns-migration systemctl is-system-running 2>/dev/null || true)
+            case "$state" in running|degraded) break ;; esac
+            sleep 1
+          done
+          state=$(docker exec smartdns-migration systemctl is-system-running 2>/dev/null || true)
+          [[ "$state" == running || "$state" == degraded ]]
+          docker cp . smartdns-migration:/repo
+      - name: Migrate installed and held SmartDNS; verify system DNS and backups
+        env:
+          LEGACY_PACKAGE: ${{ matrix.package }}
+          LEGACY_SHA: ${{ matrix.sha }}
+          REPEAT: ${{ matrix.repeat }}
+        run: |
+          docker exec --env RELEASE_BASE --env LEGACY_PACKAGE --env LEGACY_SHA --env REPEAT smartdns-migration bash -Eeuo pipefail -s <<'TEST'
+          printf '#!/bin/sh\nexit 101\n' >/usr/sbin/policy-rc.d
+          chmod 0755 /usr/sbin/policy-rc.d
+          curl -fsSL --retry 3 "$RELEASE_BASE/$LEGACY_PACKAGE" -o /tmp/legacy.deb
+          echo "$LEGACY_SHA  /tmp/legacy.deb" | sha256sum --check --status
+          apt-get update
+          apt-get install -y --allow-downgrades /tmp/legacy.deb
+          rm /usr/sbin/policy-rc.d
+          mkdir -p /var/cache/smartdns
+          printf 'bind 127.0.0.1:53\nbind-tcp 127.0.0.1:53\nserver 1.1.1.1\nserver-tcp 8.8.8.8\n' >/etc/smartdns/smartdns.conf
+          cp /etc/smartdns/smartdns.conf /tmp/before.conf
+          systemctl daemon-reload
+          systemctl enable --now smartdns.service
+          apt-mark hold smartdns
+          bash /repo/debian-init.sh --smartdns-only --network-stack ipv4
+          systemctl is-active --quiet smartdns.service
+          test "$(systemctl is-enabled smartdns.service)" = enabled
+          test "$(dpkg-query -W -f='${Version}' smartdns)" = 2026.08.05-0921
+          ! apt-mark showhold | grep -Fxq smartdns
+          grep -Fxq 'nameserver 127.0.0.1' /etc/resolv.conf
+          getent ahostsv4 debian.org >/dev/null
+          test "$(dig @127.0.0.1 debian.org AAAA +short +time=4 +tries=1)" = ''
+          backup=$(find /root/vps-init-backups -path '*/dns/smartdns.conf' -type f | head -1)
+          cmp /tmp/before.conf "$backup"
+          if [[ "$REPEAT" == true ]]; then
+            cp /etc/smartdns/smartdns.conf /tmp/first-run.conf
+            bash /repo/debian-init.sh --smartdns-only --network-stack ipv4
+            cmp /tmp/first-run.conf /etc/smartdns/smartdns.conf
+            getent ahostsv4 debian.org >/dev/null
+          fi
+          TEST
+      - name: Show service diagnostics
+        if: failure()
+        run: docker exec smartdns-migration journalctl -u smartdns.service -n 100 --no-pager || true
+      - name: Remove test container
+        if: always()
+        run: docker rm -f smartdns-migration >/dev/null 2>&1 || true
