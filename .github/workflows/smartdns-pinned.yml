@@ -37,7 +37,8 @@ jobs:
           curl -fL --retry 3 --connect-timeout 10 --max-time 180 "$SMARTDNS_URL" -o /tmp/smartdns.deb
           echo "$SMARTDNS_SHA  /tmp/smartdns.deb" | sha256sum --check --status
           test "$(dpkg-deb --field /tmp/smartdns.deb Package)" = smartdns
-          test "$(dpkg-deb --field /tmp/smartdns.deb Architecture)" = "$PACKAGE_ARCH"
+          package_arch=$(dpkg-deb --field /tmp/smartdns.deb Architecture)
+          [[ "$package_arch" == all || "$package_arch" == "$PACKAGE_ARCH" ]]
           test "$(dpkg-deb --field /tmp/smartdns.deb Version)" = "$SMARTDNS_DEB_VERSION"
           # Native execution validates config parsing on both Debian versions.
           [[ "$PACKAGE_ARCH" == amd64 ]] || exit 0

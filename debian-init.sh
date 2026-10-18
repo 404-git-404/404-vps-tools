@@ -159,8 +159,8 @@ restore_attrs() {
     flags=${ORIGINAL_ATTRS[$path]}
     command -v chattr >/dev/null 2>&1 || continue
     chattr -i -a -- "$path" 2>/dev/null || true
-    [[ "$flags" == *i* ]] && chattr +i -- "$path" 2>/dev/null || true
-    [[ "$flags" == *a* ]] && chattr +a -- "$path" 2>/dev/null || true
+    if [[ "$flags" == *i* ]]; then chattr +i -- "$path" 2>/dev/null || true; fi
+    if [[ "$flags" == *a* ]]; then chattr +a -- "$path" 2>/dev/null || true; fi
   done
 }
 
@@ -221,7 +221,7 @@ rollback_ssh() {
   if [[ -e "$BACKUP_DIR/ssh/sshd_config" ]]; then
     cp -a -- "$BACKUP_DIR/ssh/sshd_config" "$SSH_MAIN"
   fi
-  sshd -t >/dev/null 2>&1 && systemctl reload ssh.service >/dev/null 2>&1 || true
+  if sshd -t >/dev/null 2>&1; then systemctl reload ssh.service >/dev/null 2>&1 || true; fi
   if [[ "$PREAUTH_SSH_PORT_ADDED" == true ]]; then ufw_delete_comment_rules 'vps-init-ssh' >/dev/null 2>&1 || true; PREAUTH_SSH_PORT_ADDED=false; fi
   if [[ "$PREAUTH_22_ADDED" == true ]]; then ufw_delete_comment_rules 'vps-init-ssh-backup' >/dev/null 2>&1 || true; PREAUTH_22_ADDED=false; fi
 }
@@ -243,9 +243,9 @@ rollback_dns() {
   elif [[ -e "$BACKUP_DIR/dns/no-network-sysctl" ]]; then
     rm -f -- "$NETWORK_SYSCTL"
   fi
-  [[ "$IPV6_OLD_ALL" =~ ^[01]$ ]] && sysctl -q -w "net.ipv6.conf.all.disable_ipv6=$IPV6_OLD_ALL" 2>/dev/null || true
-  [[ "$IPV6_OLD_DEFAULT" =~ ^[01]$ ]] && sysctl -q -w "net.ipv6.conf.default.disable_ipv6=$IPV6_OLD_DEFAULT" 2>/dev/null || true
-  [[ "$IPV6_OLD_LO" =~ ^[01]$ ]] && sysctl -q -w "net.ipv6.conf.lo.disable_ipv6=$IPV6_OLD_LO" 2>/dev/null || true
+  if [[ "$IPV6_OLD_ALL" =~ ^[01]$ ]]; then sysctl -q -w "net.ipv6.conf.all.disable_ipv6=$IPV6_OLD_ALL" 2>/dev/null || true; fi
+  if [[ "$IPV6_OLD_DEFAULT" =~ ^[01]$ ]]; then sysctl -q -w "net.ipv6.conf.default.disable_ipv6=$IPV6_OLD_DEFAULT" 2>/dev/null || true; fi
+  if [[ "$IPV6_OLD_LO" =~ ^[01]$ ]]; then sysctl -q -w "net.ipv6.conf.lo.disable_ipv6=$IPV6_OLD_LO" 2>/dev/null || true; fi
   if [[ -L "$BACKUP_DIR/dns/resolv.conf.symlink" ]]; then
     rm -f /etc/resolv.conf
     ln -s "$(readlink "$BACKUP_DIR/dns/resolv.conf.symlink")" /etc/resolv.conf 2>/dev/null || true
@@ -530,8 +530,8 @@ update_system_and_tools() {
   wait_for_package_manager
   apt_get update
   if [[ "$DO_FULL_UPGRADE" == true ]]; then
-    apt-mark showhold 2>/dev/null | grep -Fxq sing-box && sing_was_held=true || true
-    apt-mark showhold 2>/dev/null | grep -Fxq smartdns && smart_was_held=true || true
+    if apt-mark showhold 2>/dev/null | grep -Fxq sing-box; then sing_was_held=true || true; fi
+    if apt-mark showhold 2>/dev/null | grep -Fxq smartdns; then smart_was_held=true || true; fi
     if dpkg-query -W sing-box >/dev/null 2>&1 && [[ "$sing_was_held" == false ]]; then
       apt-mark hold sing-box >/dev/null
       sing_temp_hold=true
@@ -642,9 +642,9 @@ detect_network_stack() {
         NETWORK_STACK='ipv4'
       fi
       if [[ "$CONTAINER_KIND" == none ]]; then
-        [[ "$old_all" =~ ^[01]$ ]] && sysctl -q -w "net.ipv6.conf.all.disable_ipv6=$old_all" 2>/dev/null || true
-        [[ "$old_default" =~ ^[01]$ ]] && sysctl -q -w "net.ipv6.conf.default.disable_ipv6=$old_default" 2>/dev/null || true
-        [[ "$old_lo" =~ ^[01]$ ]] && sysctl -q -w "net.ipv6.conf.lo.disable_ipv6=$old_lo" 2>/dev/null || true
+        if [[ "$old_all" =~ ^[01]$ ]]; then sysctl -q -w "net.ipv6.conf.all.disable_ipv6=$old_all" 2>/dev/null || true; fi
+        if [[ "$old_default" =~ ^[01]$ ]]; then sysctl -q -w "net.ipv6.conf.default.disable_ipv6=$old_default" 2>/dev/null || true; fi
+        if [[ "$old_lo" =~ ^[01]$ ]]; then sysctl -q -w "net.ipv6.conf.lo.disable_ipv6=$old_lo" 2>/dev/null || true; fi
       fi
       ;;
   esac
@@ -1068,7 +1068,10 @@ install_smartdns_package() {
   actual=$(sha256sum "$deb" | awk '{print $1}')
   [[ "$actual" == "$SMARTDNS_SHA" ]] || die "SmartDNS SHA256 不匹配：$actual"
   [[ "$(dpkg-deb --field "$deb" Package)" == smartdns ]] || die 'SmartDNS 包名验证失败。'
-  [[ "$(dpkg-deb --field "$deb" Architecture)" == "$(dpkg --print-architecture)" ]] || die 'SmartDNS 包架构验证失败。'
+  local package_arch
+  package_arch=$(dpkg-deb --field "$deb" Architecture)
+  # Upstream marks these architecture-specific, SHA256-pinned assets as "all".
+  [[ "$package_arch" == all || "$package_arch" == "$(dpkg --print-architecture)" ]] || die 'SmartDNS 包架构验证失败。'
   local deb_version
   deb_version=$(dpkg-deb --field "$deb" Version 2>/dev/null || true)
   [[ "$deb_version" == "$SMARTDNS_DEB_VERSION" ]] || die "SmartDNS 包版本验证失败：期望 $SMARTDNS_DEB_VERSION，实际 ${deb_version:-unknown}。"
@@ -1428,7 +1431,7 @@ configure_cf8443() {
   CURRENT_STEP='配置 Cloudflare 8443'
   local currently=false
   [[ -x "$CF_TOOL" || -e "$CF_TIMER" ]] && currently=true
-  ufw status 2>/dev/null | grep -Fq '# vps-init-cf8443' && currently=true || true
+  if ufw status 2>/dev/null | grep -Fq '# vps-init-cf8443'; then currently=true || true; fi
   if [[ "$CF8443_MODE" == auto ]]; then
     [[ "$currently" == true ]] || { log 'Cloudflare 8443：默认关闭。'; return 0; }
     CF8443_MODE=enable

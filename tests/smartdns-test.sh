@@ -96,7 +96,7 @@ done
   smartdns_pkg_values() { :; }
   install_smartdns_package() { :; }
   configure_smartdns_apt_policy() { :; }
-  # shellcheck disable=SC2329 # Called by the sourced installer.
+  # shellcheck disable=SC2329,SC2317 # Called by the sourced installer.
   command() { if [[ "${1:-}" == -v && "${2:-}" == smartdns ]]; then return 0; fi; builtin command "$@"; }
   # shellcheck disable=SC2329 # Called indirectly by the sourced installer.
   install() { :; }
@@ -123,7 +123,7 @@ fi
   capture_singbox_state() { SINGBOX_WAS_INSTALLED=false; SINGBOX_WAS_MANAGED=false; }
   configure_sagernet_repo() { :; }
   apt_get() { record "apt $*"; }
-  # shellcheck disable=SC2329 # Called by the sourced installer.
+  # shellcheck disable=SC2329,SC2317 # Called by the sourced installer.
   command() { if [[ "${1:-}" == -v && "${2:-}" == sing-box ]]; then return 0; fi; builtin command "$@"; }
   install() { :; }
   configure_singbox_boot_gate() { record gate; }
