@@ -24,7 +24,7 @@ unset -f dpkg
 
 for stack in ipv4 dual; do
   NETWORK_STACK=$stack
-  for transport in h3 dns53; do
+  for transport in h2 dns53; do
     write_smartdns_config "$TEST_TMP/$stack-$transport.conf" "$transport"
     config=$(cat "$TEST_TMP/$stack-$transport.conf")
     [[ "$config" == *'bind 127.0.0.1:53'* && "$config" == *'bind-tcp 127.0.0.1:53'* ]] || fail 'missing local UDP/TCP listener'
@@ -33,25 +33,47 @@ for stack in ipv4 dual; do
     else
       [[ "$config" == *'force-AAAA-SOA no'* && "$config" == *'bind [::1]:53'* ]] || fail 'dual DNS missing IPv6'
     fi
-    if [[ "$transport" == h3 ]]; then
-      [[ "$config" == *'server-h3 h3://'* ]] || fail 'H3 upstream missing'
+    upstreams=$(grep '^server' "$TEST_TMP/$stack-$transport.conf")
+    if [[ "$transport" == h2 ]]; then
+      expected=$'server-https https://cloudflare-dns.com/dns-query -host-ip 1.1.1.1\nserver-https https://dns.google/dns-query -host-ip 8.8.8.8'
     else
-      [[ "$config" != *'server-h3 '* && "$config" == *'server-tcp 1.1.1.1'* ]] || fail 'DNS53 fallback missing'
+      expected=$'server 1.1.1.1\nserver 8.8.8.8\nserver-tcp 1.1.1.1\nserver-tcp 8.8.8.8'
     fi
+    assert_eq "$expected" "$upstreams" "$stack $transport upstreams"
   done
 done
 
 # A CNAME alone or a broken TCP listener cannot satisfy the DNS health gate.
 (
   NETWORK_STACK=ipv4
-  dig() { if [[ " $* " == *' AAAA '* ]]; then return 0; fi; echo 192.0.2.1; }
+  dig() {
+    case " $* " in
+      *' TXT '*) echo 'status: NXDOMAIN,' ;;
+      *' AAAA '*) return 0 ;;
+      *) echo 192.0.2.1 ;;
+    esac
+  }
   smartdns_health_check || fail 'valid IPv4 DNS rejected'
-  dig() { echo cname.invalid.; }
+  dig() { if [[ " $* " == *' TXT '* ]]; then echo 'status: SERVFAIL,'; else echo 192.0.2.1; fi; }
+  if smartdns_health_check; then fail 'cached addresses passed without an upstream response'; fi
+  dig() { if [[ " $* " == *' TXT '* ]]; then echo 'status: NXDOMAIN,'; else echo cname.invalid.; fi; }
   if smartdns_health_check; then fail 'CNAME accepted as an address'; fi
-  dig() { [[ " $* " != *' +tcp '* ]] || return 1; echo 192.0.2.1; }
+  dig() {
+    case " $* " in
+      *' TXT '*) echo 'status: NXDOMAIN,' ;;
+      *' +tcp '*) return 1 ;;
+      *) echo 192.0.2.1 ;;
+    esac
+  }
   if smartdns_health_check; then fail 'broken TCP listener accepted'; fi
   NETWORK_STACK=dual
-  dig() { if [[ " $* " == *' AAAA '* ]]; then echo 2001:db8::1; else echo 192.0.2.1; fi; }
+  dig() {
+    case " $* " in
+      *' TXT '*) echo 'status: NXDOMAIN,' ;;
+      *' AAAA '*) echo 2001:db8::1 ;;
+      *) echo 192.0.2.1 ;;
+    esac
+  }
   smartdns_health_check || fail 'valid dual DNS rejected'
 )
 
@@ -89,7 +111,7 @@ for mode in smartdns singbox; do
   )
 done
 
-# Exercise H3 failure and DNS53 recovery through the production fallback branch.
+# Exercise DoH success, DNS53 recovery and complete upstream failure.
 (
   TMP_DIR=$TEST_TMP
   TRACE="$TEST_TMP/transport.trace"
@@ -102,12 +124,26 @@ done
   install() { :; }
   systemctl() { :; }
   smartdns() { echo 'smartdns test'; }
-  smartdns_try_transport() { echo "$1" >>"$TRACE"; [[ "$1" == dns53 ]]; }
+  smartdns_try_transport() { echo "$1" >>"$TRACE"; [[ "$1" == "$available_transport" ]]; }
   log() { :; }
   warn() { :; }
+  available_transport=h2
   install_and_configure_smartdns
-  assert_eq $'h3\ndns53' "$(cat "$TRACE")" 'transport fallback order'
+  assert_eq h2 "$(cat "$TRACE")" 'DoH success skips fallback'
+  assert_eq 'DoH (H2 优先)' "$SMARTDNS_TRANSPORT" 'DoH result'
+  : >"$TRACE"
+  available_transport=dns53
+  install_and_configure_smartdns
+  assert_eq $'h2\ndns53' "$(cat "$TRACE")" 'transport fallback order'
   assert_eq DNS53 "$SMARTDNS_TRANSPORT" 'fallback result'
+  : >"$TRACE"
+  available_transport=none
+  journalctl() { :; }
+  rollback_dns() { echo rollback >>"$TRACE"; }
+  if (install_and_configure_smartdns) >"$TEST_TMP/transport-error.log" 2>&1; then
+    fail 'complete upstream failure accepted'
+  fi
+  assert_eq $'h2\ndns53\nrollback' "$(cat "$TRACE")" 'complete failure invokes rollback'
 )
 
 # Conflicting independent CLI modes fail, before any system modification.
