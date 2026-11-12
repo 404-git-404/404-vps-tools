@@ -101,7 +101,7 @@ usage() {
   - 询问 SSH 公钥、SSH 端口、是否保留 22、是否 full-upgrade
   - 低内存且无合适 Swap 时才询问是否创建推荐 Swap
   - 自动检测 IPv6 是否真正可用：可用 => dual；不可用 => ipv4 并关闭 IPv6
-  - SmartDNS 自动选择 IPv4-only 或 IPv4+IPv6；优先 H3，失败自动回退 UDP/TCP 53
+  - SmartDNS 自动选择 IPv4-only 或 IPv4+IPv6；优先 DoH（H2），失败自动回退 UDP/TCP 53
   - 443/tcp + 443/udp 默认开放
   - Cloudflare 8443 默认不启用，使用 --cloudflare-8443 显式启用
 
@@ -922,7 +922,7 @@ backup_dns_state() {
 }
 
 write_smartdns_config() {
-  local out=$1 transport=${2:-h3}
+  local out=$1 transport=${2:-h2}
 
   if [[ "$NETWORK_STACK" == ipv4 ]]; then
     cat >"$out" <<'EOF'
@@ -985,24 +985,18 @@ EOF
   fi
 
   case "$transport" in
-    h3)
+    h2)
       cat >>"$out" <<'EOF'
 
-# Preferred upstream: Cloudflare + Google DNS-over-HTTPS/3 (UDP/443)
-server-h3 h3://cloudflare-dns.com/dns-query -host-ip 1.1.1.1
-server-h3 h3://dns.google/dns-query -host-ip 8.8.8.8
+# Preferred upstream: Cloudflare + Google DNS-over-HTTPS (HTTP/2 over IPv4).
+server-https https://cloudflare-dns.com/dns-query -host-ip 1.1.1.1
+server-https https://dns.google/dns-query -host-ip 8.8.8.8
 EOF
-      if [[ "$NETWORK_STACK" == dual ]]; then
-        cat >>"$out" <<'EOF'
-server-h3 h3://cloudflare-dns.com/dns-query -host-ip 2606:4700:4700::1111
-server-h3 h3://dns.google/dns-query -host-ip 2001:4860:4860::8888
-EOF
-      fi
       ;;
     dns53)
       cat >>"$out" <<'EOF'
 
-# Automatic fallback when H3/UDP443 is unavailable.
+# Automatic fallback when the DoH health check fails.
 # Use both UDP/53 and TCP/53 over IPv4 transport; AAAA answers remain available in dual-stack mode.
 server 1.1.1.1
 server 8.8.8.8
@@ -1017,7 +1011,11 @@ EOF
 }
 
 smartdns_health_check() {
-  local a='' aaaa='' tcp_a=''
+  local a='' aaaa='' tcp_a='' upstream=''
+  # Use a fresh name so persistent or expired cache entries cannot pass the upstream check.
+  upstream=$(dig @127.0.0.1 "_smartdns-check-$RANDOM-$RANDOM-$RANDOM.google.com." TXT +noall +comments +time=6 +tries=2 2>/dev/null) || return 1
+  [[ "$upstream" == *'status: NXDOMAIN,'* ]] || return 1
+
   tcp_a=$(dig @127.0.0.1 google.com A +tcp +short +time=6 +tries=2 2>/dev/null || true)
   grep -Eq '^([0-9]{1,3}\.){3}[0-9]{1,3}$' <<<"$tcp_a" || return 1
   a=$(dig @127.0.0.1 google.com A +short +time=6 +tries=2 2>/dev/null || true)
@@ -1033,9 +1031,9 @@ smartdns_health_check() {
 
 smartdns_try_transport() {
   local transport=$1 staged=$2
-  write_smartdns_config "$staged" "$transport"
+  write_smartdns_config "$staged" "$transport" || return 1
   make_mutable "$SMARTDNS_CONF"
-  install -m 0644 "$staged" "$SMARTDNS_CONF"
+  install -m 0644 "$staged" "$SMARTDNS_CONF" || return 1
 
   if ! systemctl restart smartdns.service >/dev/null 2>&1; then
     return 1
@@ -1125,17 +1123,17 @@ install_and_configure_smartdns() {
   systemctl enable smartdns.service >/dev/null
 
   SMARTDNS_TRANSPORT='unknown'
-  if smartdns_try_transport h3 "$staged"; then
-    SMARTDNS_TRANSPORT='H3'
-    log 'SmartDNS H3/UDP443 健康检查通过。'
+  if smartdns_try_transport h2 "$staged"; then
+    SMARTDNS_TRANSPORT='DoH (H2 优先)'
+    log 'SmartDNS DoH（H2 优先）健康检查通过。'
   else
-    warn 'SmartDNS H3/UDP443 不可用，自动回退到 Cloudflare/Google UDP+TCP 53。'
+    warn 'SmartDNS DoH（H2 优先）健康检查失败，自动回退到 Cloudflare/Google UDP+TCP 53。'
     if smartdns_try_transport dns53 "$staged"; then
       SMARTDNS_TRANSPORT='DNS53'
       log 'SmartDNS UDP/TCP 53 回退健康检查通过。'
     else
       journalctl -u smartdns -n 60 --no-pager >&2 || true
-      die 'SmartDNS H3 与 UDP/TCP 53 上游均未通过健康检查。'
+      die 'SmartDNS DoH 与 UDP/TCP 53 上游均未通过健康检查。'
     fi
   fi
 
