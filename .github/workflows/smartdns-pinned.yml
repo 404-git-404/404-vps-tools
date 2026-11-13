@@ -259,7 +259,7 @@ jobs:
           LEGACY_SHA: ${{ matrix.sha }}
           REPEAT: ${{ matrix.repeat }}
         run: |
-          docker exec --env RELEASE_BASE --env LEGACY_PACKAGE --env LEGACY_SHA --env REPEAT smartdns-migration bash -Eeuo pipefail -s <<'TEST'
+          docker exec -i --env RELEASE_BASE --env LEGACY_PACKAGE --env LEGACY_SHA --env REPEAT smartdns-migration bash -Eeuo pipefail -s <<'TEST'
           printf '#!/bin/sh\nexit 101\n' >/usr/sbin/policy-rc.d
           chmod 0755 /usr/sbin/policy-rc.d
           curl -fsSL --retry 3 "$RELEASE_BASE/$LEGACY_PACKAGE" -o /tmp/legacy.deb
@@ -293,7 +293,7 @@ jobs:
       - name: Exercise standalone Fail2ban with systemd and nftables
         if: matrix.repeat == 'false'
         run: |
-          docker exec smartdns-migration bash -Eeuo pipefail -s <<'TEST'
+          docker exec -i smartdns-migration bash -Eeuo pipefail -s <<'TEST'
           before=$(mktemp -d)
           cp /etc/smartdns/smartdns.conf /etc/resolv.conf "$before/"
           bash /repo/debian-init.sh --fail2ban-only
