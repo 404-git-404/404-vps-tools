@@ -26,6 +26,7 @@ jobs:
             request-cloudflare-certificate.sh
             tests/gg-status-container-test.sh
             tests/gg-status-test.sh
+            tests/fail2ban-test.sh
             tests/node-config-wizard-test.sh
             tests/smartdns-test.sh
           )
@@ -38,6 +39,7 @@ jobs:
             bash -n "$script"
           done
           for executable_script in \
+            tests/fail2ban-test.sh \
             tests/gg-status-container-test.sh \
             tests/gg-status-test.sh \
             tests/node-config-wizard-test.sh \
@@ -109,6 +111,7 @@ jobs:
           GG_STATUS_SHELL=/bin/dash PATH="$RUNNER_TEMP/mawk-bin:$PATH" bash tests/gg-status-test.sh
           PATH="$RUNNER_TEMP/mawk-bin:$PATH" bash tests/node-config-wizard-test.sh
           PATH="$RUNNER_TEMP/mawk-bin:$PATH" bash tests/smartdns-test.sh
+          PATH="$RUNNER_TEMP/mawk-bin:$PATH" bash tests/fail2ban-test.sh
 
       - name: Run Debian and Alpine containers
         run: |
@@ -120,6 +123,7 @@ jobs:
             debian-init.sh \
             request-cloudflare-certificate.sh \
             tests/gg-status-container-test.sh \
+            tests/fail2ban-test.sh \
             tests/gg-status-test.sh \
             tests/node-config-wizard-test.sh \
             tests/smartdns-test.sh \

@@ -25,6 +25,7 @@ readonly SMARTDNS_APT_PIN='/etc/apt/preferences.d/vps-init-smartdns'
 readonly SMARTDNS_RELEASE='Release48.4'
 readonly SMARTDNS_VERSION='1.2026.08.05-0921'
 readonly SMARTDNS_DEB_VERSION='2026.08.05-0921'
+FAIL2BAN_DIR='/etc/fail2ban'
 readonly SAGER_KEY_FINGERPRINT='2C317FBD5D886B4E89BAE8DA6D9152172A2B2F0C'
 readonly SINGBOX_CONFIG='/etc/sing-box/config.json'
 readonly SINGBOX_DROPIN_DIR='/etc/systemd/system/sing-box.service.d'
@@ -61,6 +62,13 @@ CONTAINER_KIND='none'
 SSH_TX=false
 DNS_TX=false
 UFW_TX=false
+FAIL2BAN_TX=false
+FAIL2BAN_SERVICE_CHANGED=false
+FAIL2BAN_RUNTIME_MASK=false
+FAIL2BAN_OLD_ACTIVE=false
+FAIL2BAN_OLD_ENABLED=false
+FAIL2BAN_PROBE_JAIL=''
+FAIL2BAN_PROBE_IP=''
 UFW_OLD_ACTIVE=false
 PREAUTH_SSH_PORT_ADDED=false
 PREAUTH_22_ADDED=false
@@ -83,6 +91,13 @@ IPV6_OLD_LO='0'
 
 # Files whose i/a attributes were temporarily cleared. Values are original lsattr flags.
 declare -A ORIGINAL_ATTRS=()
+declare -a IPV6_PROBE_CHANGED=()
+declare -a FAIL2BAN_MANAGED_FILES=(
+  jail.d/00-vps-init-defaults.local
+  jail.d/vps-init-sshd.local
+  filter.d/vps-init-sing-box-reality.conf
+  jail.d/vps-init-sing-box-reality.local
+)
 
 log()  { printf '[INFO] %s\n' "$*"; }
 warn() { printf '[WARN] %s\n' "$*" >&2; }
@@ -93,7 +108,7 @@ usage() {
   bash debian-init.sh
   bash debian-init.sh [选项]
 
-交互菜单：快速安装、自定义安装、退出、仅安装/更新 SmartDNS、仅部署 sing-box。
+交互菜单：快速安装、自定义安装、退出、仅安装/更新 SmartDNS、仅部署 sing-box、仅安装/更新 Fail2ban。
 仅部署 sing-box 独立运行节点配置向导；完整初始化只安装 sing-box，不创建节点。
 
 默认流程：
@@ -120,6 +135,7 @@ usage() {
   --base-only                只完成系统更新和基础工具安装
   --smartdns-only            仅安装/更新 SmartDNS 并验证系统 DNS
   --sing-box-only            仅安装 sing-box 并进入节点配置向导
+  --fail2ban-only            仅安装/更新 Fail2ban 并验证 Jail
   --help                     显示帮助
 EOF
 }
@@ -195,6 +211,8 @@ make_mutable() {
 cleanup() {
   local rc=$?
   set +e
+  restore_ipv6_probe_state || true
+  rollback_fail2ban || true
   if [[ "$SINGBOX_RUNTIME_MASK" == true ]]; then
     systemctl disable sing-box.service >/dev/null 2>&1 || true
     systemctl stop sing-box.service >/dev/null 2>&1 || true
@@ -309,6 +327,7 @@ on_error() {
 on_signal() {
   local sig=$1
   trap - ERR HUP INT TERM
+  restore_ipv6_probe_state || true
   rollback_ufw || true
   rollback_ssh || true
   rollback_dns || true
@@ -351,12 +370,13 @@ parse_args() {
       --network-stack) [[ $# -ge 2 ]] || die '--network-stack 缺少参数。'; NETWORK_REQUEST=$2; shift 2 ;;
       --cloudflare-8443) CF8443_MODE='enable'; shift ;;
       --no-cloudflare-8443) CF8443_MODE='disable'; shift ;;
-      --base-only|--smartdns-only|--sing-box-only)
+      --base-only|--smartdns-only|--sing-box-only|--fail2ban-only)
         [[ -z "$INSTALL_MODE" ]] || die '只能选择一种独立运行模式。'
         case "$1" in
           --base-only) BASE_ONLY=true; INSTALL_MODE=base ;;
           --smartdns-only) INSTALL_MODE=smartdns ;;
           --sing-box-only) INSTALL_MODE=singbox ;;
+          --fail2ban-only) INSTALL_MODE=fail2ban ;;
         esac
         shift ;;
       --help|-h) usage; exit 0 ;;
@@ -598,16 +618,97 @@ ipv4_https_works() {
 }
 
 ipv6_global_present() {
-  ip -6 addr show scope global 2>/dev/null | grep -q 'inet6 '
+  ip -6 addr show scope global |
+    awk '$1 == "inet6" && $2 ~ /^[23]/ && !/ (tentative|dadfailed|deprecated)( |$)/ { found=1 } END { exit !found }'
 }
 
 ipv6_route_present() {
-  ip -6 route get 2606:4700:4700::1111 >/dev/null 2>&1
+  ip -6 route show table all default |
+    awk '$1 == "default" && !/ (linkdown|dead)( |$)/ { found=1 } END { exit !found }'
+}
+
+ipv6_https_probe() {
+  local provider=$1 host=$2 address=$3 result rc
+  # Disable curlrc and proxies. Keep the hostname in the URL for SNI and certificate checks.
+  # Any HTTP response proves the HTTPS connection, including 400 from a bare DoH request.
+  if result=$(curl --disable -6 --noproxy '*' --resolve "$host:443:[$address]" \
+    --silent --show-error --output /dev/null --write-out '%{http_code}' \
+    --connect-timeout 4 --max-time 6 "https://$host/dns-query" 2>&1); then
+    if [[ "$result" =~ ^[1-5][0-9][0-9]$ ]]; then
+      log "IPv6 HTTPS $provider: PASS (HTTP $result)"
+      return 0
+    fi
+    warn "IPv6 HTTPS $provider: FAIL (no HTTP response: $result)"
+  else
+    rc=$?
+    warn "IPv6 HTTPS $provider: FAIL (curl $rc: $result)"
+  fi
+  return 1
 }
 
 ipv6_https_works() {
-  curl -6 --fail --silent --show-error --output /dev/null --connect-timeout 5 --max-time 10 https://icanhazip.com 2>/dev/null ||
-    curl -6 --fail --silent --show-error --output /dev/null --connect-timeout 5 --max-time 10 https://www.google.com/generate_204 2>/dev/null
+  local reachable=false
+  ipv6_https_probe Cloudflare cloudflare-dns.com 2606:4700:4700::1111 && reachable=true
+  ipv6_https_probe Google dns.google 2001:4860:4860::8888 && reachable=true
+  [[ "$reachable" == true ]]
+}
+
+detect_ipv6_stack() {
+  local address=false route=false detail
+  NETWORK_STACK=ipv4
+  if detail=$(ipv6_global_present 2>&1); then
+    address=true
+    log 'IPv6 Global Address: PASS'
+  else
+    warn "IPv6 Global Address: FAIL (${detail:-no usable global unicast address})"
+  fi
+  if detail=$(ipv6_route_present 2>&1); then
+    route=true
+    log 'IPv6 Default Route: PASS'
+  else
+    warn "IPv6 Default Route: FAIL (${detail:-no usable default route})"
+  fi
+  if [[ "$address" == true && "$route" == true ]]; then
+    if ipv6_https_works; then NETWORK_STACK=dual; fi
+  else
+    warn 'IPv6 HTTPS Cloudflare: FAIL (skipped: address or default route unavailable)'
+    warn 'IPv6 HTTPS Google: FAIL (skipped: address or default route unavailable)'
+  fi
+}
+
+ipv6_probe_keys() {
+  local path
+  # Writing conf/all affects every interface. Touch only disabled interfaces so
+  # the original per-interface state can be restored without disturbing live links.
+  for path in /proc/sys/net/ipv6/conf/*/disable_ipv6; do
+    [[ -e "$path" && "$path" != */all/* && "$path" != */default/* ]] || continue
+    printf '%s\n' "${path#/proc/sys/}"
+  done
+}
+
+enable_ipv6_for_probe() {
+  local key value
+  while IFS= read -r key; do
+    if value=$(sysctl -n "$key" 2>/dev/null) && [[ "$value" == 1 ]]; then
+      # Register before the write so a signal between commands still restores it.
+      IPV6_PROBE_CHANGED+=("$key")
+      if ! sysctl -q -w "$key=0"; then warn "IPv6 probe could not enable $key"; fi
+    fi
+  done < <(ipv6_probe_keys)
+  if (( ${#IPV6_PROBE_CHANGED[@]} )); then sleep 3; fi
+}
+
+restore_ipv6_probe_state() {
+  local key
+  local -a failed=()
+  for key in "${IPV6_PROBE_CHANGED[@]}"; do
+    if [[ "$(sysctl -n "$key" 2>/dev/null)" != 1 ]] && ! sysctl -q -w "$key=1"; then
+      warn "IPv6 probe could not restore $key"
+      failed+=("$key")
+    fi
+  done
+  IPV6_PROBE_CHANGED=("${failed[@]}")
+  (( ${#failed[@]} == 0 ))
 }
 
 ssh_session_uses_ipv6() {
@@ -619,33 +720,17 @@ ssh_session_uses_ipv6() {
 
 detect_network_stack() {
   CURRENT_STEP='检测网络栈'
-  local old_all old_default old_lo
   ipv4_https_works || die '未检测到可用 IPv4 HTTPS 出站；本脚本支持 IPv4-only 或双栈，不支持 IPv6-only。'
   case "$NETWORK_REQUEST" in
     ipv4) NETWORK_STACK='ipv4' ;;
     dual) NETWORK_STACK='dual' ;;
     auto)
-      # 旧版初始化可能已经把 IPv6 sysctl 关闭。为避免把“被关闭”误判成“供应商无 IPv6”，
-      # 在非容器环境临时启用后再做地址、路由和真实 HTTPS 出站三重检测，随后恢复原运行状态。
-      if [[ "$CONTAINER_KIND" == none ]]; then
-        old_all=$(sysctl -n net.ipv6.conf.all.disable_ipv6 2>/dev/null || echo 0)
-        old_default=$(sysctl -n net.ipv6.conf.default.disable_ipv6 2>/dev/null || echo 0)
-        old_lo=$(sysctl -n net.ipv6.conf.lo.disable_ipv6 2>/dev/null || echo 0)
-        sysctl -q -w net.ipv6.conf.all.disable_ipv6=0 2>/dev/null || true
-        sysctl -q -w net.ipv6.conf.default.disable_ipv6=0 2>/dev/null || true
-        sysctl -q -w net.ipv6.conf.lo.disable_ipv6=0 2>/dev/null || true
-        if [[ "$old_all$old_default$old_lo" != 000 ]]; then sleep 3; fi
+      if [[ "$CONTAINER_KIND" == none ]] && ! ssh_session_uses_ipv6 && ! ipv6_global_present 2>/dev/null; then
+        enable_ipv6_for_probe
       fi
-      if ipv6_global_present && ipv6_route_present && ipv6_https_works; then
-        NETWORK_STACK='dual'
-      else
-        NETWORK_STACK='ipv4'
-      fi
-      if [[ "$CONTAINER_KIND" == none ]]; then
-        if [[ "$old_all" =~ ^[01]$ ]]; then sysctl -q -w "net.ipv6.conf.all.disable_ipv6=$old_all" 2>/dev/null || true; fi
-        if [[ "$old_default" =~ ^[01]$ ]]; then sysctl -q -w "net.ipv6.conf.default.disable_ipv6=$old_default" 2>/dev/null || true; fi
-        if [[ "$old_lo" =~ ^[01]$ ]]; then sysctl -q -w "net.ipv6.conf.lo.disable_ipv6=$old_lo" 2>/dev/null || true; fi
-      fi
+      detect_ipv6_stack
+      restore_ipv6_probe_state || die '无法恢复 IPv6 探测前的接口状态。'
+      log "Selected Network Stack: $NETWORK_STACK"
       ;;
   esac
   if [[ "$NETWORK_STACK" == ipv4 ]] && ssh_session_uses_ipv6; then
@@ -1449,27 +1534,177 @@ configure_cf8443() {
   fi
 }
 
+rollback_fail2ban() {
+  local path saved
+  clear_fail2ban_probe || warn '无法撤销 Fail2ban 测试封禁。'
+  if [[ "$FAIL2BAN_TX" == true ]]; then
+    FAIL2BAN_TX=false
+    warn '正在回滚 Fail2ban 管理的配置。'
+    for path in "${FAIL2BAN_MANAGED_FILES[@]}"; do
+      saved="$BACKUP_DIR/fail2ban/$path"
+      if [[ -f "$saved" ]]; then
+        cp -a -- "$saved" "$FAIL2BAN_DIR/$path" || warn "无法恢复 $FAIL2BAN_DIR/$path"
+      else
+        rm -f -- "$FAIL2BAN_DIR/$path" || warn "无法移除 $FAIL2BAN_DIR/$path"
+      fi
+    done
+    if [[ "$FAIL2BAN_SERVICE_CHANGED" == true ]]; then
+      if [[ "$FAIL2BAN_OLD_ACTIVE" == true ]]; then
+        systemctl reload-or-restart fail2ban.service || warn '无法恢复 Fail2ban 服务。'
+      else
+        systemctl stop fail2ban.service || warn '无法停止 Fail2ban 服务。'
+      fi
+      if [[ "$FAIL2BAN_OLD_ENABLED" == false ]]; then
+        systemctl disable fail2ban.service || warn '无法恢复 Fail2ban 开机自启状态。'
+      fi
+    fi
+  fi
+  if [[ "$FAIL2BAN_RUNTIME_MASK" == true ]]; then
+    systemctl disable fail2ban.service >/dev/null 2>&1 || true
+    systemctl unmask --runtime fail2ban.service || warn '无法移除本次安装的 Fail2ban 临时 mask。'
+  fi
+}
+
+fail2ban_ufw_active() {
+  local status
+  command -v ufw >/dev/null 2>&1 || return 1
+  status=$(ufw status) || die '无法读取 UFW 状态。'
+  [[ "$status" == 'Status: active'* ]]
+}
+
+fail2ban_reality_available() {
+  local logs
+  systemctl is-active --quiet sing-box.service || return 1
+  logs=$(journalctl -u sing-box.service -b --no-pager -o cat -n 500) || return 1
+  grep -Eq 'inbound/vless\[[^]]+\].*REALITY:' <<<"$logs" && return 0
+  grep -Eq 'inbound/vless\[[^]]+\]' <<<"$logs" || return 1
+  python3 - "$SINGBOX_CONFIG" <<'PY'
+import json
+import sys
+
+try:
+    with open(sys.argv[1]) as config:
+        inbounds = json.load(config).get("inbounds", [])
+    sys.exit(not any(
+        inbound.get("type") == "vless"
+        and inbound.get("tls", {}).get("enabled") is True
+        and inbound["tls"].get("reality", {}).get("enabled") is True
+        for inbound in inbounds
+    ))
+except (OSError, ValueError, AttributeError, TypeError):
+    sys.exit(1)
+PY
+}
+
+fail2ban_default_ignoreip() {
+  /usr/bin/python3 - "$FAIL2BAN_DIR" <<'PY'
+import sys
+from fail2ban.client.configreader import ConfigReader
+
+reader = ConfigReader()
+reader.setBaseDir(sys.argv[1])
+reader.read("jail")
+if reader.has_option("DEFAULT", "ignoreip"):
+    print(" ".join(reader.get("DEFAULT", "ignoreip").split()))
+PY
+}
+
+verify_fail2ban_action() {
+  local jail=$1 expected=$2 actions
+  actions=$(fail2ban-client get "$jail" actions) || return 1
+  # Avoid exercising additional custom actions such as mail/webhook notifications.
+  [[ "${actions##*$'\n'}" == "$expected" ]] || return 1
+  # Force action initialization using an unused documentation address. Verify
+  # the kernel-side result because Fail2ban can queue a ban before the action runs.
+  local address=192.0.2.254 attempt ok=false firewall banned
+  local peer=${SSH_CONNECTION:-}
+  peer=${peer%% *}
+  [[ "$address" != "$peer" ]] || address=198.51.100.254
+  firewall=$(fail2ban_firewall_state "$expected") || return 1
+  banned=$(fail2ban-client get "$jail" banip) || return 1
+  if grep -Fqw "$address" <<<"$firewall"$'\n'"$banned"; then
+    warn "Fail2ban 探测地址 $address 已存在于防火墙规则。"
+    return 1
+  fi
+  FAIL2BAN_PROBE_JAIL=$jail
+  FAIL2BAN_PROBE_IP=$address
+  local added
+  added=$(fail2ban-client set "$jail" banip "$address") || return 1
+  if [[ "$added" != 1 ]]; then
+    FAIL2BAN_PROBE_IP=''
+    return 1
+  fi
+  for ((attempt=0; attempt<10; attempt++)); do
+    if firewall=$(fail2ban_firewall_state "$expected") && grep -Fqw "$address" <<<"$firewall"; then
+      ok=true
+      break
+    fi
+    sleep 1
+  done
+  clear_fail2ban_probe || return 1
+  for ((attempt=0; attempt<10; attempt++)); do
+    firewall=$(fail2ban_firewall_state "$expected") || return 1
+    if ! grep -Fqw "$address" <<<"$firewall"; then
+      [[ "$ok" == true ]]
+      return
+    fi
+    sleep 1
+  done
+  return 1
+}
+
+fail2ban_firewall_state() {
+  if [[ "$1" == ufw ]]; then ufw status; else nft -n list ruleset; fi
+}
+
+clear_fail2ban_probe() {
+  [[ -n "$FAIL2BAN_PROBE_IP" ]] || return 0
+  fail2ban-client set "$FAIL2BAN_PROBE_JAIL" unbanip "$FAIL2BAN_PROBE_IP" >/dev/null || return 1
+  FAIL2BAN_PROBE_IP=''
+}
+
 configure_fail2ban() {
   CURRENT_STEP='配置 Fail2ban'
-  local path
-  local -a managed_files=(
-    /etc/fail2ban/jail.d/00-vps-init-defaults.local
-    /etc/fail2ban/jail.d/vps-init-sshd.local
-    /etc/fail2ban/filter.d/vps-init-sing-box-reality.conf
-    /etc/fail2ban/jail.d/vps-init-sing-box-reality.local
-  )
-  install -d -m 0755 /etc/fail2ban/jail.d /etc/fail2ban/filter.d
-  for path in "${managed_files[@]}"; do
-    reject_symlink "$path"
-    make_mutable "$path"
+  local action=${1:-ufw} reality=true action_config='ufw[blocktype=deny]' path peer=''
+  local -a jails=(sshd sshd-slow)
+  if [[ "$INSTALL_MODE" == fail2ban ]]; then
+    if ! fail2ban_reality_available; then reality=false; fi
+    if [[ "$action" == nftables ]]; then action_config='nftables[type=allports]'; fi
+    peer=${SSH_CONNECTION:-}
+    peer=${peer%% *}
+    # Only literal SSH peer addresses may be written to jail config.
+    [[ "$peer" =~ ^[0-9A-Fa-f:.]+$ ]] || peer=''
+    if systemctl is-active --quiet fail2ban.service; then
+      FAIL2BAN_OLD_ACTIVE=true
+      fail2ban-client status
+    fi
+    if systemctl is-enabled --quiet fail2ban.service; then FAIL2BAN_OLD_ENABLED=true; fi
+    reject_symlink "$FAIL2BAN_DIR"
+    reject_symlink "$FAIL2BAN_DIR/jail.d"
+    reject_symlink "$FAIL2BAN_DIR/filter.d"
+    install -d -m 0700 "$BACKUP_DIR/fail2ban/jail.d" "$BACKUP_DIR/fail2ban/filter.d"
+  fi
+  install -d -m 0755 "$FAIL2BAN_DIR/jail.d" "$FAIL2BAN_DIR/filter.d"
+  for path in "${FAIL2BAN_MANAGED_FILES[@]}"; do
+    reject_symlink "$FAIL2BAN_DIR/$path"
+    if [[ "$INSTALL_MODE" == fail2ban && -f "$FAIL2BAN_DIR/$path" ]]; then
+      cp -a -- "$FAIL2BAN_DIR/$path" "$BACKUP_DIR/fail2ban/$path"
+    fi
+    make_mutable "$FAIL2BAN_DIR/$path"
   done
-  cat >/etc/fail2ban/jail.d/00-vps-init-defaults.local <<'EOF'
+  if [[ "$INSTALL_MODE" == fail2ban ]]; then
+    FAIL2BAN_TX=true
+    # Replace our legacy global defaults with jail-scoped settings below.
+    rm -f -- "$FAIL2BAN_DIR/jail.d/00-vps-init-defaults.local"
+  else
+    cat >"$FAIL2BAN_DIR/jail.d/00-vps-init-defaults.local" <<'EOF'
 [DEFAULT]
 backend = systemd
 banaction = ufw[blocktype=deny]
 ignoreip = 127.0.0.1/8 ::1
 EOF
-  cat >/etc/fail2ban/jail.d/vps-init-sshd.local <<'EOF'
+  fi
+  cat >"$FAIL2BAN_DIR/jail.d/vps-init-sshd.local" <<'EOF'
 [sshd]
 enabled = true
 filter = sshd
@@ -1486,13 +1721,15 @@ maxretry = 20
 findtime = 24h
 bantime = 7d
 EOF
-  cat >/etc/fail2ban/filter.d/vps-init-sing-box-reality.conf <<'EOF'
+  if [[ "$reality" == true ]]; then
+    jails+=(sing-box-reality sing-box-reality-slow)
+    cat >"$FAIL2BAN_DIR/filter.d/vps-init-sing-box-reality.conf" <<'EOF'
 [Definition]
 failregex = ^.*inbound/vless\[[^]]+\]: process connection from \[?<HOST>\]?:\d+: TLS handshake: REALITY: processed invalid connection$
 ignoreregex =
 journalmatch = _SYSTEMD_UNIT=sing-box.service
 EOF
-  cat >/etc/fail2ban/jail.d/vps-init-sing-box-reality.local <<'EOF'
+    cat >"$FAIL2BAN_DIR/jail.d/vps-init-sing-box-reality.local" <<'EOF'
 [sing-box-reality]
 enabled = true
 filter = vps-init-sing-box-reality
@@ -1509,12 +1746,44 @@ maxretry = 500
 findtime = 7d
 bantime = 28d
 EOF
+  else
+    # Keep the filter available for custom jails that reference it.
+    rm -f -- "$FAIL2BAN_DIR/jail.d/vps-init-sing-box-reality.local"
+  fi
+  if [[ "$INSTALL_MODE" == fail2ban ]]; then
+    local ignore_defaults
+    ignore_defaults=$(fail2ban_default_ignoreip)
+    for path in "$FAIL2BAN_DIR/jail.d/vps-init-sshd.local" "$FAIL2BAN_DIR/jail.d/vps-init-sing-box-reality.local"; do
+      [[ -f "$path" ]] || continue
+      awk -v action="$action_config" -v ignore="$ignore_defaults 127.0.0.1/8 ::1 $peer" '
+        { print }
+        /^backend = systemd$/ { print "banaction = " action; print "ignoreip = " ignore }
+      ' "$path" >"$TMP_DIR/fail2ban-jail.local"
+      install -m 0600 "$TMP_DIR/fail2ban-jail.local" "$path"
+    done
+  fi
   fail2ban-client -t >/dev/null || die 'Fail2ban 配置测试失败。'
-  systemctl enable fail2ban.service >/dev/null
-  systemctl restart fail2ban.service
-  local attempt
+  if [[ "$INSTALL_MODE" == fail2ban ]]; then
+    FAIL2BAN_SERVICE_CHANGED=true
+    systemctl reload-or-restart fail2ban.service
+  else
+    systemctl enable fail2ban.service >/dev/null
+    systemctl restart fail2ban.service
+  fi
+  local attempt jail
   for ((attempt=0; attempt<15; attempt++)); do fail2ban-client ping >/dev/null 2>&1 && break; sleep 1; done
   fail2ban-client ping >/dev/null 2>&1 || die 'Fail2ban 未就绪。'
+  if [[ "$INSTALL_MODE" == fail2ban ]]; then
+    systemctl is-active --quiet fail2ban.service || die 'Fail2ban 服务未运行。'
+    for jail in "${jails[@]}"; do
+      fail2ban-client status "$jail" >/dev/null || die "Fail2ban Jail 未运行：$jail"
+      verify_fail2ban_action "$jail" "$action" || die "Fail2ban 封禁动作验证失败：$jail ($action)"
+    done
+    systemctl enable fail2ban.service >/dev/null
+    systemctl is-enabled --quiet fail2ban.service || die 'Fail2ban 未设置为开机自启。'
+    FAIL2BAN_TX=false
+    log "Fail2ban 封禁后端=$action；REALITY=$reality；备份=$BACKUP_DIR/fail2ban"
+  fi
   log "Fail2ban jails：$(fail2ban-client status | sed -n 's/.*Jail list:[[:space:]]*//p')"
 }
 
@@ -1545,14 +1814,15 @@ select_install_mode() {
   [[ -z "$INSTALL_MODE" ]] || return 0
   local choice=''
   while true; do
-    printf '\n1. 快速安装\n2. 自定义安装\n3. 退出\n4. 仅安装/更新 SmartDNS\n5. 仅部署 sing-box\n' >/dev/tty
-    read_tty '请选择 [1-5]: ' choice
+    printf '\n1. 快速安装\n2. 自定义安装\n3. 退出\n4. 仅安装/更新 SmartDNS\n5. 仅部署 sing-box\n6. 仅安装/更新 Fail2ban\n' >/dev/tty
+    read_tty '请选择 [1-6]: ' choice
     case "$choice" in
       1) INSTALL_MODE=quick; return 0 ;;
       2) INSTALL_MODE=custom; return 0 ;;
       3) exit 0 ;;
       4) INSTALL_MODE=smartdns; return 0 ;;
       5) INSTALL_MODE=singbox; return 0 ;;
+      6) INSTALL_MODE=fail2ban; return 0 ;;
       *) printf '无效选择。\n' >/dev/tty ;;
     esac
   done
@@ -1593,12 +1863,7 @@ run_smartdns_only() {
   case "$NETWORK_REQUEST" in
     ipv4) NETWORK_STACK=ipv4 ;;
     dual) NETWORK_STACK=dual ;;
-    auto)
-      if ipv6_global_present && ipv6_route_present && ipv6_https_works; then
-        NETWORK_STACK=dual
-      else
-        NETWORK_STACK=ipv4
-      fi ;;
+    auto) detect_ipv6_stack; log "Selected Network Stack: $NETWORK_STACK" ;;
   esac
   backup_dns_state
   DNS_TX=true
@@ -1614,6 +1879,42 @@ run_singbox_only() {
   run_node_config_wizard </dev/tty
 }
 
+run_fail2ban_only() {
+  CURRENT_STEP='安装 Fail2ban 依赖'
+  local action=nftables package installed fresh=false
+  local -a packages=(fail2ban python3-systemd) missing=()
+  if fail2ban_ufw_active; then action=ufw; else packages+=(nftables); fi
+  for package in "${packages[@]}"; do
+    installed=$(dpkg-query -W -f='${Status}' "$package" 2>/dev/null) || installed=''
+    if [[ "$installed" != 'install ok installed' && "$installed" != 'hold ok installed' ]]; then
+      missing+=("$package")
+      if [[ "$package" == fail2ban ]]; then fresh=true; fi
+    fi
+  done
+  if (( ${#missing[@]} )); then
+    wait_for_package_manager
+    if [[ "$fresh" == true ]]; then
+      if [[ "$(systemctl is-enabled fail2ban.service 2>/dev/null || true)" == masked* ]]; then
+        die 'Fail2ban 已被管理员 mask，请先确认服务策略。'
+      fi
+      FAIL2BAN_RUNTIME_MASK=true
+      systemctl mask --runtime fail2ban.service
+    fi
+    apt_get update
+    apt_get install -y --no-install-recommends --no-upgrade "${missing[@]}"
+    if [[ "$FAIL2BAN_RUNTIME_MASK" == true ]]; then
+      systemctl disable fail2ban.service >/dev/null
+      systemctl unmask --runtime fail2ban.service
+      FAIL2BAN_RUNTIME_MASK=false
+    fi
+  fi
+  if [[ "$action" == nftables ]]; then
+    # Check permission and kernel support without committing firewall changes.
+    nft --check add table inet vps_init_fail2ban_check || die 'UFW 未启用，nftables 也无法写入规则。'
+  fi
+  configure_fail2ban "$action"
+}
+
 main() {
   parse_args "$@"
   select_install_mode
@@ -1622,6 +1923,7 @@ main() {
   case "$INSTALL_MODE" in
     smartdns) run_smartdns_only; return 0 ;;
     singbox) run_singbox_only; return 0 ;;
+    fail2ban) run_fail2ban_only; return 0 ;;
   esac
   if [[ "$INSTALL_MODE" == quick ]]; then
     SSH_PORT_SET=true

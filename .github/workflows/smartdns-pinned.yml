@@ -259,7 +259,7 @@ jobs:
           LEGACY_SHA: ${{ matrix.sha }}
           REPEAT: ${{ matrix.repeat }}
         run: |
-          docker exec --env RELEASE_BASE --env LEGACY_PACKAGE --env LEGACY_SHA --env REPEAT smartdns-migration bash -Eeuo pipefail -s <<'TEST'
+          docker exec -i --env RELEASE_BASE --env LEGACY_PACKAGE --env LEGACY_SHA --env REPEAT smartdns-migration bash -Eeuo pipefail -s <<'TEST'
           printf '#!/bin/sh\nexit 101\n' >/usr/sbin/policy-rc.d
           chmod 0755 /usr/sbin/policy-rc.d
           curl -fsSL --retry 3 "$RELEASE_BASE/$LEGACY_PACKAGE" -o /tmp/legacy.deb
@@ -289,6 +289,26 @@ jobs:
             cmp /tmp/first-run.conf /etc/smartdns/smartdns.conf
             getent ahostsv4 debian.org >/dev/null
           fi
+          TEST
+      - name: Exercise standalone Fail2ban with systemd and nftables
+        if: matrix.repeat == 'false'
+        run: |
+          docker exec -i smartdns-migration bash -Eeuo pipefail -s <<'TEST'
+          before=$(mktemp -d)
+          cp /etc/smartdns/smartdns.conf /etc/resolv.conf "$before/"
+          bash /repo/debian-init.sh --fail2ban-only
+          systemctl is-active --quiet fail2ban.service
+          systemctl is-enabled --quiet fail2ban.service
+          fail2ban-client status sshd
+          fail2ban-client status sshd-slow
+          fail2ban-client get sshd actions | grep -Fx nftables
+          cp /etc/fail2ban/jail.d/vps-init-sshd.local "$before/"
+          bash /repo/debian-init.sh --fail2ban-only
+          cmp "$before/vps-init-sshd.local" /etc/fail2ban/jail.d/vps-init-sshd.local
+          cmp "$before/smartdns.conf" /etc/smartdns/smartdns.conf
+          cmp "$before/resolv.conf" /etc/resolv.conf
+          systemctl is-active --quiet smartdns.service
+          test ! -e /etc/fail2ban/jail.d/vps-init-sing-box-reality.local
           TEST
       - name: Show service diagnostics
         if: failure()
