@@ -79,6 +79,126 @@ done
 
 NETWORK_STACK=unknown
 
+# Validate the production address/route filters and the exact curl arguments.
+(
+  TRACE="$TEST_TMP/ipv6-curl.trace"
+  ip() {
+    case "$*" in
+      '-6 addr show scope global') printf '%s\n' "$addresses" ;;
+      '-6 route show table all default') printf '%s\n' "$routes" ;;
+      *) fail "unexpected ip invocation: $*" ;;
+    esac
+  }
+  curl() {
+    local host address status
+    case "${*: -1}" in
+      https://cloudflare-dns.com/dns-query) host='cloudflare-dns.com'; address=2606:4700:4700::1111; status=$cloudflare ;;
+      https://dns.google/dns-query) host=dns.google; address=2001:4860:4860::8888; status=$google ;;
+      *) fail 'unexpected HTTPS target' ;;
+    esac
+    assert_eq '--disable' "$1" 'curl ignores curlrc'
+    local args
+    args=$(printf '%s\n' "$@")
+    for arg in -6 --noproxy '*' --resolve "$host:443:[$address]" --connect-timeout --max-time; do
+      grep -Fxq -- "$arg" <<<"$args" || fail "missing curl argument: $arg"
+    done
+    if grep -Exq -- '(-k|--insecure|--fail|--location)' <<<"$args"; then fail 'unsafe curl flags'; fi
+    echo "$host" >>"$TRACE"
+    if [[ "$status" == 400 ]]; then echo 400; return 0; fi
+    echo 'simulated curl failure' >&2
+    return "$status"
+  }
+  check_ipv6() {
+    local expected=$1 count=$2 output="$TEST_TMP/ipv6-detect.log"
+    : >"$TRACE"
+    detect_ipv6_stack >"$output" 2>&1
+    assert_eq "$expected" "$NETWORK_STACK" 'detected network stack'
+    assert_eq "$count" "$(wc -l <"$TRACE" | tr -d ' ')" 'probe count'
+    for label in 'Global Address' 'Default Route' 'HTTPS Cloudflare' 'HTTPS Google'; do
+      grep -Eq "IPv6 $label: (PASS|FAIL)" "$output" || fail "missing diagnostic: $label"
+    done
+  }
+  # Model a resolver that suppresses AAAA: the fake curl only works with the
+  # literal IPv6 mapping, and this path must never make a DNS query.
+  # shellcheck disable=SC2329 # Fail if the detection ever calls dig.
+  dig() { fail 'IPv6 detection queried local DNS'; }
+  addresses='    inet6 2001:db8::1/64 scope global'
+  routes='default via fe80::1 dev eth0'
+  cloudflare=400 google=400
+  check_ipv6 dual 2
+  cloudflare=28
+  check_ipv6 dual 2
+  grep -Fq 'curl 28' "$TEST_TMP/ipv6-detect.log"
+  cloudflare=400 google=60
+  check_ipv6 dual 2
+  grep -Fq 'curl 60' "$TEST_TMP/ipv6-detect.log"
+  cloudflare=7
+  check_ipv6 ipv4 2
+  addresses=$'    inet6 fd00::1/64 scope global\n    inet6 2001:db8::1/64 scope global tentative'
+  check_ipv6 ipv4 0
+  addresses='    inet6 2001:db8::1/64 scope global'
+  routes=$'unreachable default dev lo\ndefault via fe80::1 dev eth0 linkdown'
+  check_ipv6 ipv4 0
+  for mode in ipv4 dual; do
+    INSTALL_MODE='' NETWORK_REQUEST=auto
+    parse_args --smartdns-only --network-stack "$mode"
+    install_component_dependencies() { :; }
+    backup_dns_state() { :; }
+    install_and_configure_smartdns() { :; }
+    configure_system_dns() { DNS_TX=false; }
+    detect_ipv6_stack() { fail 'manual mode invoked auto detection'; }
+    run_smartdns_only
+    assert_eq "$mode" "$NETWORK_STACK" 'manual SmartDNS network stack'
+  done
+)
+
+# Use simulated per-interface sysctls and the real signal/EXIT cleanup handlers.
+for failure in timeout enable-error probe-error TERM; do
+  (
+    probe_key=net/ipv6/conf/eth0/disable_ipv6
+    state="$TEST_TMP/ipv6-sysctl"
+    echo 1 >"$state"
+    NETWORK_REQUEST=auto
+    CONTAINER_KIND=none
+    unset SSH_CONNECTION
+    ipv4_https_works() { :; }
+    ipv6_global_present() { [[ "$(cat "$state")" == 0 ]]; }
+    ipv6_route_present() { :; }
+    ipv6_probe_keys() { printf '%s\n' "$probe_key" net/ipv6/conf/eth1/disable_ipv6; }
+    sleep() { :; }
+    sysctl() {
+      case "$*" in
+        "-n $probe_key") cat "$state" ;;
+        '-n net/ipv6/conf/eth1/disable_ipv6') echo 0 ;;
+        "-q -w $probe_key=0")
+          echo 0 >"$state"
+          [[ "$failure" != enable-error ]] ;;
+        "-q -w $probe_key=1") echo 1 >"$state" ;;
+        *) fail "unexpected sysctl: $*" ;;
+      esac
+    }
+    ipv6_https_works() {
+      case "$failure" in
+        TERM) kill -TERM "$BASHPID" ;;
+        probe-error) die 'simulated unexpected probe failure' ;;
+        *) return 1 ;;
+      esac
+    }
+    if [[ "$failure" == TERM || "$failure" == probe-error ]]; then
+      # A standalone Bash process receives the same handlers as the installer.
+      (
+        trap 'on_signal TERM' TERM
+        trap cleanup EXIT
+        detect_network_stack
+      ) && fail 'interrupted probe returned success'
+    else
+      detect_network_stack
+      assert_eq ipv4 "$NETWORK_STACK" 'failed probe network stack'
+    fi
+    assert_eq 1 "$(cat "$state")" 'temporary interface state restored'
+  )
+done
+
 # The independent modes must never reach full initialization steps.
 for mode in smartdns singbox; do
   (
@@ -96,6 +216,7 @@ for mode in smartdns singbox; do
     run_singbox_only() { install_component_dependencies; install_sing_box; run_node_config_wizard; }
     NETWORK_REQUEST=auto
     ipv6_global_present() { return 1; }
+    ipv6_route_present() { return 1; }
     backup_dns_state() { record dns-backup; }
     install_and_configure_smartdns() { record smartdns; }
     configure_system_dns() { record resolver; DNS_TX=false; }
