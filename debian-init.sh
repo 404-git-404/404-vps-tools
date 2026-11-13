@@ -52,6 +52,7 @@ BASE_ONLY=false
 INSTALL_MODE=''
 SINGBOX_RUNTIME_MASK=false
 NETWORK_REQUEST='auto'
+NETWORK_REQUEST_SET=false
 NETWORK_STACK='unknown'
 SING_BOX_VERSION=''
 PUBKEY_ARGUMENT=''
@@ -70,8 +71,6 @@ FAIL2BAN_OLD_ENABLED=false
 FAIL2BAN_PROBE_JAIL=''
 FAIL2BAN_PROBE_IP=''
 UFW_OLD_ACTIVE=false
-PREAUTH_SSH_PORT_ADDED=false
-PREAUTH_22_ADDED=false
 SMARTDNS_OLD_ACTIVE=false
 SMARTDNS_OLD_ENABLED=false
 SMARTDNS_DID_INSTALL=false
@@ -85,9 +84,12 @@ SINGBOX_CONFIG_PREEXISTED=false
 SINGBOX_WAS_MANAGED=false
 SWAP_RECOMMENDED_MIB=0
 PERSIST_RESOLV_IMMUTABLE=false
-IPV6_OLD_ALL='0'
-IPV6_OLD_DEFAULT='0'
-IPV6_OLD_LO='0'
+IPV6_OLD_DEFAULT=''
+declare -A IPV6_OLD_INTERFACES=()
+NETWORK_POLICY_CHANGED=false
+LEGACY_NETWORK_CHANGED=false
+LEGACY_NETWORK_WAS_ACTIVE=false
+LEGACY_NETWORK_WAS_ENABLED=false
 
 # Files whose i/a attributes were temporarily cleared. Values are original lsattr flags.
 declare -A ORIGINAL_ATTRS=()
@@ -115,7 +117,9 @@ usage() {
   - Debian 12/13 amd64/arm64
   - 询问 SSH 公钥、SSH 端口、是否保留 22、是否 full-upgrade
   - 低内存且无合适 Swap 时才询问是否创建推荐 Swap
-  - 自动检测 IPv6 是否真正可用：可用 => dual；不可用 => ipv4 并关闭 IPv6
+  - 快速安装默认只监听 SSH 53651，可改选 22 或自定义单端口
+  - Auto 探测当前 IPv6 连通性，失败时仍保留 IPv6 和 DNS AAAA 能力
+  - 仅显式选择 ipv4 才持久禁用 IPv6，dual 则显式启用
   - SmartDNS 自动选择 IPv4-only 或 IPv4+IPv6；优先 DoH（H2），失败自动回退 UDP/TCP 53
   - 443/tcp + 443/udp 默认开放
   - Cloudflare 8443 默认不启用，使用 --cloudflare-8443 显式启用
@@ -123,13 +127,13 @@ usage() {
 选项：
   --pubkey "KEY"             预先提供 SSH 公钥
   --pubkey-file FILE         从文件读取 SSH 公钥
-  --ssh-port PORT            SSH 新端口（默认 53651）
-  --keep-22                  保留 22/tcp（默认）
-  --close-22                 不由本脚本开放 22/tcp
+  --ssh-port PORT            指定 SSH 端口并跳过端口菜单（默认 53651）
+  --keep-22                  兼容旧部署，为非 22 的 SSH 端口保留 22 备用
+  --close-22                 仅使用所选 SSH 端口（快速安装默认）
   --full-upgrade             执行 full-upgrade（默认）
   --skip-upgrade             仅 apt update，不执行 full-upgrade
   --sing-box-version VER     指定 sing-box 版本；未指定时已安装版本不会被重跑升级
-  --network-stack MODE       auto、ipv4、dual（默认 auto）
+  --network-stack MODE       auto、ipv4、dual（默认 auto），显式参数跳过网络菜单
   --cloudflare-8443          启用 Cloudflare-only 8443/tcp + 每日刷新
   --no-cloudflare-8443       删除本脚本管理的 Cloudflare 8443 规则/定时器
   --base-only                只完成系统更新和基础工具安装
@@ -240,8 +244,6 @@ rollback_ssh() {
     cp -a -- "$BACKUP_DIR/ssh/sshd_config" "$SSH_MAIN"
   fi
   if sshd -t >/dev/null 2>&1; then systemctl reload ssh.service >/dev/null 2>&1 || true; fi
-  if [[ "$PREAUTH_SSH_PORT_ADDED" == true ]]; then ufw_delete_comment_rules 'vps-init-ssh' >/dev/null 2>&1 || true; PREAUTH_SSH_PORT_ADDED=false; fi
-  if [[ "$PREAUTH_22_ADDED" == true ]]; then ufw_delete_comment_rules 'vps-init-ssh-backup' >/dev/null 2>&1 || true; PREAUTH_22_ADDED=false; fi
 }
 
 rollback_dns() {
@@ -256,10 +258,9 @@ rollback_dns() {
   elif [[ -e "$BACKUP_DIR/dns/no-smartdns-conf" ]]; then
     rm -f -- "$SMARTDNS_CONF"
   fi
-  if [[ -e "$BACKUP_DIR/dns/network-sysctl" ]]; then
-    cp -a "$BACKUP_DIR/dns/network-sysctl" "$NETWORK_SYSCTL" 2>/dev/null || true
-  elif [[ -e "$BACKUP_DIR/dns/no-network-sysctl" ]]; then
-    rm -f -- "$NETWORK_SYSCTL"
+  if [[ "$NETWORK_POLICY_CHANGED" == true ]]; then
+    rollback_legacy_network_stack
+    rollback_network_policy
   fi
   if [[ "$IPV6_OLD_ALL" =~ ^[01]$ ]]; then sysctl -q -w "net.ipv6.conf.all.disable_ipv6=$IPV6_OLD_ALL" 2>/dev/null || true; fi
   if [[ "$IPV6_OLD_DEFAULT" =~ ^[01]$ ]]; then sysctl -q -w "net.ipv6.conf.default.disable_ipv6=$IPV6_OLD_DEFAULT" 2>/dev/null || true; fi
@@ -351,9 +352,9 @@ trap 'on_signal TERM' TERM
 
 validate_port() {
   local p=$1
-  [[ "$p" =~ ^[0-9]+$ ]] || return 1
+  [[ "$p" =~ ^[1-9][0-9]{0,4}$ ]] || return 1
   (( 10#$p >= 1 && 10#$p <= 65535 )) || return 1
-  case "$p" in 22|53|80|443|8443) return 1 ;; esac
+  case "$p" in 53|80|443|8443) return 1 ;; esac
 }
 
 parse_args() {
@@ -367,7 +368,7 @@ parse_args() {
       --full-upgrade) DO_FULL_UPGRADE=true; DO_FULL_UPGRADE_SET=true; shift ;;
       --skip-upgrade) DO_FULL_UPGRADE=false; DO_FULL_UPGRADE_SET=true; shift ;;
       --sing-box-version) [[ $# -ge 2 ]] || die '--sing-box-version 缺少参数。'; SING_BOX_VERSION=${2#v}; shift 2 ;;
-      --network-stack) [[ $# -ge 2 ]] || die '--network-stack 缺少参数。'; NETWORK_REQUEST=$2; shift 2 ;;
+      --network-stack) [[ $# -ge 2 ]] || die '--network-stack 缺少参数。'; NETWORK_REQUEST=$2; NETWORK_REQUEST_SET=true; shift 2 ;;
       --cloudflare-8443) CF8443_MODE='enable'; shift ;;
       --no-cloudflare-8443) CF8443_MODE='disable'; shift ;;
       --base-only|--smartdns-only|--sing-box-only|--fail2ban-only)
@@ -383,7 +384,7 @@ parse_args() {
       *) die "未知参数：$1" ;;
     esac
   done
-  validate_port "$SSH_PORT" || die "SSH 端口无效：$SSH_PORT（不能使用 22/53/80/443/8443）。"
+  validate_port "$SSH_PORT" || die "SSH 端口无效：$SSH_PORT（保留端口为 53/80/443/8443）。"
   case "$NETWORK_REQUEST" in auto|ipv4|dual) ;; *) die '--network-stack 仅支持 auto、ipv4、dual。' ;; esac
   if [[ -n "$SING_BOX_VERSION" ]]; then
     [[ "$SING_BOX_VERSION" =~ ^[0-9A-Za-z.+:~_-]+$ ]] || die 'sing-box 版本格式无效。'
@@ -542,6 +543,62 @@ collect_choices() {
   if [[ "$DO_FULL_UPGRADE_SET" == false ]]; then
     if ask_yes_no '执行 apt full-upgrade？' true; then DO_FULL_UPGRADE=true; else DO_FULL_UPGRADE=false; fi
   fi
+}
+
+ssh_port_available() {
+  local listeners
+  listeners=$(ss -H -ltnp "sport = :$1") || return 1
+  awk '
+    NF {
+      if (!/users:\(\("(sshd|sshd-session)",/) busy=1
+      sub(/^.*users:/, "")
+      gsub(/\("(sshd|sshd-session)",/, "")
+      if (/\("/) busy=1
+    }
+    END { exit busy }
+  ' <<<"$listeners"
+}
+
+collect_quick_choices() {
+  local choice='' port=''
+  if [[ "$KEEP_SSH_22_SET" == false ]]; then KEEP_SSH_22=false; fi
+  if [[ "$SSH_PORT_SET" == false ]]; then
+    if ! command -v ss >/dev/null 2>&1; then
+      wait_for_package_manager
+      apt_get update
+      apt_get install -y iproute2
+      command -v ss >/dev/null || die '缺少 ss，无法检查 SSH 端口。'
+    fi
+    while true; do
+      read_tty $'\n1. 22 only\n2. 53651 only（默认）\n3. 自定义端口 only\n请选择 SSH 端口 [1-3]: ' choice
+      case "${choice:-2}" in
+        1) port=22 ;;
+        2) port=$DEFAULT_SSH_PORT ;;
+        3) read_tty '输入 SSH 端口: ' port ;;
+        *) warn '无效选择。'; continue ;;
+      esac
+      if validate_port "$port" && ssh_port_available "$port"; then
+        SSH_PORT=$port
+        KEEP_SSH_22=false
+        break
+      fi
+      warn "端口无效、已占用或无法检查：$port"
+    done
+  fi
+  if [[ "$NETWORK_REQUEST_SET" == false ]]; then
+    while true; do
+      read_tty $'\n1. Auto（默认）\n2. IPv4-only\n3. Dual-Stack\n请选择网络模式 [1-3]: ' choice
+      case "${choice:-1}" in
+        1) NETWORK_REQUEST=auto; break ;;
+        2) NETWORK_REQUEST=ipv4; break ;;
+        3) NETWORK_REQUEST=dual; break ;;
+        *) warn '无效选择。' ;;
+      esac
+    done
+  fi
+  SSH_PORT_SET=true
+  KEEP_SSH_22_SET=true
+  DO_FULL_UPGRADE_SET=true
 }
 
 update_system_and_tools() {
@@ -720,12 +777,13 @@ ssh_session_uses_ipv6() {
 
 detect_network_stack() {
   CURRENT_STEP='检测网络栈'
-  ipv4_https_works || die '未检测到可用 IPv4 HTTPS 出站；本脚本支持 IPv4-only 或双栈，不支持 IPv6-only。'
   case "$NETWORK_REQUEST" in
     ipv4) NETWORK_STACK='ipv4' ;;
     dual) NETWORK_STACK='dual' ;;
     auto)
-      if [[ "$CONTAINER_KIND" == none ]] && ! ssh_session_uses_ipv6 && ! ipv6_global_present 2>/dev/null; then
+      if [[ "$NETWORK_POLICY_CHANGED" == false && "$CONTAINER_KIND" == none ]] &&
+        ! ssh_session_uses_ipv6 && ! ipv6_global_present 2>/dev/null &&
+        { managed_ipv6_policy "$NETWORK_SYSCTL" || legacy_ipv6_unit_managed || legacy_ipv6_sysctl_managed; }; then
         enable_ipv6_for_probe
       fi
       detect_ipv6_stack
@@ -733,25 +791,98 @@ detect_network_stack() {
       log "Selected Network Stack: $NETWORK_STACK"
       ;;
   esac
-  if [[ "$NETWORK_STACK" == ipv4 ]] && ssh_session_uses_ipv6; then
+  if [[ "$NETWORK_REQUEST" == ipv4 ]] && ssh_session_uses_ipv6; then
     die '当前 SSH 会话正在通过 IPv6；为避免断线，拒绝关闭 IPv6。请先用 IPv4 SSH 登录后重跑。'
   fi
   log "网络模式：$NETWORK_STACK（请求：$NETWORK_REQUEST）"
 }
 
+managed_ipv6_policy() {
+  [[ -f "$1" && ! -L "$1" ]] || return 1
+  awk '
+    NR == 1 && /^# Managed by (vps-init\.sh|404-vps-tools|404notfound)/ { managed=1 }
+    /^[[:space:]]*($|#)/ { next }
+    /^[[:space:]]*net\.ipv6\.conf\.(all|default|lo)\.disable_ipv6[[:space:]]*=[[:space:]]*[01][[:space:]]*$/ { next }
+    { invalid=1 }
+    END { exit !(managed && !invalid) }
+  ' "$1"
+}
+
+legacy_ipv6_unit_managed() {
+  [[ -f "$LEGACY_NETWORK_UNIT" && ! -L "$LEGACY_NETWORK_UNIT" ]] &&
+    grep -Eq '^Description=Apply (404-vps-tools|404notfound) IPv4-only network stack$' "$LEGACY_NETWORK_UNIT"
+}
+
+backup_network_policy() {
+  local key value
+  if [[ -e "$NETWORK_SYSCTL" || -L "$NETWORK_SYSCTL" ]]; then cp -a "$NETWORK_SYSCTL" "$BACKUP_DIR/dns/network-sysctl"; fi
+  IPV6_OLD_DEFAULT=$(sysctl -n net.ipv6.conf.default.disable_ipv6 2>/dev/null || true)
+  while IFS= read -r key; do
+    if value=$(sysctl -n "$key" 2>/dev/null) && [[ "$value" =~ ^[01]$ ]]; then
+      IPV6_OLD_INTERFACES["$key"]=$value
+    fi
+  done < <(ipv6_probe_keys)
+  NETWORK_POLICY_CHANGED=true
+}
+
+rollback_network_policy() {
+  local key value
+  if [[ -L "$BACKUP_DIR/dns/network-sysctl" ]]; then
+    : # Auto did not modify this provider-owned link.
+  elif [[ -f "$BACKUP_DIR/dns/network-sysctl" ]]; then
+    cp -a -- "$BACKUP_DIR/dns/network-sysctl" "$NETWORK_SYSCTL" || warn "无法恢复 $NETWORK_SYSCTL"
+  else
+    rm -f -- "$NETWORK_SYSCTL" || warn "无法移除 $NETWORK_SYSCTL"
+  fi
+  if [[ "$IPV6_OLD_DEFAULT" =~ ^[01]$ ]]; then
+    sysctl -q -w "net.ipv6.conf.default.disable_ipv6=$IPV6_OLD_DEFAULT" >/dev/null 2>&1 || true
+  fi
+  for key in "${!IPV6_OLD_INTERFACES[@]}"; do
+    value=${IPV6_OLD_INTERFACES[$key]}
+    if [[ "$(sysctl -n "$key" 2>/dev/null)" != "$value" ]]; then
+      sysctl -q -w "$key=$value" >/dev/null 2>&1 || warn "无法恢复 $key"
+    fi
+  done
+  NETWORK_POLICY_CHANGED=false
+}
+
 apply_network_stack() {
   CURRENT_STEP='应用网络栈'
   local value=0 scope out restricted=false
-  [[ "$NETWORK_STACK" == ipv4 ]] && value=1
-  reject_symlink "$NETWORK_SYSCTL"
-  make_mutable "$NETWORK_SYSCTL"
-  cat >"$NETWORK_SYSCTL" <<EOF
+  if [[ -e "$NETWORK_SYSCTL" || -L "$NETWORK_SYSCTL" ]] && ! managed_ipv6_policy "$NETWORK_SYSCTL"; then
+    if [[ "$NETWORK_REQUEST" != auto ]]; then die "$NETWORK_SYSCTL 不是脚本管理的配置。"; fi
+    warn "保留非脚本管理的 $NETWORK_SYSCTL"
+  fi
+  if [[ "$NETWORK_REQUEST" == auto ]]; then
+    managed_ipv6_policy "$NETWORK_SYSCTL" || legacy_ipv6_unit_managed || legacy_ipv6_sysctl_managed || return 0
+  elif [[ "$NETWORK_REQUEST" == ipv4 ]]; then
+    value=1
+  fi
+  backup_network_policy
+  if [[ "$NETWORK_REQUEST" == auto ]]; then
+    local restore_runtime=false
+    if legacy_ipv6_unit_managed || legacy_ipv6_sysctl_managed; then
+      restore_runtime=true
+    fi
+    if managed_ipv6_policy "$NETWORK_SYSCTL"; then
+      if grep -Eq 'disable_ipv6[[:space:]]*=[[:space:]]*1[[:space:]]*$' "$NETWORK_SYSCTL"; then restore_runtime=true; fi
+      make_mutable "$NETWORK_SYSCTL"
+      rm -f -- "$NETWORK_SYSCTL"
+    fi
+    log "Auto 正在迁移旧版 IPv6 禁用策略；备份=$BACKUP_DIR"
+    [[ "$restore_runtime" == true ]] || return 0
+  else
+    make_mutable "$NETWORK_SYSCTL"
+    cat >"$NETWORK_SYSCTL" <<EOF
 # Managed by vps-init.sh
 net.ipv6.conf.all.disable_ipv6 = $value
 net.ipv6.conf.default.disable_ipv6 = $value
 net.ipv6.conf.lo.disable_ipv6 = $value
 EOF
+  fi
   for scope in all default lo; do
+    # Writing all=0 broadcasts to every interface, even when a provider has
+    # disabled an individual link. Use it only for explicit policy or migration.
     if ! out=$(sysctl -w "net.ipv6.conf.$scope.disable_ipv6=$value" 2>&1); then
       if grep -Eqi 'permission denied|operation not permitted|read-only' <<<"$out"; then
         restricted=true
@@ -763,6 +894,17 @@ EOF
   if [[ "$restricted" == true ]]; then
     warn '宿主/容器禁止修改 IPv6 sysctl；SmartDNS 仍按检测结果配置，但内核级开关无法保证。'
   fi
+}
+
+legacy_ipv6_sysctl_managed() {
+  managed_ipv6_policy "$LEGACY_IPV6_SYSCTL" ||
+    { [[ -f "$LEGACY_IPV6_SYSCTL" && ! -L "$LEGACY_IPV6_SYSCTL" ]] && legacy_ipv6_unit_managed &&
+      awk '
+        /^[[:space:]]*($|#)/ { next }
+        /^[[:space:]]*net\.ipv6\.conf\.(all|default|lo)\.disable_ipv6[[:space:]]*=[[:space:]]*1[[:space:]]*$/ { found=1; next }
+        { invalid=1 }
+        END { exit !(found && !invalid) }
+      ' "$LEGACY_IPV6_SYSCTL"; }
 }
 
 configure_chrony() {
@@ -991,10 +1133,6 @@ smartdns_pkg_values() {
 backup_dns_state() {
   install -d -m 0700 "$BACKUP_DIR/dns"
   if [[ -f "$SMARTDNS_CONF" ]]; then cp -a "$SMARTDNS_CONF" "$BACKUP_DIR/dns/smartdns.conf"; else touch "$BACKUP_DIR/dns/no-smartdns-conf"; fi
-  if [[ -f "$NETWORK_SYSCTL" ]]; then cp -a "$NETWORK_SYSCTL" "$BACKUP_DIR/dns/network-sysctl"; else touch "$BACKUP_DIR/dns/no-network-sysctl"; fi
-  IPV6_OLD_ALL=$(sysctl -n net.ipv6.conf.all.disable_ipv6 2>/dev/null || echo 0)
-  IPV6_OLD_DEFAULT=$(sysctl -n net.ipv6.conf.default.disable_ipv6 2>/dev/null || echo 0)
-  IPV6_OLD_LO=$(sysctl -n net.ipv6.conf.lo.disable_ipv6 2>/dev/null || echo 0)
   if [[ -L /etc/resolv.conf ]]; then
     ln -s "$(readlink /etc/resolv.conf)" "$BACKUP_DIR/dns/resolv.conf.symlink"
   elif [[ -e /etc/resolv.conf ]]; then
@@ -1007,12 +1145,18 @@ backup_dns_state() {
 }
 
 write_smartdns_config() {
-  local out=$1 transport=${2:-h2}
-
-  if [[ "$NETWORK_STACK" == ipv4 ]]; then
-    cat >"$out" <<'EOF'
+  local out=$1 transport=${2:-h2} listeners=${3:-auto} aaaa_soa=no
+  {
+    cat <<'EOF'
 bind 127.0.0.1:53
 bind-tcp 127.0.0.1:53
+EOF
+    if [[ "$NETWORK_REQUEST" == ipv4 ]]; then
+      aaaa_soa=yes
+    elif [[ "$listeners" == auto ]] && ipv6_loopback_available; then
+      printf '%s\n' 'bind [::1]:53' 'bind-tcp [::1]:53'
+    fi
+    cat <<EOF
 
 cache-persist yes
 cache-file /var/cache/smartdns/smartdns.cache
@@ -1028,7 +1172,7 @@ speed-check-mode tcp:443,ping
 response-mode first-ping
 
 dualstack-ip-selection no
-force-AAAA-SOA yes
+force-AAAA-SOA $aaaa_soa
 
 log-level warn
 log-console no
@@ -1037,37 +1181,7 @@ audit-enable no
 
 ca-file /etc/ssl/certs/ca-certificates.crt
 EOF
-  else
-    cat >"$out" <<'EOF'
-bind 127.0.0.1:53
-bind-tcp 127.0.0.1:53
-bind [::1]:53
-bind-tcp [::1]:53
-
-cache-persist yes
-cache-file /var/cache/smartdns/smartdns.cache
-cache-checkpoint-time 86400
-
-serve-expired yes
-serve-expired-ttl 259200
-serve-expired-reply-ttl 3
-serve-expired-prefetch-time 21600
-prefetch-domain yes
-
-speed-check-mode tcp:443,ping
-response-mode first-ping
-
-dualstack-ip-selection no
-force-AAAA-SOA no
-
-log-level warn
-log-console no
-log-syslog yes
-audit-enable no
-
-ca-file /etc/ssl/certs/ca-certificates.crt
-EOF
-  fi
+  } >"$out" || return 1
 
   case "$transport" in
     h2)
@@ -1095,6 +1209,11 @@ EOF
   esac
 }
 
+ipv6_loopback_available() {
+  ip -6 addr show dev lo up 2>/dev/null |
+    awk '$1 == "inet6" && $2 == "::1/128" && !/ (tentative|dadfailed)( |$)/ { found=1 } END { exit !found }'
+}
+
 smartdns_health_check() {
   local a='' aaaa='' tcp_a='' upstream=''
   # Use a fresh name so persistent or expired cache entries cannot pass the upstream check.
@@ -1107,7 +1226,7 @@ smartdns_health_check() {
   grep -Eq '^([0-9]{1,3}\.){3}[0-9]{1,3}$' <<<"$a" || return 1
 
   aaaa=$(dig @127.0.0.1 google.com AAAA +short +time=6 +tries=2 2>/dev/null || true)
-  if [[ "$NETWORK_STACK" == ipv4 ]]; then
+  if [[ "$NETWORK_REQUEST" == ipv4 ]]; then
     [[ -z "$aaaa" ]]
   else
     grep -Eq '^[0-9a-fA-F:]*:[0-9a-fA-F:]+$' <<<"$aaaa"
@@ -1121,7 +1240,11 @@ smartdns_try_transport() {
   install -m 0644 "$staged" "$SMARTDNS_CONF" || return 1
 
   if ! systemctl restart smartdns.service >/dev/null 2>&1; then
-    return 1
+    grep -Fxq 'bind [::1]:53' "$staged" || return 1
+    warn 'SmartDNS 双监听启动失败，保留 A/AAAA 并重试 IPv4 监听。'
+    write_smartdns_config "$staged" "$transport" ipv4-listener || return 1
+    install -m 0644 "$staged" "$SMARTDNS_CONF" || return 1
+    systemctl restart smartdns.service >/dev/null 2>&1 || return 1
   fi
   sleep 2
   systemctl is-active --quiet smartdns.service || return 1
@@ -1227,21 +1350,46 @@ install_and_configure_smartdns() {
 
 cleanup_legacy_network_stack() {
   CURRENT_STEP='迁移旧网络栈组件'
-  local found=false
-  if [[ -e "$LEGACY_NETWORK_UNIT" || -e "$LEGACY_NETWORK_HELPER" || -e "$LEGACY_IPV6_SYSCTL" ]]; then
-    found=true
-    install -d -m 0700 "$BACKUP_DIR/legacy-404-network"
-    [[ ! -e "$LEGACY_NETWORK_UNIT" ]] || cp -a "$LEGACY_NETWORK_UNIT" "$BACKUP_DIR/legacy-404-network/"
-    [[ ! -e "$LEGACY_NETWORK_HELPER" ]] || cp -a "$LEGACY_NETWORK_HELPER" "$BACKUP_DIR/legacy-404-network/"
-    [[ ! -e "$LEGACY_IPV6_SYSCTL" ]] || cp -a "$LEGACY_IPV6_SYSCTL" "$BACKUP_DIR/legacy-404-network/"
-    systemctl disable --now 404-network-stack.service >/dev/null 2>&1 || true
-    make_mutable "$LEGACY_NETWORK_UNIT"
-    make_mutable "$LEGACY_NETWORK_HELPER"
-    make_mutable "$LEGACY_IPV6_SYSCTL"
-    rm -f -- "$LEGACY_NETWORK_UNIT" "$LEGACY_NETWORK_HELPER" "$LEGACY_IPV6_SYSCTL" /run/404-network-stack.status
-    systemctl daemon-reload
+  local path backup="$BACKUP_DIR/legacy-404-network"
+  local -a files=()
+  if legacy_ipv6_sysctl_managed; then
+    files+=("$LEGACY_IPV6_SYSCTL")
   fi
-  [[ "$found" == false ]] || log '已备份并移除旧 404-network-stack 持久化组件，避免重启后覆盖新网络策略。'
+  if legacy_ipv6_unit_managed; then
+    files+=("$LEGACY_NETWORK_UNIT")
+    if [[ -e "$LEGACY_NETWORK_HELPER" || -L "$LEGACY_NETWORK_HELPER" ]]; then files+=("$LEGACY_NETWORK_HELPER"); fi
+    if systemctl is-active --quiet 404-network-stack.service; then LEGACY_NETWORK_WAS_ACTIVE=true; fi
+    if systemctl is-enabled --quiet 404-network-stack.service; then LEGACY_NETWORK_WAS_ENABLED=true; fi
+  fi
+  (( ${#files[@]} )) || return 0
+  install -d -m 0700 "$backup"
+  for path in "${files[@]}"; do
+    cp -a -- "$path" "$backup/"
+    make_mutable "$path"
+  done
+  LEGACY_NETWORK_CHANGED=true
+  if [[ -f "$backup/${LEGACY_NETWORK_UNIT##*/}" ]]; then
+    systemctl disable --now 404-network-stack.service
+  fi
+  rm -f -- "${files[@]}"
+  systemctl daemon-reload
+  log "已迁移旧 IPv6 持久化组件；备份=$backup"
+}
+
+rollback_legacy_network_stack() {
+  [[ "$LEGACY_NETWORK_CHANGED" == true ]] || return 0
+  local path backup="$BACKUP_DIR/legacy-404-network"
+  for path in "$LEGACY_NETWORK_UNIT" "$LEGACY_NETWORK_HELPER" "$LEGACY_IPV6_SYSCTL"; do
+    if [[ -e "$backup/${path##*/}" || -L "$backup/${path##*/}" ]]; then
+      cp -a -- "$backup/${path##*/}" "$path" || warn "无法恢复 $path"
+    fi
+  done
+  if [[ -f "$backup/${LEGACY_NETWORK_UNIT##*/}" ]]; then
+    systemctl daemon-reload || true
+    if [[ "$LEGACY_NETWORK_WAS_ENABLED" == true ]]; then systemctl enable 404-network-stack.service || true; fi
+    if [[ "$LEGACY_NETWORK_WAS_ACTIVE" == true ]]; then systemctl start 404-network-stack.service || true; fi
+  fi
+  LEGACY_NETWORK_CHANGED=false
 }
 
 configure_system_dns() {
@@ -1312,7 +1460,7 @@ write_ssh_dropin() {
   make_mutable "$SSH_DROPIN"
   {
     echo '# Managed by vps-init.sh'
-    [[ "$KEEP_SSH_22" == true ]] && echo 'Port 22'
+    if ssh_has_backup_port; then echo 'Port 22'; fi
     cat <<EOF
 Port $SSH_PORT
 PermitRootLogin prohibit-password
@@ -1331,25 +1479,34 @@ EOF
   chmod 0644 "$SSH_DROPIN"
 }
 
+ssh_has_backup_port() {
+  [[ "$KEEP_SSH_22" == true && "$SSH_PORT" != 22 ]]
+}
+
+ufw_allow_port() {
+  # prepend does not retag an existing rule with the same match.
+  ufw prepend allow "$1/tcp" comment "$2" >/dev/null
+}
+
 preauthorize_ufw_ssh() {
   if ufw status 2>/dev/null | grep -q '^Status: active$'; then
-    if ! ufw status 2>/dev/null | grep -Eq "^${SSH_PORT}/tcp[[:space:]]+ALLOW"; then
-      ufw allow "$SSH_PORT/tcp" comment 'vps-init-ssh' >/dev/null
-      PREAUTH_SSH_PORT_ADDED=true
-    fi
-    if [[ "$KEEP_SSH_22" == true ]] && ! ufw status 2>/dev/null | grep -Eq '^(22/tcp|OpenSSH)[[:space:]]+ALLOW'; then
-      ufw allow 22/tcp comment 'vps-init-ssh-backup' >/dev/null
-      PREAUTH_22_ADDED=true
-    fi
+    ufw_allow_port "$SSH_PORT" vps-init-ssh
+    if ssh_has_backup_port; then ufw_allow_port 22 vps-init-ssh-backup; fi
   fi
 }
 
 validate_sshd_effective() {
   local eff ports authfile authcmd
   eff=$(sshd -T -C user=root,host=localhost,addr=127.0.0.1 2>/dev/null) || return 1
-  ports=$(awk '$1=="port"{print $2}' <<<"$eff" | sort -nu)
-  grep -Fxq "$SSH_PORT" <<<"$ports" || return 1
-  if [[ "$KEEP_SSH_22" == true ]]; then grep -Fxq 22 <<<"$ports" || return 1; else ! grep -Fxq 22 <<<"$ports" || return 1; fi
+  ports=$(awk '$1=="port"{print $2}' <<<"$eff" | sort -u)
+  if ssh_has_backup_port; then
+    [[ "$ports" == "22"$'\n'"$SSH_PORT" || "$ports" == "$SSH_PORT"$'\n22' ]] || return 1
+  else
+    [[ "$ports" == "$SSH_PORT" ]] || return 1
+  fi
+  awk -v selected="$SSH_PORT" -v backup="$KEEP_SSH_22" '
+    $1 == "listenaddress" && $2 !~ (":" selected "$") && !(backup == "true" && $2 ~ /:22$/) { exit 1 }
+  ' <<<"$eff" || return 1
   grep -Eq '^permitrootlogin (prohibit-password|without-password)$' <<<"$eff" || return 1
   grep -Eq '^pubkeyauthentication yes$' <<<"$eff" || return 1
   grep -Eq '^passwordauthentication no$' <<<"$eff" || return 1
@@ -1360,15 +1517,28 @@ validate_sshd_effective() {
   [[ "$authcmd" == none ]] || return 1
 }
 
+validate_ssh_listeners() {
+  local listeners ports
+  listeners=$(ss -H -ltnp) || return 1
+  ports=$(awk '/users:\(\("(sshd|sshd-session)",/ { sub(/^.*:/, "", $4); print $4 }' <<<"$listeners" | sort -u)
+  if ssh_has_backup_port; then
+    [[ "$ports" == "22"$'\n'"$SSH_PORT" || "$ports" == "$SSH_PORT"$'\n22' ]]
+  else
+    [[ "$ports" == "$SSH_PORT" ]]
+  fi
+}
+
 configure_ssh() {
   CURRENT_STEP='配置 SSH'
   systemctl is-active --quiet ssh.service || die 'ssh.service 未运行。'
   [[ -f "$SSH_MAIN" && ! -L "$SSH_MAIN" ]] || die "$SSH_MAIN 必须是普通文件。"
   [[ ! -L "$SSH_DIR" ]] || die "$SSH_DIR 不能是符号链接。"
   if systemctl is-active --quiet ssh.socket 2>/dev/null; then die '检测到 ssh.socket 激活；为避免锁死，请先转换为 ssh.service 后再运行。'; fi
-  ss -H -ltnp "sport = :$SSH_PORT" 2>/dev/null | grep -qv sshd && die "$SSH_PORT/tcp 已被非 sshd 进程占用。"
+  ssh_port_available "$SSH_PORT" || die "$SSH_PORT/tcp 已被占用或无法检查。"
   backup_ssh_state
+  backup_ufw_state
   SSH_TX=true
+  UFW_TX=true
   preauthorize_ufw_ssh
   make_mutable "$SSH_MAIN"
   make_mutable "$SSH_DIR"
@@ -1387,13 +1557,9 @@ configure_ssh() {
   validate_sshd_effective || die 'sshd -T 最终策略不符合目标。'
   systemctl reload ssh.service || die 'reload ssh.service 失败。'
   local attempt
-  for ((attempt=0; attempt<10; attempt++)); do ss -H -ltn "sport = :$SSH_PORT" 2>/dev/null | grep -q . && break; sleep 1; done
-  ss -H -ltn "sport = :$SSH_PORT" 2>/dev/null | grep -q . || die "$SSH_PORT/tcp 未开始监听。"
-  if [[ "$KEEP_SSH_22" == true ]]; then ss -H -ltn 'sport = :22' 2>/dev/null | grep -q . || die '22/tcp 未保持监听。'; fi
+  for ((attempt=0; attempt<10; attempt++)); do validate_ssh_listeners && break; sleep 1; done
+  validate_ssh_listeners || die 'SSH 实际监听端口与目标不一致。'
   validate_sshd_effective || die 'reload 后 SSH 策略验证失败。'
-  SSH_TX=false
-  PREAUTH_SSH_PORT_ADDED=false
-  PREAUTH_22_ADDED=false
   log "SSH 配置完成：$SSH_PORT/tcp；保留 22=$KEEP_SSH_22。"
 }
 
@@ -1405,40 +1571,62 @@ backup_ufw_state() {
 }
 
 ufw_delete_comment_rules() {
-  local comment=$1 nums
+  local comment=$1 keep=${2:-} nums n
   while true; do
-    nums=$(ufw status numbered 2>/dev/null | awk -v c="# $comment" 'index($0,c){n=$0; sub(/^\[[[:space:]]*/,"",n); sub(/\].*/,"",n); gsub(/[[:space:]]/,"",n); if(n~/^[0-9]+$/) print n}' | sort -rn)
+    nums=$(ufw status numbered | awk -v c="$comment" -v keep="$keep" '
+      { line=$0; if (sub(/^.*[[:space:]]#[[:space:]]+/, "") && $0 == c) {
+          n=line; sub(/^\[[[:space:]]*/,"",n); sub(/\].*/,"",n)
+          sub(/^\[[^]]*\][[:space:]]*/,"",line); split(line, fields, /[[:space:]]+/)
+          if (n~/^[0-9]+$/ && (keep == "" || fields[1] != keep)) print n
+        }
+      }
+    ' | sort -rn) || return 1
     [[ -n "$nums" ]] || break
-    while IFS= read -r n; do [[ -n "$n" ]] && ufw --force delete "$n" >/dev/null; done <<<"$nums"
+    while IFS= read -r n; do ufw --force delete "$n" >/dev/null || return 1; done <<<"$nums"
   done
 }
 
 configure_ufw() {
   CURRENT_STEP='配置 UFW'
-  backup_ufw_state
-  UFW_TX=true
+  if [[ "$UFW_TX" == false ]]; then
+    backup_ufw_state
+    UFW_TX=true
+  fi
   make_mutable /etc/default/ufw
   if [[ -f /etc/default/ufw ]]; then
-    if [[ "$NETWORK_STACK" == dual ]]; then sed -i -E 's/^IPV6=.*/IPV6=yes/' /etc/default/ufw; else sed -i -E 's/^IPV6=.*/IPV6=no/' /etc/default/ufw; fi
+    if [[ "$NETWORK_REQUEST" == ipv4 ]]; then
+      sed -i -E 's/^IPV6=.*/IPV6=no/' /etc/default/ufw
+    else
+      sed -i -E 's/^IPV6=.*/IPV6=yes/' /etc/default/ufw
+    fi
   fi
   ufw default deny incoming >/dev/null
   ufw default allow outgoing >/dev/null
-  ufw_delete_comment_rules 'vps-init-ssh'
-  ufw_delete_comment_rules 'vps-init-ssh-backup'
-  ufw_delete_comment_rules 'vps-init-443-tcp'
-  ufw_delete_comment_rules 'vps-init-443-udp'
-  ufw allow "$SSH_PORT/tcp" comment 'vps-init-ssh' >/dev/null
-  if [[ "$KEEP_SSH_22" == true ]]; then
-    ufw allow 22/tcp comment 'vps-init-ssh-backup' >/dev/null
-  elif ufw status 2>/dev/null | grep -Eq '^(22/tcp|OpenSSH)[[:space:]]+ALLOW'; then
-    warn '选择了不保留 22，但检测到非本脚本管理的 22/OpenSSH ALLOW 规则；基于 ownership boundary 未删除，请人工确认。'
+  ufw_allow_port "$SSH_PORT" vps-init-ssh
+  if ssh_has_backup_port; then ufw_allow_port 22 vps-init-ssh-backup; fi
+  ufw prepend allow 443/tcp comment 'vps-init-443-tcp' >/dev/null
+  ufw prepend allow 443/udp comment 'vps-init-443-udp' >/dev/null
+  if [[ "$UFW_OLD_ACTIVE" == true ]]; then
+    # Apply the updated IPv6 setting without disabling the active firewall.
+    ufw reload >/dev/null
+  else
+    ufw --force enable >/dev/null
   fi
-  ufw allow 443/tcp comment 'vps-init-443-tcp' >/dev/null
-  ufw allow 443/udp comment 'vps-init-443-udp' >/dev/null
-  ufw --force enable >/dev/null
   ufw status | grep -q '^Status: active$' || die 'UFW 未成功启用。'
+  ufw_delete_comment_rules vps-init-ssh "$SSH_PORT/tcp"
+  if ssh_has_backup_port; then
+    ufw_delete_comment_rules vps-init-ssh-backup 22/tcp
+  else
+    # A previous backup rule may have the same match as the new primary rule.
+    ufw_delete_comment_rules vps-init-ssh-backup
+    ufw_allow_port "$SSH_PORT" vps-init-ssh
+  fi
   ufw status | grep -Eq "^${SSH_PORT}/tcp[[:space:]]+ALLOW" || die 'UFW 未放行新 SSH 端口。'
+  if ssh_has_backup_port; then
+    ufw status | grep -Eq '^22/tcp[[:space:]]+ALLOW' || die 'UFW 未放行 SSH 备用端口。'
+  fi
   UFW_TX=false
+  SSH_TX=false
 }
 
 write_cf_tool() {
@@ -1794,11 +1982,11 @@ print_report() {
 VPS 初始化完成
 ============================================================
 系统          : ${PRETTY_NAME:-Debian}
-网络栈        : $NETWORK_STACK
-SSH           : $SSH_PORT/tcp；保留 22=$KEEP_SSH_22
+网络栈        : $NETWORK_STACK（策略 $NETWORK_REQUEST）
+SSH           : $SSH_PORT/tcp$(if ssh_has_backup_port; then printf ' + 22/tcp'; fi)
 UFW           : $(ufw status | head -1)
 SmartDNS      : $(smartdns -v 2>/dev/null | head -1 || echo unavailable)
-SmartDNS 模式 : $([[ "$NETWORK_STACK" == ipv4 ]] && echo 'IPv4-only' || echo 'IPv4+IPv6') / $SMARTDNS_TRANSPORT
+SmartDNS 模式 : $([[ "$NETWORK_REQUEST" == ipv4 ]] && echo 'A only' || echo 'A + AAAA') / $SMARTDNS_TRANSPORT
 sing-box      : $(sing-box version 2>/dev/null | head -1 || echo unavailable)
 Fail2ban      : $(systemctl is-active fail2ban.service 2>/dev/null || true)
 BBR           : $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo unavailable)
@@ -1806,7 +1994,7 @@ Swap          : $(awk '/SwapTotal:/ {printf "%.0f MiB", $2/1024}' /proc/meminfo)
 备份目录      : $BACKUP_DIR
 需要重启      : $([[ -e /var/run/reboot-required ]] && echo yes || echo no)
 ============================================================
-请保持当前 SSH 会话，并从另一终端测试新端口 $SSH_PORT 后再决定是否人工移除 22。
+请保持当前 SSH 会话，并从另一终端验证 SSH 端口 $SSH_PORT。
 EOF
 }
 
@@ -1869,7 +2057,7 @@ run_smartdns_only() {
   DNS_TX=true
   install_and_configure_smartdns
   configure_system_dns
-  log "SmartDNS 完成：网络模式=$NETWORK_STACK；上游=$SMARTDNS_TRANSPORT；备份=$BACKUP_DIR"
+  log "SmartDNS 完成：网络=$NETWORK_STACK（策略 $NETWORK_REQUEST）；上游=$SMARTDNS_TRANSPORT；备份=$BACKUP_DIR"
 }
 
 run_singbox_only() {
@@ -1926,9 +2114,7 @@ main() {
     fail2ban) run_fail2ban_only; return 0 ;;
   esac
   if [[ "$INSTALL_MODE" == quick ]]; then
-    SSH_PORT_SET=true
-    KEEP_SSH_22_SET=true
-    DO_FULL_UPGRADE_SET=true
+    collect_quick_choices
   fi
   if [[ "$INSTALL_MODE" == custom ]]; then
     custom_phase_one
@@ -1954,16 +2140,23 @@ main() {
     log '已按 --base-only 完成系统更新与基础工具安装。'
     return 0
   fi
-  detect_network_stack
+  # Establish connectivity before any tuning and reject explicit IPv4-only
+  # over an IPv6 SSH session before changing the kernel.
+  CURRENT_STEP='检测网络栈'
+  ipv4_https_works || die '未检测到可用 IPv4 HTTPS 出站。'
+  if [[ "$NETWORK_REQUEST" == ipv4 ]] && ssh_session_uses_ipv6; then
+    die '当前 SSH 会话正在通过 IPv6；请用 IPv4 SSH 登录后再关闭 IPv6。'
+  fi
   configure_chrony
   configure_tcp_tuning
   install_sing_box
   backup_dns_state
   DNS_TX=true
   apply_network_stack
+  cleanup_legacy_network_stack
+  detect_network_stack
   install_and_configure_smartdns
   configure_system_dns
-  cleanup_legacy_network_stack
   configure_ssh
   configure_ufw
   configure_cf8443
