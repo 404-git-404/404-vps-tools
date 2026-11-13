@@ -22,8 +22,10 @@ for architecture in amd64 arm64; do
 done
 unset -f dpkg
 
+ipv6_loopback_available() { return 0; }
 for stack in ipv4 dual; do
   NETWORK_STACK=$stack
+  NETWORK_REQUEST=$stack
   for transport in h2 dns53; do
     write_smartdns_config "$TEST_TMP/$stack-$transport.conf" "$transport"
     config=$(cat "$TEST_TMP/$stack-$transport.conf")
@@ -46,6 +48,7 @@ done
 # A CNAME alone or a broken TCP listener cannot satisfy the DNS health gate.
 (
   NETWORK_STACK=ipv4
+  NETWORK_REQUEST=ipv4
   dig() {
     case " $* " in
       *' TXT '*) echo 'status: NXDOMAIN,' ;;
@@ -67,6 +70,7 @@ done
   }
   if smartdns_health_check; then fail 'broken TCP listener accepted'; fi
   NETWORK_STACK=dual
+  NETWORK_REQUEST=dual
   dig() {
     case " $* " in
       *' TXT '*) echo 'status: NXDOMAIN,' ;;
@@ -78,6 +82,117 @@ done
 )
 
 NETWORK_STACK=unknown
+NETWORK_REQUEST=auto
+
+# Quick menus use the real validation path, including occupied ports and CLI precedence.
+for selection in default standard custom cli; do
+  (
+    prompt=0
+    # shellcheck disable=SC2329 # Used by the sourced quick menu.
+    command() { if [[ "$*" == '-v ss' ]]; then return 0; fi; builtin command "$@"; }
+    ss() {
+      if [[ "$*" == *':1234' ]]; then echo 'LISTEN 0 128 0.0.0.0:1234 0.0.0.0:* users:(("other",pid=1,fd=2))'; fi
+    }
+    read_tty() {
+      local response=''
+      prompt=$((prompt+1))
+      case "$selection:$prompt" in
+        standard:1) response=1 ;;
+        standard:2) response=2 ;;
+        custom:1|custom:3|custom:5|custom:7) response=3 ;;
+        custom:2) response=443 ;;
+        custom:4) response=1234 ;;
+        custom:6) response=43210 ;;
+        cli:*) fail 'explicit CLI options prompted' ;;
+      esac
+      printf -v "$2" '%s' "$response"
+    }
+    if [[ "$selection" == cli ]]; then parse_args --ssh-port 22 --keep-22 --network-stack ipv4; fi
+    collect_quick_choices
+    case "$selection" in
+      default) assert_eq '53651/auto/2' "$SSH_PORT/$NETWORK_REQUEST/$prompt" 'quick defaults' ;;
+      standard) assert_eq '22/ipv4/2' "$SSH_PORT/$NETWORK_REQUEST/$prompt" 'quick 22 only' ;;
+      custom) assert_eq '43210/dual/7' "$SSH_PORT/$NETWORK_REQUEST/$prompt" 'quick custom port' ;;
+      cli) assert_eq '22/ipv4/0' "$SSH_PORT/$NETWORK_REQUEST/$prompt" 'explicit CLI' ;;
+    esac
+    if ssh_has_backup_port; then fail 'unexpected backup SSH port'; fi
+    ss() { printf 'LISTEN 0 128 0.0.0.0:%s 0.0.0.0:* users:(("sshd",pid=1,fd=2))\n' "$SSH_PORT"; }
+    validate_ssh_listeners || fail 'single SSH listener rejected'
+    ss() { printf 'LISTEN 0 128 0.0.0.0:%s 0.0.0.0:* users:(("sshd",pid=1,fd=2))\n' "$SSH_PORT" 22222; }
+    if validate_ssh_listeners; then fail 'unexpected SSH listener accepted'; fi
+  )
+done
+
+# Redirect only file destinations. Exercise real policy generation and rollback.
+for policy in fresh provider legacy legacy-service ipv4 dual; do
+  (
+    export POLICY_TEST_DIR="$TEST_TMP/policy-$policy"
+    export POLICY_TEST_SCENARIO="$policy"
+    # shellcheck disable=SC2016 # Expand the test path in the child Bash.
+    sed -e 's|^readonly NETWORK_SYSCTL=.*|readonly NETWORK_SYSCTL="$POLICY_TEST_DIR/network.conf"|' \
+      -e 's|^readonly LEGACY_NETWORK_UNIT=.*|readonly LEGACY_NETWORK_UNIT="$POLICY_TEST_DIR/404-network-stack.service"|' \
+      -e 's|^readonly LEGACY_NETWORK_HELPER=.*|readonly LEGACY_NETWORK_HELPER="$POLICY_TEST_DIR/helper"|' \
+      -e 's|^readonly LEGACY_IPV6_SYSCTL=.*|readonly LEGACY_IPV6_SYSCTL="$POLICY_TEST_DIR/99-disable-ipv6.conf"|' \
+      "$REPO_ROOT/debian-init.sh" >"$TEST_TMP/policy-installer.sh"
+    bash -s "$TEST_TMP/policy-installer.sh" <<'TEST'
+set -Eeuo pipefail
+source "$1"
+trap - EXIT ERR HUP INT TERM
+IFS=$' \t\n'
+BACKUP_DIR="$POLICY_TEST_DIR/backup"
+mkdir -p "$BACKUP_DIR/dns"
+trace="$POLICY_TEST_DIR/sysctl"
+: >"$trace"
+make_mutable() { :; }
+install() { [[ "$1" == -d ]]; shift 3; mkdir -p "$@"; }
+sysctl() { if [[ "$1" == -n ]]; then echo 1; else printf '%s\n' "${*: -1}" >>"$trace"; fi; }
+systemctl() { printf '%s\n' "$*" >>"$trace"; }
+ipv6_probe_keys() { printf 'net/ipv6/conf/eth0/disable_ipv6\n'; }
+case "$POLICY_TEST_SCENARIO" in
+  provider) printf '# Provider settings\nnet.ipv6.conf.eth0.accept_ra = 2\n' >"$NETWORK_SYSCTL" ;;
+  legacy) printf '# Managed by vps-init.sh\nnet.ipv6.conf.all.disable_ipv6 = 1\n' >"$NETWORK_SYSCTL" ;;
+  legacy-service)
+    printf 'Description=Apply 404-vps-tools IPv4-only network stack\n' >"$LEGACY_NETWORK_UNIT"
+    printf 'net.ipv6.conf.all.disable_ipv6 = 1\n' >"$LEGACY_IPV6_SYSCTL" ;;
+  ipv4|dual) NETWORK_REQUEST=$POLICY_TEST_SCENARIO ;;
+esac
+NETWORK_STACK=ipv4
+apply_network_stack
+cleanup_legacy_network_stack
+case "$POLICY_TEST_SCENARIO" in
+  fresh) [[ ! -e "$NETWORK_SYSCTL" && ! -s "$trace" ]] ;;
+  provider)
+    [[ ! -s "$trace" ]]
+    grep -Fxq 'net.ipv6.conf.eth0.accept_ra = 2' "$NETWORK_SYSCTL" ;;
+  legacy|legacy-service)
+    [[ ! -e "$NETWORK_SYSCTL" && ! -e "$LEGACY_NETWORK_UNIT" && ! -e "$LEGACY_IPV6_SYSCTL" ]]
+    grep -Fxq 'net.ipv6.conf.all.disable_ipv6=0' "$trace"
+    if grep -Eq 'disable_ipv6=1$' "$trace"; then exit 1; fi
+    rollback_legacy_network_stack
+    rollback_network_policy
+    if [[ "$POLICY_TEST_SCENARIO" == legacy ]]; then
+      cmp "$BACKUP_DIR/dns/network-sysctl" "$NETWORK_SYSCTL"
+    else
+      [[ -f "$LEGACY_NETWORK_UNIT" && -f "$LEGACY_IPV6_SYSCTL" ]]
+      grep -Fxq 'enable 404-network-stack.service' "$trace"
+    fi ;;
+  ipv4|dual)
+    value=0
+    if [[ "$NETWORK_REQUEST" == ipv4 ]]; then value=1; fi
+    grep -Fxq "net.ipv6.conf.all.disable_ipv6 = $value" "$NETWORK_SYSCTL" ;;
+esac
+TEST
+  )
+done
+
+(
+  ipv6_loopback_available() { return 1; }
+  write_smartdns_config "$TEST_TMP/auto-no-loopback.conf"
+  grep -Fxq 'bind 127.0.0.1:53' "$TEST_TMP/auto-no-loopback.conf"
+  grep -Fxq 'bind-tcp 127.0.0.1:53' "$TEST_TMP/auto-no-loopback.conf"
+  grep -Fxq 'force-AAAA-SOA no' "$TEST_TMP/auto-no-loopback.conf"
+  if grep -Fq '[::1]' "$TEST_TMP/auto-no-loopback.conf"; then fail 'unavailable IPv6 listener enabled'; fi
+)
 
 # Validate the production address/route filters and the exact curl arguments.
 (
@@ -161,7 +276,7 @@ for failure in timeout enable-error probe-error TERM; do
     NETWORK_REQUEST=auto
     CONTAINER_KIND=none
     unset SSH_CONNECTION
-    ipv4_https_works() { :; }
+    managed_ipv6_policy() { return 0; }
     ipv6_global_present() { [[ "$(cat "$state")" == 0 ]]; }
     ipv6_route_present() { :; }
     ipv6_probe_keys() { printf '%s\n' "$probe_key" net/ipv6/conf/eth1/disable_ipv6; }

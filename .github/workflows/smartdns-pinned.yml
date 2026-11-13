@@ -152,7 +152,7 @@ jobs:
       - name: Install validation tools
         run: |
           apt-get update
-          apt-get install -y bash curl ca-certificates dnsutils
+          apt-get install -y bash curl ca-certificates dnsutils iproute2
       - name: Verify package and generated configuration
         shell: bash
         env:
@@ -173,8 +173,15 @@ jobs:
           [[ "$PACKAGE_ARCH" == amd64 ]] || exit 0
           apt-get install -y /tmp/smartdns.deb
           smartdns -v | grep -F "$SMARTDNS_VERSION"
-          for stack in ipv4 dual; do
-            NETWORK_STACK=$stack
+          for stack in ipv4 dual auto; do
+            NETWORK_REQUEST=$stack
+            if [[ "$stack" == auto ]]; then
+              # Simulate missing IPv6 loopback and IPv4-only current connectivity.
+              NETWORK_STACK=ipv4
+              ipv6_loopback_available() { return 1; }
+            else
+              NETWORK_STACK=$stack
+            fi
             for transport in h2 dns53; do
               write_smartdns_config /tmp/smartdns.conf "$transport"
               sed -i -e 's/:53$/:6053/' -e 's/^cache-persist yes/cache-persist no/' \
@@ -189,7 +196,10 @@ jobs:
               if grep -Eqi 'unknown (option|command)|invalid (option|config)|unsupported' /tmp/smartdns.log; then cat /tmp/smartdns.log; exit 1; fi
               dig @127.0.0.1 -p 6053 debian.org A +short +time=6 +tries=2 | grep -E '^([0-9]{1,3}\.){3}[0-9]{1,3}$'
               dig @127.0.0.1 -p 6053 google.com A +tcp +short +time=6 +tries=2 | grep -E '^([0-9]{1,3}\.){3}[0-9]{1,3}$'
-              if [[ "$stack" == dual ]]; then
+              if [[ "$stack" == auto ]]; then
+                ! grep -Fq '[::1]' /tmp/smartdns.conf
+                dig @127.0.0.1 -p 6053 google.com AAAA +short +time=6 +tries=2 | grep -E '^[0-9a-fA-F:]*:[0-9a-fA-F:]+$'
+              elif [[ "$stack" == dual ]]; then
                 dig @::1 -p 6053 google.com AAAA +short +time=6 +tries=2 | grep -E '^[0-9a-fA-F:]*:[0-9a-fA-F:]+$'
               else
                 aaaa=$(dig @127.0.0.1 -p 6053 google.com AAAA +noall +comments +authority +time=6 +tries=2)
@@ -309,6 +319,44 @@ jobs:
           cmp "$before/resolv.conf" /etc/resolv.conf
           systemctl is-active --quiet smartdns.service
           test ! -e /etc/fail2ban/jail.d/vps-init-sing-box-reality.local
+          TEST
+      - name: Verify SSH single-port switching and UFW ownership
+        if: matrix.repeat == 'false'
+        run: |
+          docker exec -i smartdns-migration bash -Eeuo pipefail -s <<'TEST'
+          apt-get install -y --no-install-recommends openssh-server ufw iproute2
+          systemctl disable --now ssh.socket 2>/dev/null || true
+          systemctl enable --now ssh.service
+          sed -i 's/^IPV6=.*/IPV6=yes/' /etc/default/ufw
+          ufw allow 22/tcp comment 'operator-owned'
+          ufw allow 12345/tcp comment 'vps-init-ssh'
+          ufw allow 12346/tcp comment 'vps-init-ssh-backup'
+          ufw allow 12347/tcp comment 'vps-init-ssh unrelated'
+          for port in 22 53651 43210 43210; do
+            (
+              source /repo/debian-init.sh
+              BACKUP_DIR=$(mktemp -d)
+              TMP_DIR=$(mktemp -d)
+              SSH_PORT=$port
+              KEEP_SSH_22=false
+              NETWORK_REQUEST=auto
+              configure_ssh
+              configure_ufw
+              validate_sshd_effective
+              validate_ssh_listeners
+            )
+            rules=$(ufw status numbered)
+            grep -F '22/tcp' <<<"$rules" | grep -F '# operator-owned'
+            grep -F '12347/tcp' <<<"$rules" | grep -F '# vps-init-ssh unrelated'
+            if grep -Eq '12345/tcp|12346/tcp|# vps-init-ssh-backup$' <<<"$rules"; then exit 1; fi
+            if [[ "$port" == 22 ]]; then
+              # The existing allow rule retains its original ownership.
+              if grep -Eq '# vps-init-ssh$' <<<"$rules"; then exit 1; fi
+            else
+              grep -E "^[[:space:]]*\[[^]]*\][[:space:]]+$port/tcp[[:space:]]+ALLOW" <<<"$rules" | grep -F '# vps-init-ssh'
+              test "$(grep -Ec '# vps-init-ssh$' <<<"$rules")" -le 2
+            fi
+          done
           TEST
       - name: Show service diagnostics
         if: failure()
