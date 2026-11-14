@@ -99,7 +99,7 @@ for scenario in reuse-many reuse-one decline first empty comments corrupt duplic
             preflight() { :; }
             acquire_lock() { :; }
             install_early_dependencies() { :; }
-            recommend_swap() {
+            configure_swap() {
               [[ "$REUSE_PUBLIC_KEY" == true && "$prompt_index" == 2 ]]
               exit 0
             }

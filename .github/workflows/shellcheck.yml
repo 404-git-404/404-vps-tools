@@ -30,6 +30,7 @@ jobs:
             tests/node-config-wizard-test.sh
             tests/smartdns-test.sh
             tests/ssh-public-key-test.sh
+            tests/swap-test.sh
           )
           for script in "${scripts[@]}"; do
             test -s "$script"
@@ -45,7 +46,8 @@ jobs:
             tests/gg-status-test.sh \
             tests/node-config-wizard-test.sh \
             tests/smartdns-test.sh \
-            tests/ssh-public-key-test.sh; do
+            tests/ssh-public-key-test.sh \
+            tests/swap-test.sh; do
             test -x "$executable_script"
           done
           for script in yt-region gg-status alpine-init.sh; do
@@ -115,6 +117,10 @@ jobs:
           PATH="$RUNNER_TEMP/mawk-bin:$PATH" bash tests/smartdns-test.sh
           PATH="$RUNNER_TEMP/mawk-bin:$PATH" bash tests/fail2ban-test.sh
           PATH="$RUNNER_TEMP/mawk-bin:$PATH" bash tests/ssh-public-key-test.sh
+          PATH="$RUNNER_TEMP/mawk-bin:$PATH" bash tests/swap-test.sh
+
+      - name: Verify real Swap activation on the runner VM
+        run: sudo bash tests/swap-test.sh --kernel
 
       - name: Run Debian and Alpine containers
         run: |
@@ -131,6 +137,7 @@ jobs:
             tests/node-config-wizard-test.sh \
             tests/smartdns-test.sh \
             tests/ssh-public-key-test.sh \
+            tests/swap-test.sh \
             /tmp/node-wizard.sh \
             /tmp/update-cloudflare-ufw
           shellcheck -s sh yt-region gg-status alpine-init.sh
