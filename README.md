@@ -18,6 +18,8 @@ curl -fsSL https://raw.githubusercontent.com/404-git-404/404-vps-tools/main/gg-s
 
 Auto 探测当前 IPv6 连通性，保留服务商的 IPv6 配置与 SmartDNS 的 AAAA 应答，并备份迁移本脚本旧版 IPv6 禁用策略。显式 IPv4-only 才持久关闭 IPv6，Dual-Stack 则显式启用。SmartDNS 始终监听 IPv4 本地端口，IPv6 回环可用时添加 IPv6 监听。
 
+Debian 初始化要求根分区至少有 2048MiB 可用空间。低内存且已启用 Swap 不足 512MiB 时，脚本按 RAM 和磁盘空间推荐 2048、1024 或 512MiB，创建后至少保留 1024MiB。确认后空间减少时会降档或跳过。符合容量的旧 Swap 文件可在确认后直接复用。
+
 Debian 完整初始化包含系统更新、SSH 公钥与端口、UFW、SmartDNS、sing-box 安装及基础调优；sing-box 节点通过选项 5 单独配置，预览并确认后才应用和启动。选项 4 仅处理 SmartDNS 与系统 DNS。覆盖已有配置前备份，失败时查看输出中的备份路径。修改 SSH 后保持当前会话，并从另一终端验证新端口。
 
 第二条命令以 root 在 Alpine/OpenRC 环境下载并运行独立初始化脚本，暂不融合 Debian 菜单。本地运行 `sh alpine-init.sh`。

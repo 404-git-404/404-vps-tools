@@ -35,6 +35,9 @@ readonly CF_TOOL='/usr/local/sbin/vps-init-cloudflare-8443'
 readonly CF_SERVICE='/etc/systemd/system/vps-init-cloudflare-8443.service'
 readonly CF_TIMER='/etc/systemd/system/vps-init-cloudflare-8443.timer'
 readonly SWAPFILE='/swapfile-vps-init'
+readonly SWAP_FSTAB='/etc/fstab'
+readonly SWAP_RESERVE_KIB=$((1024 * 1024))
+readonly MIN_ROOT_FREE_KIB=$((2 * 1024 * 1024))
 readonly LEGACY_NETWORK_UNIT='/etc/systemd/system/404-network-stack.service'
 readonly LEGACY_NETWORK_HELPER='/usr/local/libexec/404-network-stack'
 readonly LEGACY_IPV6_SYSCTL='/etc/sysctl.d/99-disable-ipv6.conf'
@@ -84,6 +87,8 @@ SINGBOX_WAS_ENABLED=false
 SINGBOX_CONFIG_PREEXISTED=false
 SINGBOX_WAS_MANAGED=false
 SWAP_RECOMMENDED_MIB=0
+SWAP_REUSE_FILE=false
+SWAPFILE_SNAPSHOT=''
 PERSIST_RESOLV_IMMUTABLE=false
 IPV6_OLD_DEFAULT=''
 declare -A IPV6_OLD_INTERFACES=()
@@ -412,11 +417,10 @@ preflight() {
     die '需要正在运行的 systemd。'
   fi
   command -v dpkg >/dev/null 2>&1 || die '缺少 dpkg。'
-  local arch free_kb audit
+  local arch audit
   arch=$(dpkg --print-architecture)
   [[ "$arch" == amd64 || "$arch" == arm64 ]] || die "仅支持 amd64/arm64，当前：$arch。"
-  free_kb=$(df -Pk / | awk 'NR==2{print $4}')
-  (( free_kb >= 2097152 )) || die '根分区至少需要 2GiB 可用空间。'
+  check_root_space
   audit=$(dpkg --audit 2>&1 || true)
   [[ -z "$audit" ]] || die "dpkg 当前存在未完成/损坏状态：$audit"
   if [[ "$INSTALL_MODE" == quick || "$INSTALL_MODE" == custom ]]; then
@@ -478,55 +482,202 @@ install_early_dependencies() {
   apt_get install -y util-linux e2fsprogs ca-certificates curl gnupg openssh-client
 }
 
-mem_total_mib() { awk '/MemTotal:/ {print int($2/1024)}' /proc/meminfo; }
+root_free_kib() {
+  df -Pk / | awk 'NR == 2 && $4 ~ /^[0-9]+$/ { print $4; found=1 } END { exit !found }'
+}
+
+format_mib() {
+  awk -v kib="$1" 'BEGIN { value=sprintf("%.10f", kib/1024); sub(/0+$/, "", value); sub(/\.$/, "", value); print value "MiB" }'
+}
+
+check_root_space() {
+  local free_kib
+  free_kib=$(root_free_kib) || die '无法读取根分区可用空间。'
+  if (( free_kib < MIN_ROOT_FREE_KIB )); then
+    die "$(printf '根分区可用：%s\n最低要求：%s\n还需释放：%s' \
+      "$(format_mib "$free_kib")" "$(format_mib "$MIN_ROOT_FREE_KIB")" \
+      "$(format_mib "$((MIN_ROOT_FREE_KIB - free_kib))")")"
+  fi
+}
+
+mem_total_kib() { awk '/MemTotal:/ {print $2}' /proc/meminfo; }
 swap_total_mib() { awk '/SwapTotal:/ {print int($2/1024)}' /proc/meminfo; }
 
+swapfile_is_active() {
+  grep -Fxq -- "$SWAPFILE" <<<"$1"
+}
+
+inactive_swapfile_bytes() {
+  [[ ! -L "$SWAPFILE" ]] || return 1
+  if [[ ! -e "$SWAPFILE" ]]; then printf '0\n'; return 0; fi
+  [[ -f "$SWAPFILE" ]] || return 1
+  local owner mode links bytes
+  IFS=' ' read -r owner mode links bytes < <(stat -c '%u %a %h %s' -- "$SWAPFILE") || return 1
+  [[ "$owner" == 0 && "$mode" == 600 && "$links" == 1 ]] || return 1
+  [[ "$(blkid -p -s TYPE -o value -- "$SWAPFILE" 2>/dev/null)" == swap ]] || return 1
+  printf '%s\n' "$bytes"
+}
+
+swapfile_snapshot() {
+  if [[ -e "$SWAPFILE" || -L "$SWAPFILE" ]]; then
+    stat -c '%d:%i:%s:%y:%z' -- "$SWAPFILE"
+  fi
+}
+
+select_swap_capacity() {
+  local maximum=$1 free_kib=$2 old_bytes=$3 candidate
+  SWAP_RECOMMENDED_MIB=0
+  SWAP_REUSE_FILE=false
+  for candidate in 2048 1024 512; do
+    (( candidate <= maximum )) || continue
+    if (( old_bytes == candidate * 1024 * 1024 && free_kib >= SWAP_RESERVE_KIB )); then
+      SWAP_RECOMMENDED_MIB=$candidate
+      SWAP_REUSE_FILE=true
+      return 0
+    fi
+    if (( candidate == 2048 && free_kib < 4 * 1024 * 1024 )); then continue; fi
+    if (( free_kib >= candidate * 1024 + SWAP_RESERVE_KIB )); then
+      SWAP_RECOMMENDED_MIB=$candidate
+      return 0
+    fi
+  done
+}
+
 recommend_swap() {
-  local mem swap
-  mem=$(mem_total_mib)
-  swap=$(swap_total_mib)
+  local mem_kib swap maximum free_kib active old_bytes reason
   SWAP_RECOMMENDED_MIB=0
   if [[ "$CONTAINER_KIND" != none ]]; then
     log '容器环境：跳过自动 Swap 文件建议。'
     return 0
   fi
+  swap=$(swap_total_mib)
   (( swap < 512 )) || return 0
-  if (( mem <= 1024 )); then
-    SWAP_RECOMMENDED_MIB=2048
-  elif (( mem <= 2048 )); then
-    SWAP_RECOMMENDED_MIB=1024
-  fi
-}
-
-create_swap() {
-  local target_mib=$1 free_kb required_kb
-  CURRENT_STEP='创建 Swap'
-  free_kb=$(df -Pk / | awk 'NR==2 {print $4}')
-  required_kb=$(( (target_mib + 1024) * 1024 ))
-  (( free_kb >= required_kb )) || die "根分区空间不足：创建 ${target_mib}MiB Swap 后还需要至少保留 1GiB。"
-  command -v mkswap >/dev/null 2>&1 || die '缺少 mkswap。'
-  command -v swapon >/dev/null 2>&1 || die '缺少 swapon。'
-  [[ ! -L "$SWAPFILE" ]] || die "$SWAPFILE 不能是符号链接。"
-  if swapon --show=NAME --noheadings 2>/dev/null | grep -Fxq "$SWAPFILE"; then
-    log "$SWAPFILE 已启用，跳过创建。"
+  mem_kib=$(mem_total_kib)
+  if (( mem_kib <= 1024 * 1024 )); then
+    maximum=2048
+  elif (( mem_kib <= 2048 * 1024 )); then
+    maximum=1024
+  else
     return 0
   fi
-  if [[ -e "$SWAPFILE" ]]; then
-    make_mutable "$SWAPFILE"
-    rm -f -- "$SWAPFILE"
+  active=$(swapon --show=NAME --noheadings --raw) || { warn '无法检查已启用的 Swap，跳过。'; return 0; }
+  if swapfile_is_active "$active"; then log "$SWAPFILE 已启用，跳过创建。"; return 0; fi
+  old_bytes=$(inactive_swapfile_bytes) || { warn "$SWAPFILE 的类型、归属、权限或 Swap 签名无法验证，跳过。"; return 0; }
+  SWAPFILE_SNAPSHOT=$(swapfile_snapshot) || { warn '无法确认旧 Swap 文件状态，跳过。'; return 0; }
+  free_kib=$(root_free_kib) || { warn '无法检查根分区可用空间，跳过 Swap。'; return 0; }
+  select_swap_capacity "$maximum" "$free_kib" "$old_bytes"
+  reason='保留根分区安全空间'
+  if [[ "$SWAP_REUSE_FILE" == true ]]; then
+    reason='复用现有未启用的 Swap 文件，无需重新分配空间'
+  elif (( SWAP_RECOMMENDED_MIB == 0 )); then
+    reason='没有可在保留 1024MiB 后安全创建的容量，跳过'
   fi
-  if command -v fallocate >/dev/null 2>&1 && fallocate -l "${target_mib}M" "$SWAPFILE" 2>/dev/null; then
-    :
-  else
-    dd if=/dev/zero of="$SWAPFILE" bs=1M count="$target_mib" status=progress
+  log "$(printf 'RAM：%s\n当前 Swap：%sMiB\n磁盘可用：%s\n原始推荐：%sMiB\n调整推荐：%sMiB\n原因：%s' \
+    "$(format_mib "$mem_kib")" "$swap" "$(format_mib "$free_kib")" "$maximum" "$SWAP_RECOMMENDED_MIB" "$reason")"
+}
+
+create_swap() (
+  local confirmed=$1 free_kib active old_bytes target current fstab_before
+  local swap_work='' fstab_stage='' publishing=false activating=false committed=false
+  ORIGINAL_ATTRS=()
+  # Keep the old inode until both activation and the atomic fstab update succeed.
+  trap '
+    set +e
+    if [[ -n "$fstab_stage" ]]; then rm -f -- "$fstab_stage"; fi
+    if [[ "$committed" == false ]]; then
+      if [[ "$activating" == true ]]; then
+        if ! active=$(swapon --show=NAME --noheadings --raw) ||
+          { swapfile_is_active "$active" && ! swapoff "$SWAPFILE"; }; then
+          warn "无法安全撤销 $SWAPFILE；保留文件及恢复目录：$swap_work"
+          restore_attrs
+          exit 1
+        fi
+      fi
+      if [[ "$publishing" == true && ! -e "$swap_work/new" ]]; then rm -f -- "$SWAPFILE"; fi
+      if [[ -n "$swap_work" && -e "$swap_work/old" ]]; then
+        mv -T -- "$swap_work/old" "$SWAPFILE" || {
+          warn "无法恢复原 Swap 文件；备份保留在 $swap_work/old"
+          restore_attrs
+          exit 1
+        }
+      fi
+    fi
+    restore_attrs
+    if [[ -n "$swap_work" ]]; then rm -f -- "$swap_work/new" "$swap_work/old"; rmdir -- "$swap_work"; fi
+  ' EXIT
+  trap 'exit 1' HUP INT TERM
+
+  active=$(swapon --show=NAME --noheadings --raw) || return 1
+  if swapfile_is_active "$active" || (( $(swap_total_mib) >= 512 )); then return 0; fi
+  current=$(swapfile_snapshot) || return 1
+  if [[ "$current" != "$SWAPFILE_SNAPSHOT" ]]; then warn 'Swap 文件自确认后已变化，跳过。'; return 0; fi
+  old_bytes=$(inactive_swapfile_bytes) || { warn "$SWAPFILE 的状态已变化，跳过。"; return 0; }
+  free_kib=$(root_free_kib) || return 1
+  select_swap_capacity "$confirmed" "$free_kib" "$old_bytes"
+  target=$SWAP_RECOMMENDED_MIB
+  if (( target == 0 )); then warn '磁盘空间变化，已跳过 Swap。'; return 0; fi
+  if (( target < confirmed )); then warn "磁盘空间变化，Swap 调整为 ${target}MiB。"; fi
+  [[ -f "$SWAP_FSTAB" && ! -L "$SWAP_FSTAB" ]] || return 1
+  fstab_before="$BACKUP_DIR/swap/fstab"
+  install -d -m 0700 "$BACKUP_DIR/swap" || return 1
+  cp -a -- "$SWAP_FSTAB" "$fstab_before" || return 1
+  fstab_stage=$(mktemp "${SWAP_FSTAB}.vps-init.XXXXXXXX") || return 1
+  cp --preserve=mode,ownership -- "$fstab_before" "$fstab_stage" || return 1
+  awk -v path="$SWAPFILE" '
+    $1 == path { if ($3 != "swap") exit 1; next }
+    { print }
+    END { print path " none swap sw 0 0" }
+  ' "$fstab_before" >"$fstab_stage" || return 1
+
+  if [[ "$SWAP_REUSE_FILE" == false ]]; then
+    swap_work=$(mktemp -d "${SWAPFILE}.vps-init.XXXXXXXX") || return 1
+    if ! dd if=/dev/zero of="$swap_work/new" bs=1M count="$target" conv=fsync status=none; then
+      warn 'Swap 文件分配失败，保留现有文件并跳过。'
+      return 0
+    fi
+    chmod 0600 "$swap_work/new" || return 1
+    mkswap "$swap_work/new" >/dev/null || return 1
+    current=$(swapfile_snapshot) || return 1
+    active=$(swapon --show=NAME --noheadings --raw) || return 1
+    if [[ "$current" != "$SWAPFILE_SNAPSHOT" ]] || swapfile_is_active "$active"; then
+      warn 'Swap 文件或启用状态已变化，跳过。'
+      return 0
+    fi
+    if (( old_bytes > 0 )); then mv -T -- "$SWAPFILE" "$swap_work/old" || return 1; fi
+    publishing=true
+    mv -T -- "$swap_work/new" "$SWAPFILE" || return 1
   fi
-  chmod 0600 "$SWAPFILE"
-  mkswap "$SWAPFILE" >/dev/null
-  swapon "$SWAPFILE"
-  reject_symlink /etc/fstab
-  make_mutable /etc/fstab
-  grep -Fq "$SWAPFILE none swap sw 0 0" /etc/fstab || printf '%s\n' "$SWAPFILE none swap sw 0 0" >>/etc/fstab
-  log "已创建并启用 ${target_mib}MiB Swap：$SWAPFILE"
+  free_kib=$(root_free_kib) || return 1
+  if (( free_kib < SWAP_RESERVE_KIB )); then warn '磁盘可用空间已低于安全余量，已跳过 Swap。'; return 0; fi
+  activating=true
+  swapon "$SWAPFILE" || return 1
+  active=$(swapon --show=NAME --noheadings --raw) && swapfile_is_active "$active" || return 1
+  if ! cmp -s -- "$fstab_before" "$SWAP_FSTAB"; then warn 'fstab 在配置过程中已变化。'; return 1; fi
+  if ! cmp -s -- "$fstab_stage" "$SWAP_FSTAB"; then
+    make_mutable "$SWAP_FSTAB"
+    # Defer signals across the atomic commit and rollback flag update.
+    trap '' HUP INT TERM
+    mv -T -- "$fstab_stage" "$SWAP_FSTAB" || return 1
+  fi
+  committed=true
+  log "已启用 ${target}MiB Swap：$SWAPFILE"
+)
+
+configure_swap() {
+  recommend_swap
+  (( SWAP_RECOMMENDED_MIB > 0 )) || return 0
+  local action='创建' question='创建？'
+  if [[ "$SWAP_REUSE_FILE" == true ]]; then
+    action='复用并启用'
+    question='启用？'
+  elif [[ -e "$SWAPFILE" ]]; then
+    action='替换未启用的旧文件并创建'
+    question='替换并创建？'
+  fi
+  if ask_yes_no "$(printf '检测到 %s RAM、当前 Swap %sMiB\n当前磁盘空间推荐%s %sMiB Swap\n%s' \
+    "$(format_mib "$(mem_total_kib)")" "$(swap_total_mib)" "$action" "$SWAP_RECOMMENDED_MIB" "$question")" true; then
+    if ! create_swap "$SWAP_RECOMMENDED_MIB"; then warn 'Swap 配置未完成，继续初始化。'; fi
+  fi
 }
 
 collect_choices() {
@@ -2222,12 +2373,7 @@ main() {
     collect_public_key
     install_authorized_key
   fi
-  recommend_swap
-  if (( SWAP_RECOMMENDED_MIB > 0 )); then
-    if ask_yes_no "检测到 $(mem_total_mib)MiB RAM、当前 Swap $(swap_total_mib)MiB；建议创建 ${SWAP_RECOMMENDED_MIB}MiB Swap。创建？" true; then
-      create_swap "$SWAP_RECOMMENDED_MIB"
-    fi
-  fi
+  configure_swap
   if [[ "$INSTALL_MODE" != custom ]]; then
     update_system_and_tools
   fi
