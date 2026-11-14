@@ -85,7 +85,7 @@ NETWORK_STACK=unknown
 NETWORK_REQUEST=auto
 
 # Quick menus use the real validation path, including occupied ports and CLI precedence.
-for selection in default standard custom cli; do
+for selection in default standard custom cli preserve; do
   (
     prompt=0
     # shellcheck disable=SC2329 # Used by the sourced quick menu.
@@ -99,6 +99,8 @@ for selection in default standard custom cli; do
       case "$selection:$prompt" in
         standard:1) response=1 ;;
         standard:2) response=2 ;;
+        preserve:1) response=4 ;;
+        preserve:2) response=3 ;;
         custom:1|custom:3|custom:5|custom:7) response=3 ;;
         custom:2) response=443 ;;
         custom:4) response=1234 ;;
@@ -114,6 +116,7 @@ for selection in default standard custom cli; do
       standard) assert_eq '22/ipv4/2' "$SSH_PORT/$NETWORK_REQUEST/$prompt" 'quick 22 only' ;;
       custom) assert_eq '43210/dual/7' "$SSH_PORT/$NETWORK_REQUEST/$prompt" 'quick custom port' ;;
       cli) assert_eq '22/ipv4/0' "$SSH_PORT/$NETWORK_REQUEST/$prompt" 'explicit CLI' ;;
+      preserve) assert_eq 'true/dual/2' "$PRESERVE_SSH/$NETWORK_REQUEST/$prompt" 'preserve SSH menu' ;;
     esac
     if ssh_has_backup_port; then fail 'unexpected backup SSH port'; fi
     ss() { printf 'LISTEN 0 128 0.0.0.0:%s 0.0.0.0:* users:(("sshd",pid=1,fd=2))\n' "$SSH_PORT"; }
@@ -122,6 +125,37 @@ for selection in default standard custom cli; do
     if validate_ssh_listeners; then fail 'unexpected SSH listener accepted'; fi
   )
 done
+
+for args in --ssh-port --keep-22 --close-22 --pubkey --pubkey-file --cloudflare-8443; do
+  case "$args" in
+    --ssh-port|--pubkey|--pubkey-file)
+      if (parse_args --preserve-ssh "$args" 22) >/dev/null 2>&1; then fail "accepted conflicting $args"; fi ;;
+    *)
+      if (parse_args --preserve-ssh "$args") >/dev/null 2>&1; then fail "accepted conflicting $args"; fi ;;
+  esac
+done
+
+(
+  parse_args --preserve-ssh --network-stack dual
+  read_tty() { fail 'unexpected SSH prompt in preserve mode'; }
+  collect_quick_choices
+  collect_choices
+  systemctl() { fail 'preserve mode attempted to manage SSH'; }
+  ufw() { fail 'preserve mode attempted to change UFW'; }
+  configure_ssh
+  configure_ufw
+  configure_cf8443
+)
+
+(
+  CONTAINER_KIND=lxc
+  systemctl() {
+    [[ "$2" == chrony.service ]] || fail 'unexpected service operation'
+    [[ "$1" != restart ]]
+  }
+  configure_chrony 2>"$TEST_TMP/chrony.log"
+  grep -Fq '容器（lxc）内 Chrony 启动失败；继续安装' "$TEST_TMP/chrony.log"
+)
 
 # Redirect only file destinations. Exercise real policy generation and rollback.
 for policy in fresh provider legacy legacy-service ipv4 dual; do

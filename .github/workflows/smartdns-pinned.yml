@@ -332,6 +332,65 @@ jobs:
           ufw allow 12345/tcp comment 'vps-init-ssh'
           ufw allow 12346/tcp comment 'vps-init-ssh-backup'
           ufw allow 12347/tcp comment 'vps-init-ssh unrelated'
+          ufw allow 53651/tcp comment 'vps-init-ssh'
+          ufw allow 50602/tcp comment 'custom application'
+          ufw allow 50602/udp comment 'custom application'
+          cat >/etc/ssh/sshd_config.d/99-custom.conf <<'SSH'
+          ListenAddress 0.0.0.0:22
+          ListenAddress [::]:53651
+          PasswordAuthentication no
+          PermitRootLogin prohibit-password
+          SSH
+          cat >/etc/ssh/sshd_config.d/90-match.conf <<'SSH'
+          Match User example
+              AllowTcpForwarding no
+          SSH
+          sshd -t
+          systemctl reload ssh.service
+          ufw --force enable
+          fixtures=$(mktemp -d)
+          cp /etc/ssh/sshd_config.d/90-match.conf "$fixtures/match"
+          snapshot() {
+            sha256sum /etc/ssh/sshd_config /etc/ssh/sshd_config.d/*.conf /etc/ufw/user*.rules /etc/default/ufw
+            ss -H -ltnp | awk '/sshd/ { print $4 }' | sort
+            ufw status numbered
+          }
+          for _ in {1..10}; do
+            if ss -H -ltnp | grep -E '53651.*sshd' >/dev/null; then break; fi
+            sleep 1
+          done
+          snapshot >"$fixtures/original"
+          grep -Fx '0.0.0.0:22' "$fixtures/original"
+          grep -Eq '^(\[::\]|\*):53651$' "$fixtures/original"
+          (
+            source /repo/debian-init.sh
+            parse_args --preserve-ssh --network-stack dual
+            configure_ssh
+            configure_ufw
+            ssh_listener_addresses | grep -F ':53651'
+          )
+          snapshot >"$fixtures/current"
+          cmp "$fixtures/original" "$fixtures/current"
+          for failure in ssh ufw; do
+            if bash -Eeuo pipefail -c '
+              source /repo/debian-init.sh
+              BACKUP_DIR=$(mktemp -d)
+              TMP_DIR=$(mktemp -d)
+              SSH_PORT=43210 KEEP_SSH_22=false NETWORK_REQUEST=dual
+              case "$1" in
+                ssh) validate_sshd_effective() { return 1; } ;;
+                ufw) ufw() { if [[ "$1" == default ]]; then return 1; fi; command ufw "$@"; } ;;
+              esac
+              configure_ssh
+              configure_ufw
+            ' _ "$failure"; then exit 1; fi
+            for _ in {1..10}; do
+              snapshot >"$fixtures/current"
+              if cmp -s "$fixtures/original" "$fixtures/current"; then break; fi
+              sleep 1
+            done
+            diff -u "$fixtures/original" "$fixtures/current"
+          done
           for port in 22 53651 43210 43210; do
             (
               source /repo/debian-init.sh
@@ -346,7 +405,10 @@ jobs:
               validate_ssh_listeners
             )
             rules=$(ufw status numbered)
+            cmp "$fixtures/match" /etc/ssh/sshd_config.d/90-match.conf
             grep -F '22/tcp' <<<"$rules" | grep -F '# operator-owned'
+            grep -F '50602/tcp' <<<"$rules" | grep -F '# custom application'
+            grep -F '50602/udp' <<<"$rules" | grep -F '# custom application'
             grep -F '12347/tcp' <<<"$rules" | grep -F '# vps-init-ssh unrelated'
             if grep -Eq '12345/tcp|12346/tcp|# vps-init-ssh-backup$' <<<"$rules"; then exit 1; fi
             if [[ "$port" == 22 ]]; then

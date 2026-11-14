@@ -50,6 +50,10 @@ KEEP_SSH_22=true
 DO_FULL_UPGRADE=true
 SSH_PORT_SET=false
 KEEP_SSH_22_SET=false
+PRESERVE_SSH=false
+declare -a SSH_TEMP_HOLDS=()
+SSH_KEYS_TX=false
+SSH_KEY_DIR_STATE=''
 DO_FULL_UPGRADE_SET=false
 BASE_ONLY=false
 INSTALL_MODE=''
@@ -65,6 +69,7 @@ REUSE_PUBLIC_KEY=false
 CF8443_MODE='auto' # auto = fresh install off; existing managed install preserved
 CONTAINER_KIND='none'
 SSH_TX=false
+SSH_RELOAD_ATTEMPTED=false
 DNS_TX=false
 UFW_TX=false
 FAIL2BAN_TX=false
@@ -137,6 +142,7 @@ usage() {
   --ssh-port PORT            指定 SSH 端口并跳过端口菜单（默认 53651）
   --keep-22                  兼容旧部署，为非 22 的 SSH 端口保留 22 备用
   --close-22                 仅使用所选 SSH 端口（快速安装默认）
+  --preserve-ssh             保留现有 SSH 监听、认证及 UFW，跳过公钥和端口配置
   --full-upgrade             执行 full-upgrade（默认）
   --skip-upgrade             仅 apt update，不执行 full-upgrade
   --sing-box-version VER     指定 sing-box 版本；未指定时已安装版本不会被重跑升级
@@ -223,6 +229,7 @@ make_mutable() {
 cleanup() {
   local rc=$?
   set +e
+  restore_ssh_package_holds
   restore_ipv6_probe_state || true
   rollback_fail2ban || true
   if [[ "$SINGBOX_RUNTIME_MASK" == true ]]; then
@@ -237,6 +244,7 @@ cleanup() {
 }
 
 rollback_ssh() {
+  rollback_ssh_keys
   [[ "$SSH_TX" == true ]] || return 0
   SSH_TX=false
   warn '正在回滚 SSH 配置。'
@@ -251,7 +259,11 @@ rollback_ssh() {
   if [[ -e "$BACKUP_DIR/ssh/sshd_config" ]]; then
     cp -a -- "$BACKUP_DIR/ssh/sshd_config" "$SSH_MAIN"
   fi
-  if sshd -t >/dev/null 2>&1; then systemctl reload ssh.service >/dev/null 2>&1 || true; fi
+  if [[ "$SSH_RELOAD_ATTEMPTED" == true ]]; then
+    if ! sshd -t || ! systemctl reload ssh.service; then
+      warn "无法重新加载恢复后的 SSH 配置；备份位于 $BACKUP_DIR/ssh"
+    fi
+  fi
 }
 
 rollback_dns() {
@@ -316,8 +328,9 @@ rollback_ufw() {
   fi
   [[ ! -e "$BACKUP_DIR/ufw/default-ufw" ]] || cp -a "$BACKUP_DIR/ufw/default-ufw" /etc/default/ufw
   if [[ "$UFW_OLD_ACTIVE" == true ]]; then
-    ufw --force enable >/dev/null 2>&1 || true
-    ufw --force reload >/dev/null 2>&1 || true
+    if ! ufw reload >/dev/null 2>&1; then
+      ufw --force enable >/dev/null 2>&1 || warn "无法恢复 UFW；备份位于 $BACKUP_DIR/ufw"
+    fi
   else
     ufw --force disable >/dev/null 2>&1 || true
   fi
@@ -373,6 +386,7 @@ parse_args() {
       --ssh-port) [[ $# -ge 2 ]] || die '--ssh-port 缺少参数。'; SSH_PORT=$2; SSH_PORT_SET=true; shift 2 ;;
       --keep-22) KEEP_SSH_22=true; KEEP_SSH_22_SET=true; shift ;;
       --close-22) KEEP_SSH_22=false; KEEP_SSH_22_SET=true; shift ;;
+      --preserve-ssh) PRESERVE_SSH=true; shift ;;
       --full-upgrade) DO_FULL_UPGRADE=true; DO_FULL_UPGRADE_SET=true; shift ;;
       --skip-upgrade) DO_FULL_UPGRADE=false; DO_FULL_UPGRADE_SET=true; shift ;;
       --sing-box-version) [[ $# -ge 2 ]] || die '--sing-box-version 缺少参数。'; SING_BOX_VERSION=${2#v}; shift 2 ;;
@@ -394,6 +408,12 @@ parse_args() {
     esac
   done
   [[ -z "$PUBKEY_ARGUMENT" || -z "$PUBKEY_FILE" ]] || die '--pubkey 与 --pubkey-file 只能指定一个。'
+  if [[ "$PRESERVE_SSH" == true ]]; then
+    if [[ "$SSH_PORT_SET" == true || "$KEEP_SSH_22_SET" == true || -n "$PUBKEY_ARGUMENT$PUBKEY_FILE" ]]; then
+      die '--preserve-ssh 不能与 SSH 端口、备用端口或公钥参数同时使用。'
+    fi
+    [[ "$CF8443_MODE" == auto ]] || die '--preserve-ssh 保留 UFW，不能同时调整 Cloudflare 8443 规则。'
+  fi
   validate_port "$SSH_PORT" || die "SSH 端口无效：$SSH_PORT（保留端口为 53/80/443/8443）。"
   case "$NETWORK_REQUEST" in auto|ipv4|dual) ;; *) die '--network-stack 仅支持 auto、ipv4、dual。' ;; esac
   if [[ -n "$SING_BOX_VERSION" ]]; then
@@ -426,7 +446,10 @@ preflight() {
   audit=$(dpkg --audit 2>&1 || true)
   [[ -z "$audit" ]] || die "dpkg 当前存在未完成/损坏状态：$audit"
   if [[ "$INSTALL_MODE" == quick || "$INSTALL_MODE" == custom ]]; then
-    systemctl is-active --quiet ssh.service || die 'ssh.service 未运行；完整初始化拒绝继续。'
+    if [[ "$PRESERVE_SSH" == false ]]; then
+      systemctl is-active --quiet ssh.service || systemctl is-active --quiet ssh.socket ||
+        die 'ssh.service 和 ssh.socket 均未运行。'
+    fi
     [[ -r /dev/tty && -w /dev/tty ]] || die '完整初始化需要交互式 /dev/tty。'
   fi
   CONTAINER_KIND=$(systemd-detect-virt --container 2>/dev/null || true)
@@ -444,6 +467,9 @@ preflight() {
 
 apt_get() {
   local lock_timeout=$APT_WAIT_MAX
+  local NEEDRESTART_MODE=${NEEDRESTART_MODE:-}
+  if [[ "$PRESERVE_SSH" == true ]]; then NEEDRESTART_MODE=l; fi
+  export NEEDRESTART_MODE
   apt-get \
     -o "DPkg::Lock::Timeout=$lock_timeout" \
     -o Dpkg::Options::='--force-confdef' \
@@ -481,7 +507,9 @@ install_early_dependencies() {
   CURRENT_STEP='安装初始化依赖'
   wait_for_package_manager
   apt_get update
-  apt_get install -y util-linux e2fsprogs ca-certificates curl gnupg openssh-client
+  local -a ssh_packages=()
+  if [[ "$PRESERVE_SSH" == false ]]; then ssh_packages+=(openssh-client); fi
+  apt_get install -y util-linux e2fsprogs ca-certificates curl gnupg "${ssh_packages[@]}"
 }
 
 root_free_kib() {
@@ -685,12 +713,12 @@ configure_swap() {
 collect_choices() {
   [[ "$BASE_ONLY" == true ]] && return 0
   local answer=''
-  if [[ "$SSH_PORT_SET" == false ]]; then
+  if [[ "$PRESERVE_SSH" == false && "$SSH_PORT_SET" == false ]]; then
     read_tty "SSH 端口 [$DEFAULT_SSH_PORT]: " answer
     [[ -z "$answer" ]] || SSH_PORT=$answer
   fi
   validate_port "$SSH_PORT" || die "SSH 端口无效：$SSH_PORT。"
-  if [[ "$KEEP_SSH_22_SET" == false ]]; then
+  if [[ "$PRESERVE_SSH" == false && "$KEEP_SSH_22_SET" == false ]]; then
     if ask_yes_no '保留 SSH 22/tcp 作为备用？' true; then KEEP_SSH_22=true; else KEEP_SSH_22=false; fi
   fi
   if [[ "$DO_FULL_UPGRADE_SET" == false ]]; then
@@ -715,7 +743,7 @@ ssh_port_available() {
 collect_quick_choices() {
   local choice='' port=''
   if [[ "$KEEP_SSH_22_SET" == false ]]; then KEEP_SSH_22=false; fi
-  if [[ "$SSH_PORT_SET" == false ]]; then
+  if [[ "$PRESERVE_SSH" == false && "$SSH_PORT_SET" == false ]]; then
     if ! command -v ss >/dev/null 2>&1; then
       wait_for_package_manager
       apt_get update
@@ -723,11 +751,16 @@ collect_quick_choices() {
       command -v ss >/dev/null || die '缺少 ss，无法检查 SSH 端口。'
     fi
     while true; do
-      read_tty $'\n1. 22 only\n2. 53651 only（默认）\n3. 自定义端口 only\n请选择 SSH 端口 [1-3]: ' choice
+      read_tty $'\n1. 22 only\n2. 53651 only（默认）\n3. 自定义端口 only\n4. 保留现有 SSH 配置\n请选择 SSH 端口 [1-4]: ' choice
       case "${choice:-2}" in
         1) port=22 ;;
         2) port=$DEFAULT_SSH_PORT ;;
         3) read_tty '输入 SSH 端口: ' port ;;
+        4)
+          [[ "$KEEP_SSH_22_SET" == false && -z "$PUBKEY_ARGUMENT$PUBKEY_FILE" && "$CF8443_MODE" == auto ]] ||
+            die '保留 SSH 模式不能与备用端口、公钥参数或 Cloudflare 8443 修改同时使用。'
+          PRESERVE_SSH=true
+          break ;;
         *) warn '无效选择。'; continue ;;
       esac
       if validate_port "$port" && ssh_port_available "$port"; then
@@ -754,9 +787,31 @@ collect_quick_choices() {
   DO_FULL_UPGRADE_SET=true
 }
 
+restore_ssh_package_holds() {
+  (( ${#SSH_TEMP_HOLDS[@]} )) || return 0
+  if apt-mark unhold "${SSH_TEMP_HOLDS[@]}" >/dev/null; then
+    SSH_TEMP_HOLDS=()
+  else
+    warn "无法恢复临时包 hold：${SSH_TEMP_HOLDS[*]}"
+  fi
+}
+
 update_system_and_tools() {
   CURRENT_STEP='系统更新与基础工具'
   local sing_was_held=false smart_was_held=false sing_temp_hold=false smart_temp_hold=false upgrade_rc=0
+  local package held installed
+  local -a access_packages=(openssh-server ufw fail2ban)
+  if [[ "$PRESERVE_SSH" == true ]]; then
+    access_packages=()
+    held=$(apt-mark showhold)
+    for package in openssh-server openssh-client openssh-sftp-server ufw fail2ban; do
+      installed=$(dpkg-query -W -f='${db:Status-Status}' "$package" 2>/dev/null || true)
+      if [[ "$installed" == installed ]] && ! grep -Fxq "$package" <<<"$held"; then
+        SSH_TEMP_HOLDS+=("$package")
+        apt-mark hold "$package" >/dev/null
+      fi
+    done
+  fi
   wait_for_package_manager
   apt_get update
   if [[ "$DO_FULL_UPGRADE" == true ]]; then
@@ -779,10 +834,14 @@ update_system_and_tools() {
   fi
   apt_get install -y \
     ca-certificates curl wget git rsync tar unzip xz-utils jq nano gnupg openssl socat cron \
-    openssh-server ufw dnsutils iproute2 iputils-ping netcat-openbsd mtr-tiny traceroute tcpdump \
+    "${access_packages[@]}" dnsutils iproute2 iputils-ping netcat-openbsd mtr-tiny traceroute tcpdump \
     procps lsof htop chrony vnstat python3 python3-systemd util-linux file sudo e2fsprogs psmisc \
-    fail2ban kmod
-  if ! command -v curl >/dev/null || ! command -v sshd >/dev/null || ! command -v ufw >/dev/null; then
+    kmod
+  restore_ssh_package_holds
+  if ! command -v curl >/dev/null; then
+    die '基础工具验证失败。'
+  fi
+  if [[ "$PRESERVE_SSH" == false ]] && { ! command -v sshd >/dev/null || ! command -v ufw >/dev/null; }; then
     die '基础工具验证失败。'
   fi
 }
@@ -900,6 +959,8 @@ install_authorized_key() {
     cp -a -- "$AUTHORIZED_KEYS" "$BACKUP_DIR/ssh/authorized_keys"
     existing=$(ssh_public_key_fingerprints "$AUTHORIZED_KEYS" || true)
   fi
+  if [[ -d "${AUTHORIZED_KEYS%/*}" ]]; then SSH_KEY_DIR_STATE=$(stat -c '%u:%g %a' -- "${AUTHORIZED_KEYS%/*}"); fi
+  SSH_KEYS_TX=true
   install -d -o root -g root -m 0700 "${AUTHORIZED_KEYS%/*}"
   make_mutable "$AUTHORIZED_KEYS"
   touch "$AUTHORIZED_KEYS"
@@ -914,6 +975,24 @@ install_authorized_key() {
       printf '%s\n' "$PUBLIC_KEY"
     } >>"$AUTHORIZED_KEYS"
     log "SSH 公钥已添加：$fingerprint"
+  fi
+}
+
+rollback_ssh_keys() {
+  [[ "$SSH_KEYS_TX" == true ]] || return 0
+  SSH_KEYS_TX=false
+  local mode owner directory="${AUTHORIZED_KEYS%/*}"
+  make_mutable "$AUTHORIZED_KEYS"
+  if [[ -f "$BACKUP_DIR/ssh/authorized_keys" ]]; then
+    cp -a -- "$BACKUP_DIR/ssh/authorized_keys" "$AUTHORIZED_KEYS" || warn '无法恢复 authorized_keys。'
+  else
+    rm -f -- "$AUTHORIZED_KEYS" || warn '无法移除本次新建的 authorized_keys。'
+  fi
+  if [[ -n "$SSH_KEY_DIR_STATE" ]]; then
+    IFS=' ' read -r owner mode <<<"$SSH_KEY_DIR_STATE"
+    if ! chown "$owner" "$directory" || ! chmod "$mode" "$directory"; then warn '无法恢复 .ssh 权限。'; fi
+  else
+    rmdir -- "$directory" 2>/dev/null || true
   fi
 }
 
@@ -1160,7 +1239,7 @@ configure_chrony() {
   systemctl enable chrony.service >/dev/null 2>&1 || true
   if ! systemctl restart chrony.service; then
     if [[ "$CONTAINER_KIND" != none ]]; then
-      warn '容器环境中 Chrony 无法启动；继续执行。'
+      warn "容器（$CONTAINER_KIND）内 Chrony 启动失败；继续安装。"
     else
       die 'Chrony 启动失败。'
     fi
@@ -1195,8 +1274,6 @@ configure_tcp_tuning() {
   [[ " $available " == *' bbr '* ]] && bbr=true
   {
     echo '# Managed by vps-init.sh'
-    [[ "$bbr" == true ]] && echo 'net.core.default_qdisc = fq'
-    [[ "$bbr" == true ]] && echo 'net.ipv4.tcp_congestion_control = bbr'
     cat <<'EOF'
 net.core.rmem_max = 33554432
 net.core.wmem_max = 33554432
@@ -1213,14 +1290,24 @@ EOF
   sysctl_try net.ipv4.tcp_window_scaling 1 || true
   sysctl_try net.ipv4.tcp_moderate_rcvbuf 1 || true
   if [[ "$bbr" == true ]]; then
-    printf 'tcp_bbr\n' >"$BBR_MODULES"
-    sysctl_try net.core.default_qdisc fq || true
-    sysctl_try net.ipv4.tcp_congestion_control bbr || true
-    log "BBR：$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo unknown) / qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo unknown)"
+    local out
+    if out=$(sysctl -w net.core.default_qdisc=fq 2>&1); then
+      printf 'net.core.default_qdisc = fq\n' >>"$TCP_SYSCTL"
+    else
+      warn "默认 qdisc 无法设为 fq：$out"
+    fi
+    if out=$(sysctl -w net.ipv4.tcp_congestion_control=bbr 2>&1); then
+      printf 'tcp_bbr\n' >"$BBR_MODULES"
+      printf 'net.ipv4.tcp_congestion_control = bbr\n' >>"$TCP_SYSCTL"
+    else
+      rm -f -- "$BBR_MODULES"
+      warn "当前环境无法启用 BBR：$out"
+    fi
   else
     rm -f "$BBR_MODULES"
-    warn '当前内核不提供 BBR；TCP buffer 调优已应用，未写入无效 BBR 配置。'
+    warn '当前内核未报告 BBR 可用；TCP 参数的应用结果见上方日志。'
   fi
+  log "TCP 实际拥塞算法：$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo unavailable) / 默认 qdisc：$(sysctl -n net.core.default_qdisc 2>/dev/null || echo unavailable)"
 }
 
 configure_sagernet_repo() {
@@ -1682,7 +1769,7 @@ neutralize_ssh_file() {
   awk '
     BEGIN {
       global=1
-      split("port permitrootlogin pubkeyauthentication authenticationmethods passwordauthentication kbdinteractiveauthentication challengeresponseauthentication permitemptypasswords usepam x11forwarding authorizedkeysfile authorizedkeyscommand authorizedkeyscommanduser allowusers allowgroups denyusers denygroups", a, " ")
+      split("port listenaddress permitrootlogin pubkeyauthentication authenticationmethods passwordauthentication kbdinteractiveauthentication challengeresponseauthentication permitemptypasswords usepam x11forwarding authorizedkeysfile authorizedkeyscommand authorizedkeyscommanduser allowusers allowgroups denyusers denygroups", a, " ")
       for (i in a) blocked[a[i]]=1
     }
     {
@@ -1744,8 +1831,8 @@ preauthorize_ufw_ssh() {
 }
 
 validate_sshd_effective() {
-  local eff ports authfile authcmd
-  eff=$(sshd -T -C user=root,host=localhost,addr=127.0.0.1 2>/dev/null) || return 1
+  local context=${1:-user=root,host=localhost,addr=127.0.0.1} eff ports authfile authcmd
+  eff=$(sshd -T -C "$context" 2>/dev/null) || return 1
   ports=$(awk '$1=="port"{print $2}' <<<"$eff" | sort -u)
   if ssh_has_backup_port; then
     [[ "$ports" == "22"$'\n'"$SSH_PORT" || "$ports" == "$SSH_PORT"$'\n22' ]] || return 1
@@ -1759,6 +1846,7 @@ validate_sshd_effective() {
   grep -Eq '^pubkeyauthentication yes$' <<<"$eff" || return 1
   grep -Eq '^passwordauthentication no$' <<<"$eff" || return 1
   grep -Eq '^kbdinteractiveauthentication no$' <<<"$eff" || return 1
+  grep -Fxq 'authenticationmethods publickey' <<<"$eff" || return 1
   authfile=$(awk '$1=="authorizedkeysfile"{$1=""; sub(/^ /,""); print; exit}' <<<"$eff")
   grep -Eq '(^|[[:space:]])\.ssh/authorized_keys([[:space:]]|$)|/root/\.ssh/authorized_keys' <<<"$authfile" || return 1
   authcmd=$(awk '$1=="authorizedkeyscommand"{print $2; exit}' <<<"$eff")
@@ -1776,11 +1864,47 @@ validate_ssh_listeners() {
   fi
 }
 
+validate_ssh_policy() {
+  local peer='' _ local_addr=''
+  validate_sshd_effective || return 1
+  IFS=' ' read -r peer _ local_addr _ <<<"${SSH_CONNECTION:-}"
+  if [[ -n "$peer" && -n "$local_addr" ]]; then
+    validate_sshd_effective "user=root,host=$peer,addr=$peer,laddr=$local_addr,lport=$SSH_PORT"
+  fi
+}
+
+ssh_listener_addresses() {
+  local entries unit
+  entries=$(ss -H -ltnp) || return 1
+  awk '/users:.*\("(sshd|sshd-session)",/ { print $4 }' <<<"$entries"
+  if systemctl is-active --quiet ssh.socket; then
+    unit=$(systemctl show ssh.socket -p Listen --value) || return 1
+    awk '{for (i=2; i<=NF; i++) if ($i=="(Stream)") print $(i-1)}' <<<"$unit"
+  fi
+}
+
+confirm_ssh_listener_change() {
+  local addresses ports
+  addresses=$(ssh_listener_addresses) || die '无法读取现有 SSH 监听。'
+  ports=$(awk 'NF { sub(/^.*:/, ""); print }' <<<"$addresses" | sort -u)
+  if [[ "$ports" != *$'\n'* ]]; then return 0; fi
+  warn "现有 SSH 监听多个端口，切换到端口 $SSH_PORT 可能改变 IPv4/IPv6 或 NAT 的访问路径。"
+  printf '%s\n' "$addresses"
+  if ! ask_yes_no '覆盖现有 SSH 分端口监听配置？' false; then
+    die '已取消 SSH 切换。可用 --preserve-ssh 保留现有配置并继续初始化。'
+  fi
+}
+
 configure_ssh() {
   CURRENT_STEP='配置 SSH'
+  if [[ "$PRESERVE_SSH" == true ]]; then
+    log '保留 SSH 监听、认证和服务。'
+    return 0
+  fi
   systemctl is-active --quiet ssh.service || die 'ssh.service 未运行。'
   [[ -f "$SSH_MAIN" && ! -L "$SSH_MAIN" ]] || die "$SSH_MAIN 必须是普通文件。"
   [[ ! -L "$SSH_DIR" ]] || die "$SSH_DIR 不能是符号链接。"
+  reject_symlink "$SSH_DROPIN"
   if systemctl is-active --quiet ssh.socket 2>/dev/null; then die '检测到 ssh.socket 激活；为避免锁死，请先转换为 ssh.service 后再运行。'; fi
   ssh_port_available "$SSH_PORT" || die "$SSH_PORT/tcp 已被占用或无法检查。"
   backup_ssh_state
@@ -1802,12 +1926,13 @@ configure_ssh() {
   shopt -u nullglob
   write_ssh_dropin
   sshd -t || die 'sshd -t 失败。'
-  validate_sshd_effective || die 'sshd -T 最终策略不符合目标。'
+  validate_ssh_policy || die 'sshd -T 最终监听或认证策略不符合目标。'
+  SSH_RELOAD_ATTEMPTED=true
   systemctl reload ssh.service || die 'reload ssh.service 失败。'
   local attempt
   for ((attempt=0; attempt<10; attempt++)); do validate_ssh_listeners && break; sleep 1; done
   validate_ssh_listeners || die 'SSH 实际监听端口与目标不一致。'
-  validate_sshd_effective || die 'reload 后 SSH 策略验证失败。'
+  validate_ssh_policy || die 'reload 后 SSH 策略验证失败。'
   log "SSH 配置完成：$SSH_PORT/tcp；保留 22=$KEEP_SSH_22。"
 }
 
@@ -1836,6 +1961,10 @@ ufw_delete_comment_rules() {
 
 configure_ufw() {
   CURRENT_STEP='配置 UFW'
+  if [[ "$PRESERVE_SSH" == true ]]; then
+    log '保留现有 UFW 状态与放行规则。'
+    return 0
+  fi
   if [[ "$UFW_TX" == false ]]; then
     backup_ufw_state
     UFW_TX=true
@@ -1875,6 +2004,7 @@ configure_ufw() {
   fi
   UFW_TX=false
   SSH_TX=false
+  SSH_KEYS_TX=false
 }
 
 write_cf_tool() {
@@ -1948,6 +2078,7 @@ EOF
 
 configure_cf8443() {
   CURRENT_STEP='配置 Cloudflare 8443'
+  [[ "$PRESERVE_SSH" == false ]] || return 0
   local currently=false
   [[ -x "$CF_TOOL" || -e "$CF_TIMER" ]] && currently=true
   if ufw status 2>/dev/null | grep -Fq '# vps-init-cf8443'; then currently=true || true; fi
@@ -2224,6 +2355,8 @@ EOF
 }
 
 print_report() {
+  local ssh_listeners
+  ssh_listeners=$(ssh_listener_addresses | sort -u | paste -sd ' ' -) || ssh_listeners=''
   cat <<EOF
 
 ============================================================
@@ -2231,18 +2364,18 @@ VPS 初始化完成
 ============================================================
 系统          : ${PRETTY_NAME:-Debian}
 网络栈        : $NETWORK_STACK（策略 $NETWORK_REQUEST）
-SSH           : $SSH_PORT/tcp$(if ssh_has_backup_port; then printf ' + 22/tcp'; fi)
-UFW           : $(ufw status | head -1)
+SSH 实际监听  : ${ssh_listeners:-未检测到}$(if [[ "$PRESERVE_SSH" == true ]]; then printf '（保留现有配置）'; fi)
+UFW           : $(ufw status 2>/dev/null | sed -n '1p' || echo unavailable)
 SmartDNS      : $(smartdns -v 2>/dev/null | head -1 || echo unavailable)
 SmartDNS 模式 : $([[ "$NETWORK_REQUEST" == ipv4 ]] && echo 'A only' || echo 'A + AAAA') / $SMARTDNS_TRANSPORT
 sing-box      : $(sing-box version 2>/dev/null | head -1 || echo unavailable)
 Fail2ban      : $(systemctl is-active fail2ban.service 2>/dev/null || true)
-BBR           : $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo unavailable)
+TCP / qdisc   : $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo unavailable) / $(sysctl -n net.core.default_qdisc 2>/dev/null || echo unavailable)
 Swap          : $(awk '/SwapTotal:/ {printf "%.0f MiB", $2/1024}' /proc/meminfo)
 备份目录      : $BACKUP_DIR
 需要重启      : $([[ -e /var/run/reboot-required ]] && echo yes || echo no)
 ============================================================
-请保持当前 SSH 会话，并从另一终端验证 SSH 端口 $SSH_PORT。
+请保持当前 SSH 会话，并从另一终端验证所需的 SSH 监听地址和端口。
 EOF
 }
 
@@ -2650,6 +2783,9 @@ main() {
   if [[ "$INSTALL_MODE" == quick ]]; then
     collect_quick_choices
   fi
+  if [[ "$BASE_ONLY" == false && "$PRESERVE_SSH" == true && "$NETWORK_REQUEST" == ipv4 ]]; then
+    die '保留 SSH 模式不能同时关闭 IPv6；请选择 Auto 或 Dual-Stack。'
+  fi
   if [[ "$INSTALL_MODE" == custom ]]; then
     custom_phase_one
   fi
@@ -2657,7 +2793,8 @@ main() {
   if [[ "$INSTALL_MODE" != custom ]]; then
     install_early_dependencies
   fi
-  if [[ "$BASE_ONLY" == false ]]; then
+  if [[ "$BASE_ONLY" == false && "$PRESERVE_SSH" == false ]]; then
+    confirm_ssh_listener_change
     collect_public_key
     install_authorized_key
   fi
@@ -2689,7 +2826,11 @@ main() {
   configure_ssh
   configure_ufw
   configure_cf8443
-  configure_fail2ban
+  if [[ "$PRESERVE_SSH" == true ]]; then
+    log '保留现有 Fail2ban 状态，避免重启时变更 SSH 封禁规则。'
+  else
+    configure_fail2ban
+  fi
   print_report
 }
 
