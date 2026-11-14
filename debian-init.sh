@@ -1099,7 +1099,8 @@ ssh_session_uses_ipv6() {
   local local_addr=''
   [[ -n "${SSH_CONNECTION:-}" ]] || return 1
   local_addr=$(awk '{print $3}' <<<"$SSH_CONNECTION")
-  [[ "$local_addr" == *:* ]]
+  # A dual-stack socket can represent an IPv4 session as an IPv4-mapped address.
+  [[ "$local_addr" == *:* && "${local_addr,,}" != ::ffff:*.* ]]
 }
 
 detect_network_stack() {
@@ -2783,8 +2784,8 @@ main() {
   if [[ "$INSTALL_MODE" == quick ]]; then
     collect_quick_choices
   fi
-  if [[ "$BASE_ONLY" == false && "$PRESERVE_SSH" == true && "$NETWORK_REQUEST" == ipv4 ]]; then
-    die '保留 SSH 模式不能同时关闭 IPv6；请选择 Auto 或 Dual-Stack。'
+  if [[ "$BASE_ONLY" == false && "$NETWORK_REQUEST" == ipv4 ]] && ssh_session_uses_ipv6; then
+    die '当前 SSH 会话正在通过 IPv6；请用 IPv4 SSH 登录后再关闭 IPv6。'
   fi
   if [[ "$INSTALL_MODE" == custom ]]; then
     custom_phase_one
@@ -2806,13 +2807,9 @@ main() {
     log '已按 --base-only 完成系统更新与基础工具安装。'
     return 0
   fi
-  # Establish connectivity before any tuning and reject explicit IPv4-only
-  # over an IPv6 SSH session before changing the kernel.
+  # Establish IPv4 connectivity before tuning or changing the kernel.
   CURRENT_STEP='检测网络栈'
   ipv4_https_works || die '未检测到可用 IPv4 HTTPS 出站。'
-  if [[ "$NETWORK_REQUEST" == ipv4 ]] && ssh_session_uses_ipv6; then
-    die '当前 SSH 会话正在通过 IPv6；请用 IPv4 SSH 登录后再关闭 IPv6。'
-  fi
   configure_chrony
   configure_tcp_tuning
   install_sing_box

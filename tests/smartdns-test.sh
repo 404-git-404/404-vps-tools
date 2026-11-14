@@ -147,6 +147,80 @@ done
   configure_cf8443
 )
 
+# Run the production quick-install flow, replacing only host-changing operations.
+# shellcheck disable=SC2329 # Mocks are called through the sourced installer.
+check_preserved_ssh_network_mode() (
+  local connection=$1 request=$2 expected=$3
+  local phase_trace="$TEST_TMP/preserve-network.trace" result=0
+  : >"$phase_trace"
+  case "$connection" in
+    ipv4) SSH_CONNECTION='192.0.2.10 12345 192.0.2.20 22' ;;
+    mapped) SSH_CONNECTION='::ffff:192.0.2.10 12345 ::ffff:192.0.2.20 22' ;;
+    ipv6) SSH_CONNECTION='2001:db8::10 12345 2001:db8::20 53651' ;;
+    console) unset SSH_CONNECTION ;;
+  esac
+  INSTALL_MODE=quick
+  CONTAINER_KIND=lxc
+  preflight() { :; }
+  acquire_lock() { :; }
+  # Simulate menu choice 4 and explicitly select the requested network mode.
+  command() { if [[ "$*" == '-v ss' ]]; then return 0; fi; builtin command "$@"; }
+  read_tty() {
+    case "$1" in
+      *'请选择 SSH 端口'*) printf -v "$2" 4 ;;
+      *'请选择网络模式'*)
+        case "$request" in
+          auto) printf -v "$2" 1 ;;
+          ipv4) printf -v "$2" 2 ;;
+          dual) printf -v "$2" 3 ;;
+        esac ;;
+      *) fail 'unexpected prompt in preserve mode' ;;
+    esac
+  }
+  collect_public_key() { fail 'preserve mode requested SSH key'; }
+  install_authorized_key() { fail 'preserve mode would install SSH key'; }
+  systemctl() { fail 'preserve mode called an unmocked systemctl operation'; }
+  ufw() { fail 'preserve mode attempted to change UFW'; }
+  configure_fail2ban() { fail 'preserve mode attempted to reconfigure Fail2ban'; }
+  install_early_dependencies() { echo dependencies >>"$phase_trace"; }
+  configure_swap() { :; }
+  update_system_and_tools() { :; }
+  ipv4_https_works() { :; }
+  configure_chrony() { :; }
+  configure_tcp_tuning() { :; }
+  install_sing_box() { echo sing-box >>"$phase_trace"; }
+  backup_dns_state() { :; }
+  apply_network_stack() { echo "apply=$NETWORK_REQUEST" >>"$phase_trace"; }
+  cleanup_legacy_network_stack() { :; }
+  ipv6_global_present() { [[ "$connection" == ipv6 ]]; }
+  ipv6_route_present() { [[ "$connection" == ipv6 ]]; }
+  ipv6_https_works() { [[ "$connection" == ipv6 ]]; }
+  install_and_configure_smartdns() { echo "smartdns=$NETWORK_STACK" >>"$phase_trace"; }
+  configure_system_dns() { DNS_TX=false; }
+  print_report() { :; }
+  (main) >"$TEST_TMP/preserve-network.log" 2>&1 || result=$?
+  if [[ "$expected" == blocked ]]; then
+    assert_eq 1 "$result" "$connection/$request result"
+    [[ ! -s "$phase_trace" ]] || fail 'IPv6 SSH guard ran after host changes'
+    grep -Fq '当前 SSH 会话正在通过 IPv6' "$TEST_TMP/preserve-network.log" || fail 'missing IPv6 SSH diagnostic'
+  else
+    if (( result != 0 )); then cat "$TEST_TMP/preserve-network.log" >&2; fail "$connection/$request was rejected"; fi
+    assert_eq "$(printf 'dependencies\nsing-box\napply=%s\nsmartdns=%s' "$request" "$expected")" "$(cat "$phase_trace")" "$connection/$request operation order"
+  fi
+)
+for connection in ipv4 ipv6 console; do
+  for request in auto ipv4 dual; do
+    expected=$request
+    case "$connection/$request" in
+      ipv6/ipv4) expected=blocked ;;
+      ipv6/auto) expected=dual ;;
+      */auto) expected=ipv4 ;;
+    esac
+    check_preserved_ssh_network_mode "$connection" "$request" "$expected"
+  done
+done
+check_preserved_ssh_network_mode mapped ipv4 ipv4
+
 (
   CONTAINER_KIND=lxc
   systemctl() {

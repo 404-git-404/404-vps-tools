@@ -14,7 +14,7 @@ curl -fsSL https://raw.githubusercontent.com/404-git-404/404-vps-tools/main/gg-s
 
 快速安装选择 SSH 单端口和网络策略，直接回车默认使用 53651 与 Auto。`--ssh-port PORT` 和 `--network-stack auto|ipv4|dual` 分别跳过对应菜单。使用 `--ssh-port PORT --keep-22` 可兼容旧部署的备用 22。
 
-SSH 菜单选项 4（或 `--preserve-ssh`）保留原有 SSH 监听、认证、公钥、服务及 UFW 规则，搭配 Auto 或 Dual-Stack 使用。切换端口前会显示现有分端口监听并要求确认，切换失败会恢复 SSH 与 UFW。
+SSH 菜单选项 4（或 `--preserve-ssh`）保留原有 SSH 监听配置、认证、公钥、服务及 UFW 规则。可独立选择 Auto、Dual-Stack 或 IPv4-only，当前 SSH 会话使用 IPv6 时禁止关闭 IPv6。切换端口前会显示现有分端口监听并要求确认，切换失败会恢复 SSH 与 UFW。
 
 快速安装和自定义安装均可在 SSH 公钥提示直接回车。脚本检查 `/root/.ssh/authorized_keys`，显示有效公钥数量和指纹，确认后原样复用。也可直接粘贴新公钥，或使用 `--pubkey`、`--pubkey-file` 跳过询问。新公钥通过验证后去重追加。
 
