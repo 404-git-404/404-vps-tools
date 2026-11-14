@@ -58,6 +58,7 @@ SING_BOX_VERSION=''
 PUBKEY_ARGUMENT=''
 PUBKEY_FILE=''
 PUBLIC_KEY=''
+REUSE_PUBLIC_KEY=false
 CF8443_MODE='auto' # auto = fresh install off; existing managed install preserved
 CONTAINER_KIND='none'
 SSH_TX=false
@@ -116,6 +117,7 @@ usage() {
 默认流程：
   - Debian 12/13 amd64/arm64
   - 询问 SSH 公钥、SSH 端口、是否保留 22、是否 full-upgrade
+  - SSH 公钥提示可直接回车，查看指纹并确认复用已有公钥
   - 低内存且无合适 Swap 时才询问是否创建推荐 Swap
   - 快速安装默认只监听 SSH 53651，可改选 22 或自定义单端口
   - Auto 探测当前 IPv6 连通性，失败时仍保留 IPv6 和 DNS AAAA 能力
@@ -125,8 +127,8 @@ usage() {
   - Cloudflare 8443 默认不启用，使用 --cloudflare-8443 显式启用
 
 选项：
-  --pubkey "KEY"             预先提供 SSH 公钥
-  --pubkey-file FILE         从文件读取 SSH 公钥
+  --pubkey "KEY"             预先提供 SSH 公钥，跳过复用询问
+  --pubkey-file FILE         从文件读取 SSH 公钥，跳过复用询问
   --ssh-port PORT            指定 SSH 端口并跳过端口菜单（默认 53651）
   --keep-22                  兼容旧部署，为非 22 的 SSH 端口保留 22 备用
   --close-22                 仅使用所选 SSH 端口（快速安装默认）
@@ -360,8 +362,8 @@ validate_port() {
 parse_args() {
   while (( $# )); do
     case "$1" in
-      --pubkey) [[ $# -ge 2 ]] || die '--pubkey 缺少参数。'; PUBKEY_ARGUMENT=$2; shift 2 ;;
-      --pubkey-file) [[ $# -ge 2 ]] || die '--pubkey-file 缺少参数。'; PUBKEY_FILE=$2; shift 2 ;;
+      --pubkey) [[ $# -ge 2 && -n "$2" && "$2" != --* ]] || die '--pubkey 需要非空公钥。'; PUBKEY_ARGUMENT=$2; shift 2 ;;
+      --pubkey-file) [[ $# -ge 2 && -n "$2" && "$2" != --* ]] || die '--pubkey-file 需要非空文件路径。'; PUBKEY_FILE=$2; shift 2 ;;
       --ssh-port) [[ $# -ge 2 ]] || die '--ssh-port 缺少参数。'; SSH_PORT=$2; SSH_PORT_SET=true; shift 2 ;;
       --keep-22) KEEP_SSH_22=true; KEEP_SSH_22_SET=true; shift ;;
       --close-22) KEEP_SSH_22=false; KEEP_SSH_22_SET=true; shift ;;
@@ -384,6 +386,7 @@ parse_args() {
       *) die "未知参数：$1" ;;
     esac
   done
+  [[ -z "$PUBKEY_ARGUMENT" || -z "$PUBKEY_FILE" ]] || die '--pubkey 与 --pubkey-file 只能指定一个。'
   validate_port "$SSH_PORT" || die "SSH 端口无效：$SSH_PORT（保留端口为 53/80/443/8443）。"
   case "$NETWORK_REQUEST" in auto|ipv4|dual) ;; *) die '--network-stack 仅支持 auto、ipv4、dual。' ;; esac
   if [[ -n "$SING_BOX_VERSION" ]]; then
@@ -529,9 +532,6 @@ create_swap() {
 collect_choices() {
   [[ "$BASE_ONLY" == true ]] && return 0
   local answer=''
-  if [[ -z "$PUBKEY_ARGUMENT" && -z "$PUBKEY_FILE" ]]; then
-    read_tty 'SSH 公钥: ' PUBKEY_ARGUMENT
-  fi
   if [[ "$SSH_PORT_SET" == false ]]; then
     read_tty "SSH 端口 [$DEFAULT_SSH_PORT]: " answer
     [[ -z "$answer" ]] || SSH_PORT=$answer
@@ -634,37 +634,132 @@ update_system_and_tools() {
   fi
 }
 
+ssh_public_key_fingerprints() {
+  # ssh-keygen also accepts known_hosts and private keys. Pass only public
+  # records after checking the optional authorized_keys prefix.
+  awk '
+    function strip_options(line,    name, option, i, ch) {
+      for (;;) {
+        if (!match(line, /^[A-Za-z-]+/)) return ""
+        name = tolower(substr(line, 1, RLENGTH))
+        line = substr(line, RLENGTH + 1)
+        if (name ~ /^(command|environment|expiry-time|from|permitlisten|permitopen|principals|tunnel)$/) {
+          if (substr(line, 1, 2) != "=\"") return ""
+          option = substr(line, 3)
+          for (i = 1; i <= length(option); i++) {
+            ch = substr(option, i, 1)
+            if (ch == "\\" && substr(option, i + 1, 1) == "\"") i++
+            else if (ch == "\"") break
+          }
+          if (i > length(option)) return ""
+          line = substr(option, i + 1)
+        } else if (name !~ /^(restrict|cert-authority|(no-)?(agent-forwarding|port-forwarding|pty|user-rc|x11-forwarding|touch-required|verify-required))$/) {
+          return ""
+        }
+        if (line ~ /^[ \t]/) {
+          sub(/^[ \t]+/, "", line)
+          return line
+        }
+        if (substr(line, 1, 1) != ",") return ""
+        line = substr(line, 2)
+      }
+    }
+    {
+      sub(/\r$/, "")
+      if (/[\r\x00]/) next
+      sub(/^[ \t]+/, "")
+      if ($0 == "" || /^#/ || length($0) > 8192) next
+      if ($1 !~ /^(ssh-|ecdsa-|sk-)/) $0 = strip_options($0)
+      if ($1 ~ /^(ssh-|ecdsa-|sk-)/ && $2 ~ /^[A-Za-z0-9+\/=]+$/) print $1, $2
+    }
+  ' "$@" | ssh-keygen -l -E sha256 -f - 2>/dev/null | awk '$2 ~ /^SHA256:/ { print $2 }'
+}
+
+check_authorized_keys_path() {
+  local directory=${AUTHORIZED_KEYS%/*}
+  reject_symlink "$directory"
+  reject_symlink "$AUTHORIZED_KEYS"
+  [[ ! -e "$directory" || -d "$directory" ]] || die "$directory 必须是目录。"
+  [[ ! -e "$AUTHORIZED_KEYS" || -f "$AUTHORIZED_KEYS" ]] || die "$AUTHORIZED_KEYS 必须是普通文件。"
+}
+
+check_reused_key_permissions() {
+  local path owner mode
+  for path in "${AUTHORIZED_KEYS%/*}" "$AUTHORIZED_KEYS"; do
+    IFS=' ' read -r owner mode < <(stat -c '%u %a' -- "$path") || die "无法检查 $path 的权限。"
+    if [[ "$owner" != 0 ]] || (( 8#$mode & 022 )); then
+      die "$path 必须归 root 所有，且不能允许组或其他用户写入。"
+    fi
+  done
+}
+
 collect_public_key() {
   CURRENT_STEP='验证 SSH 公钥'
-  local keyfile="$TMP_DIR/public-key"
+  local fingerprints='' candidate=''
+  local -a keys=()
+  command -v ssh-keygen >/dev/null || die '缺少 ssh-keygen，无法验证 SSH 公钥。'
+  REUSE_PUBLIC_KEY=false
+  PUBLIC_KEY=''
+  check_authorized_keys_path
   if [[ -n "$PUBKEY_FILE" ]]; then
-    [[ -r "$PUBKEY_FILE" ]] || die "无法读取公钥文件：$PUBKEY_FILE"
-    PUBLIC_KEY=$(awk 'NF && $1 !~ /^#/ {print; exit}' "$PUBKEY_FILE")
+    [[ -f "$PUBKEY_FILE" && -r "$PUBKEY_FILE" ]] || die "无法读取公钥文件：$PUBKEY_FILE"
+    candidate=$(awk 'NF && $1 !~ /^#/ {sub(/\r$/, ""); print; exit}' <"$PUBKEY_FILE")
+  elif [[ -n "$PUBKEY_ARGUMENT" ]]; then
+    candidate=$PUBKEY_ARGUMENT
   else
-    PUBLIC_KEY=$(printf '%s\n' "$PUBKEY_ARGUMENT" | awk 'NF {print; exit}')
+    read_tty 'SSH 公钥（直接回车检测已有密钥）: ' candidate
+    if [[ -z "$candidate" ]]; then
+      if [[ -f "$AUTHORIZED_KEYS" ]]; then
+        fingerprints=$(ssh_public_key_fingerprints "$AUTHORIZED_KEYS" || true)
+      fi
+      if [[ -n "$fingerprints" ]]; then
+        mapfile -t keys <<<"$fingerprints"
+        printf '检测到 %s 个有效 SSH 公钥\n%s\n' "${#keys[@]}" "$fingerprints"
+        if ask_yes_no '是否复用已有公钥？' true; then
+          check_reused_key_permissions
+          REUSE_PUBLIC_KEY=true
+          return 0
+        fi
+      else
+        log '未检测到有效 SSH 公钥。'
+      fi
+      read_tty '请输入新的 SSH 公钥: ' candidate
+    fi
   fi
-  [[ -n "$PUBLIC_KEY" ]] || die 'SSH 公钥不能为空。'
-  printf '%s\n' "$PUBLIC_KEY" >"$keyfile"
-  ssh-keygen -l -f "$keyfile" >/dev/null 2>&1 || die 'SSH 公钥无法通过 ssh-keygen 校验。'
+  while [[ "$candidate" == *$'\n'* ]] || ! ssh_public_key_fingerprints <<<"$candidate" >/dev/null; do
+    if [[ -n "$PUBKEY_ARGUMENT" || -n "$PUBKEY_FILE" ]]; then
+      die '显式提供的 SSH 公钥为空或无效。'
+    fi
+    warn 'SSH 公钥为空或无效，请重试。'
+    read_tty '请输入新的 SSH 公钥: ' candidate
+  done
+  PUBLIC_KEY=${candidate%$'\r'}
 }
 
 install_authorized_key() {
   CURRENT_STEP='安装 SSH 公钥'
-  local keytmp="$TMP_DIR/newkey" fingerprint existing=''
-  printf '%s\n' "$PUBLIC_KEY" >"$keytmp"
-  fingerprint=$(ssh-keygen -lf "$keytmp" | awk '{print $2}')
-  [[ ! -L /root/.ssh ]] || die '/root/.ssh 不能是符号链接。'
-  install -d -o root -g root -m 0700 /root/.ssh
-  reject_symlink "$AUTHORIZED_KEYS"
+  [[ "$REUSE_PUBLIC_KEY" == false ]] || return 0
+  local fingerprint existing='' last_byte
+  fingerprint=$(ssh_public_key_fingerprints <<<"$PUBLIC_KEY") || die 'SSH 公钥无法通过 ssh-keygen 校验。'
+  check_authorized_keys_path
+  if [[ -f "$AUTHORIZED_KEYS" ]]; then
+    install -d -m 0700 "$BACKUP_DIR/ssh"
+    cp -a -- "$AUTHORIZED_KEYS" "$BACKUP_DIR/ssh/authorized_keys"
+    existing=$(ssh_public_key_fingerprints "$AUTHORIZED_KEYS" || true)
+  fi
+  install -d -o root -g root -m 0700 "${AUTHORIZED_KEYS%/*}"
   make_mutable "$AUTHORIZED_KEYS"
   touch "$AUTHORIZED_KEYS"
   chown root:root "$AUTHORIZED_KEYS"
   chmod 0600 "$AUTHORIZED_KEYS"
-  existing=$(ssh-keygen -lf "$AUTHORIZED_KEYS" 2>/dev/null | awk '{print $2}' || true)
   if grep -Fqx "$fingerprint" <<<"$existing"; then
     log 'authorized_keys 已有相同公钥。'
   else
-    printf '%s\n' "$PUBLIC_KEY" >>"$AUTHORIZED_KEYS"
+    last_byte=$(tail -c 1 -- "$AUTHORIZED_KEYS" | od -An -t u1)
+    {
+      if [[ -n "$last_byte" && ! "$last_byte" =~ ^[[:space:]]*10$ ]]; then printf '\n'; fi
+      printf '%s\n' "$PUBLIC_KEY"
+    } >>"$AUTHORIZED_KEYS"
     log "SSH 公钥已添加：$fingerprint"
   fi
 }
