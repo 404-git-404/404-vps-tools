@@ -107,6 +107,10 @@ done
   swapon() { [[ "$1" == --show=NAME,SIZE && "$2" == --bytes ]]; printf 'NAME SIZE\n/swapfile-vps-init 536866816\n'; }
   swapoff() { fail 'cleanup called swapoff'; }
   : >"$trace"
+  # Set both optional operations aside in this reporting fixture, even when
+  # the developer launches it from an interactive terminal.
+  cleanup_orphan_packages() { CLEANUP_RESULT='测试跳过'; }
+  cleanup_old_kernels() { CLEANUP_RESULT='测试跳过'; }
   main --cleanup-only >"$test_dir/report"
   [[ "$(cat "$trace")" == $'apt\njournal\ntmpfiles' ]]
   grep -Fxq '清理前可用：650MiB' "$test_dir/report"
@@ -120,12 +124,13 @@ done
 if [[ "$(uname -s)" == Linux ]] && command -v script >/dev/null; then
   for mode in quick custom exit smartdns singbox fail2ban cleanup; do
     case "$mode" in quick) option=1;; custom) option=2;; exit) option=3;; smartdns) option=4;; singbox) option=5;; fail2ban) option=6;; cleanup) option=7;; esac
-    printf '%s\n' "$option" | script -qec "bash -c 'source \"$repo/debian-init.sh\"; select_install_mode; echo selected=\$INSTALL_MODE'" /dev/null >"$test_dir/menu"
-    grep -Fq '7. 系统清理' "$test_dir/menu"
+    printf '%s\n' "$option" | script -qec "bash -c 'source \"$repo/debian-init.sh\"; select_install_mode; echo selected=\$INSTALL_MODE'" /dev/null >"$test_dir/menu" ||
+      { cat "$test_dir/menu"; fail "menu option $option failed"; }
+    grep -Fq '7. 系统清理' "$test_dir/menu" || fail 'cleanup menu label missing'
     if [[ "$mode" == exit ]]; then
       if grep -Fq 'selected=' "$test_dir/menu"; then fail 'exit continued to dispatch'; fi
     else
-      grep -Fq "selected=$mode" "$test_dir/menu"
+      grep -Fq "selected=$mode" "$test_dir/menu" || { cat "$test_dir/menu"; fail "unexpected dispatch for $mode"; }
     fi
   done
 fi

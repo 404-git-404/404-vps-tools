@@ -2611,7 +2611,7 @@ run_system_cleanup() {
       tmpfiles='失败'
     fi
   fi
-  if [[ -r /dev/tty && -w /dev/tty ]]; then
+  if ( : </dev/tty ) 2>/dev/null; then
     cleanup_orphan_packages; orphans=$CLEANUP_RESULT
     cleanup_old_kernels; kernels=$CLEANUP_RESULT
   else
