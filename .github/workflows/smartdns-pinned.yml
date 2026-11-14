@@ -358,6 +358,45 @@ jobs:
             fi
           done
           TEST
+      - name: Exercise low-space cleanup on Debian
+        if: matrix.repeat == 'false'
+        run: |
+          docker exec -i smartdns-migration bash -Eeuo pipefail -s <<'TEST'
+          mkdir -p /var/cache/apt/archives /etc/sing-box
+          printf '{}\n' >/etc/sing-box/config.json
+          touch /var/cache/apt/archives/cleanup-fixture.deb
+          printf 'swap fixture\n' >/swapfile-vps-init
+          sha256sum /swapfile-vps-init /etc/fstab /etc/resolv.conf \
+            /etc/smartdns/smartdns.conf /etc/sing-box/config.json \
+            /etc/fail2ban/jail.d/vps-init-sshd.local >/root/cleanup-checksums
+          export CLEANUP_TEST_TRACE=/run/cleanup-tool-trace
+          df() {
+            printf 'Filesystem 1024-blocks Used Available Capacity Mounted on\n'
+            printf '/dev/test 5138022 4000000 665600 90%% /\n'
+          }
+          journalctl() {
+            printf 'journal\n' >>"$CLEANUP_TEST_TRACE"
+            command journalctl "$@"
+          }
+          systemd-tmpfiles() {
+            printf 'tmpfiles\n' >>"$CLEANUP_TEST_TRACE"
+            command systemd-tmpfiles "$@"
+          }
+          export -f df journalctl systemd-tmpfiles
+          for run in 1 2; do
+            bash /repo/debian-init.sh --cleanup-only | tee "/run/cleanup-$run.log"
+            grep -Fx '清理前可用：650MiB' "/run/cleanup-$run.log"
+            grep -Fx 'APT 缓存：完成' "/run/cleanup-$run.log"
+            grep -Fx 'Journal：完成（归档日志，目标 50MiB）' "/run/cleanup-$run.log"
+            grep -Fx '临时文件：完成' "/run/cleanup-$run.log"
+            test ! -e /var/cache/apt/archives/cleanup-fixture.deb
+            sha256sum --check /root/cleanup-checksums
+          done
+          test "$(grep -c '^journal$' "$CLEANUP_TEST_TRACE")" = 2
+          test "$(grep -c '^tmpfiles$' "$CLEANUP_TEST_TRACE")" = 2
+          systemctl is-active --quiet smartdns.service
+          systemctl is-active --quiet fail2ban.service
+          TEST
       - name: Show service diagnostics
         if: failure()
         run: docker exec smartdns-migration journalctl -u smartdns.service -n 100 --no-pager || true

@@ -116,7 +116,7 @@ usage() {
   bash debian-init.sh
   bash debian-init.sh [选项]
 
-交互菜单：快速安装、自定义安装、退出、仅安装/更新 SmartDNS、仅部署 sing-box、仅安装/更新 Fail2ban。
+交互菜单：快速安装、自定义安装、退出、仅安装/更新 SmartDNS、仅部署 sing-box、仅安装/更新 Fail2ban、系统清理。
 仅部署 sing-box 独立运行节点配置向导；完整初始化只安装 sing-box，不创建节点。
 
 默认流程：
@@ -147,6 +147,7 @@ usage() {
   --smartdns-only            仅安装/更新 SmartDNS 并验证系统 DNS
   --sing-box-only            仅安装 sing-box 并进入节点配置向导
   --fail2ban-only            仅安装/更新 Fail2ban 并验证 Jail
+  --cleanup-only             系统清理，删除软件包和旧内核需分别确认
   --help                     显示帮助
 EOF
 }
@@ -378,13 +379,14 @@ parse_args() {
       --network-stack) [[ $# -ge 2 ]] || die '--network-stack 缺少参数。'; NETWORK_REQUEST=$2; NETWORK_REQUEST_SET=true; shift 2 ;;
       --cloudflare-8443) CF8443_MODE='enable'; shift ;;
       --no-cloudflare-8443) CF8443_MODE='disable'; shift ;;
-      --base-only|--smartdns-only|--sing-box-only|--fail2ban-only)
+      --base-only|--smartdns-only|--sing-box-only|--fail2ban-only|--cleanup-only)
         [[ -z "$INSTALL_MODE" ]] || die '只能选择一种独立运行模式。'
         case "$1" in
           --base-only) BASE_ONLY=true; INSTALL_MODE=base ;;
           --smartdns-only) INSTALL_MODE=smartdns ;;
           --sing-box-only) INSTALL_MODE=singbox ;;
           --fail2ban-only) INSTALL_MODE=fail2ban ;;
+          --cleanup-only) INSTALL_MODE=cleanup ;;
         esac
         shift ;;
       --help|-h) usage; exit 0 ;;
@@ -2248,8 +2250,8 @@ select_install_mode() {
   [[ -z "$INSTALL_MODE" ]] || return 0
   local choice=''
   while true; do
-    printf '\n1. 快速安装\n2. 自定义安装\n3. 退出\n4. 仅安装/更新 SmartDNS\n5. 仅部署 sing-box\n6. 仅安装/更新 Fail2ban\n' >/dev/tty
-    read_tty '请选择 [1-6]: ' choice
+    printf '\n1. 快速安装\n2. 自定义安装\n3. 退出\n4. 仅安装/更新 SmartDNS\n5. 仅部署 sing-box\n6. 仅安装/更新 Fail2ban\n7. 系统清理\n' >/dev/tty
+    read_tty '请选择 [1-7]: ' choice
     case "$choice" in
       1) INSTALL_MODE=quick; return 0 ;;
       2) INSTALL_MODE=custom; return 0 ;;
@@ -2257,6 +2259,7 @@ select_install_mode() {
       4) INSTALL_MODE=smartdns; return 0 ;;
       5) INSTALL_MODE=singbox; return 0 ;;
       6) INSTALL_MODE=fail2ban; return 0 ;;
+      7) INSTALL_MODE=cleanup; return 0 ;;
       *) printf '无效选择。\n' >/dev/tty ;;
     esac
   done
@@ -2349,9 +2352,294 @@ run_fail2ban_only() {
   configure_fail2ban "$action"
 }
 
+cleanup_preflight() {
+  CURRENT_STEP='清理预检'
+  (( EUID == 0 )) || die '必须使用 root 运行。'
+  [[ -r /etc/os-release && -d /run/lock ]] || die '缺少系统版本信息或锁目录。'
+  # shellcheck disable=SC1091
+  . /etc/os-release
+  [[ "${ID:-}" == debian && "${VERSION_ID:-}" =~ ^(12|13)$ ]] || die '仅支持 Debian 12/13。'
+  local tool
+  for tool in df awk flock; do command -v "$tool" >/dev/null || die "缺少 $tool。"; done
+  exec 9>"$LOCK_FILE"
+  flock -n 9 || die '已有另一个 vps-init.sh 正在运行。'
+}
+
+cleanup_apt_plan() {
+  local plan=$1
+  awk '
+    /^(Inst|Conf|Purg)[[:space:]]/ { invalid=1 }
+    /^Remv[[:space:]]/ {
+      if ($2 !~ /^[a-z0-9][a-z0-9+.-]*(:[a-z0-9-]+)?$/ || seen[$2]++) invalid=1
+      print $2
+    }
+    /^[0-9]+ upgraded, [0-9]+ newly installed, [0-9]+ to remove/ {
+      summary++; if ($1 != 0 || $3 != 0) invalid=1
+      removals=$6
+    }
+    END { exit (invalid || summary != 1 || removals != length(seen)) }
+  ' <<<"$plan"
+}
+
+cleanup_autoremove_safe() {
+  local package=$1 metadata files scripts
+  # Limit automatic orphan removal to optional libraries and development
+  # packages. Treat unknown metadata, critical paths and maintainer hooks as unsafe.
+  metadata=$(dpkg-query -W -f='${db:Status-Status}|${Essential}|${Protected}|${Priority}|${Section}' -- "$package") || return 1
+  [[ "$metadata" =~ ^installed\|(no)?\|(no)?\|(optional|extra)\|([^|]+/)?(libs|oldlibs|libdevel)$ ]] || return 1
+  case "${package%%:*}" in
+    linux-*|kernel-*|kmod|grub*|*initramfs*|*systemd*|*pam*|*nss*|*ssh*|*smartdns*|*sing-box*|*fail2ban*|*nft*|*iptables*|*ufw*) return 1 ;;
+  esac
+  files=$(dpkg-query -L -- "$package") || return 1
+  if grep -Eq '^/(boot|etc|var|root|home|sbin|usr/sbin)(/|$)|^/(usr/)?lib/(systemd|modules|udev|firmware)/' <<<"$files"; then return 1; fi
+  scripts=$(dpkg-query --control-list "$package") || return 1
+  ! grep -Exq 'prerm|postrm|triggers' <<<"$scripts"
+}
+
+cleanup_remove_packages() {
+  local kind=$1 preview=$2 planned current plan package
+  shift 2
+  local -a packages=("$@")
+  if ! ask_yes_no "删除上述$kind？" false; then
+    CLEANUP_RESULT='用户跳过'
+    return
+  fi
+  # Recheck dependencies after confirmation. dpkg removes only these exact
+  # packages and enforces dependencies under its own locks.
+  if ! plan=$(apt-get -s remove -- "${packages[@]}") || ! current=$(cleanup_apt_plan "$plan"); then
+    CLEANUP_RESULT='失败（无法重新验证删除计划）'
+    return
+  fi
+  planned=$(printf '%s\n' "${packages[@]}" | sort)
+  if [[ "$(sort <<<"$current")" != "$planned" ]] || ! cmp -s <(dpkg-query -W -- "${packages[@]}") <(printf '%s\n' "$preview"); then
+    CLEANUP_RESULT='跳过（删除计划或包版本已变化）'
+    return
+  fi
+  if [[ "$kind" == 旧内核 ]]; then
+    current=$(cleanup_old_kernel_candidates) || current=''
+    for package in "${packages[@]}"; do
+      if ! grep -Fxq -- "$package" <<<"$current"; then
+        CLEANUP_RESULT='跳过（启动保护状态已变化）'
+        return
+      fi
+    done
+  else
+    local auto
+    auto=$(apt-mark showauto) || { CLEANUP_RESULT='跳过（无法复核自动安装状态）'; return; }
+    for package in "${packages[@]}"; do
+      if ! grep -Fxq -- "$package" <<<"$auto" || ! cleanup_autoremove_safe "$package"; then
+        CLEANUP_RESULT='跳过（软件包保护状态已变化）'
+        return
+      fi
+    done
+  fi
+  if dpkg --remove -- "${packages[@]}"; then CLEANUP_RESULT='已清理'; else CLEANUP_RESULT='失败（包管理器返回错误）'; fi
+}
+
+cleanup_orphan_packages() {
+  local plan candidates package versions audit
+  local -a packages
+  CLEANUP_RESULT='跳过（缺少 APT 或 dpkg 工具）'
+  command -v apt-get >/dev/null && command -v apt-mark >/dev/null && command -v dpkg >/dev/null && command -v dpkg-query >/dev/null || return 0
+  audit=$(dpkg --audit) && [[ -z "$audit" ]] || { CLEANUP_RESULT='跳过（dpkg 状态异常）'; return; }
+  CLEANUP_RESULT='失败（无法预览 APT 删除计划）'
+  plan=$(apt-get -s autoremove) || return 0
+  printf '\nAPT autoremove 完整预览\n%s\n' "$plan"
+  candidates=$(cleanup_apt_plan "$plan") || return 0
+  if [[ -z "$candidates" ]]; then CLEANUP_RESULT='无候选'; return; fi
+  mapfile -t packages <<<"$candidates"
+  for package in "${packages[@]}"; do
+    if ! cleanup_autoremove_safe "$package"; then
+      CLEANUP_RESULT="跳过（计划含受保护或无法安全确认的包 $package）"
+      return
+    fi
+  done
+  versions=$(dpkg-query -W -- "${packages[@]}") || return 0
+  cleanup_remove_packages 无用软件包 "$versions" "${packages[@]}"
+}
+
+cleanup_grub_kernel() {
+  local boot=$1 running=$2 file config environment
+  # Only the stock GRUB first-entry layout can be resolved conservatively.
+  command -v grub-script-check >/dev/null && command -v grub-editenv >/dev/null || return 1
+  [[ -f "$boot/grub/grub.cfg" && -r "$boot/grub/grubenv" ]] || return 1
+  # The kernel post-removal hook regenerates GRUB. The source defaults must
+  # also select the first entry; never source local shell configuration.
+  [[ -f /etc/default/grub ]] || return 1
+  for file in /etc/default/grub.d/*.cfg; do [[ ! -e "$file" ]] || return 1; done
+  awk '
+    /^[[:space:]]*($|#)/ { next }
+    /^GRUB_DEFAULT=(0|"0"|\0470\047)[[:space:]]*$/ { defaults++; next }
+    /^GRUB_[A-Z0-9_]+=/ && !/^GRUB_DEFAULT=/ && !/[`$;&|]/ { next }
+    { unsafe=1 }
+    END { exit (unsafe || defaults > 1) }
+  ' /etc/default/grub || return 1
+  grub-script-check "$boot/grub/grub.cfg" >/dev/null || return 1
+  environment=$(grub-editenv "$boot/grub/grubenv" list) || return 1
+  if grep -Eq '^(next_entry|saved_entry|prev_saved_entry)=' <<<"$environment"; then return 1; fi
+  # A BOOT_IMAGE for the running kernel and a GRUB installation are both
+  # required. With UEFI, confirm firmware is booting Debian's GRUB/shim.
+  file=$(awk '{ for (i=1; i<=NF; i++) if ($i ~ /^BOOT_IMAGE=([^[:space:]]*\/)?vmlinuz-/) {
+    sub(/^BOOT_IMAGE=([^[:space:]]*\/)?vmlinuz-/, "", $i); print $i
+  }}' /proc/cmdline)
+  [[ "$file" == "$running" ]] || return 1
+  if [[ -d /sys/firmware/efi ]]; then
+    command -v efibootmgr >/dev/null || return 1
+    config=$(efibootmgr -v) || return 1
+    awk '
+      /^BootCurrent:/ { current=$2 }
+      /^BootNext:/ { uncertain=1 }
+      /^BootOrder:/ { split($2, order, ","); first=order[1] }
+      /^Boot[0-9A-Fa-f]/ && tolower($0) ~ /\\efi\\debian\\(grub|shim)(x64|aa64)\.efi/ { debian[substr($1,5,4)]=1 }
+      END { exit (uncertain || current == "" || first != current || !debian[current]) }
+    ' <<<"$config" || return 1
+  else
+    dpkg-query -W -f='${db:Status-Status}' grub-pc 2>/dev/null | grep -Fxq installed || return 1
+  fi
+  cleanup_parse_grub "$boot/grub/grub.cfg"
+}
+
+cleanup_parse_grub() {
+  awk '
+    /^### BEGIN .*\/10_linux ###$/ { standard=1; next }
+    /^### END .*\/10_linux ###$/ { standard=0 }
+    /^[[:space:]]*source[[:space:]]/ && $0 !~ /^[[:space:]]*source[[:space:]]+\$\{?(prefix|config_directory)\}?\/custom\.cfg[[:space:]]*$/ { unsafe=1 }
+    /^[[:space:]]*(configfile|chainloader|blscfg)([[:space:]]|$)/ { unsafe=1 }
+    /^[[:space:]]*set default=/ && $0 !~ /^[[:space:]]*set default="(0|\$\{next_entry\})"[[:space:]]*$/ { unsafe=1 }
+    /^[[:space:]]*set default="0"[[:space:]]*$/ { fallback=1 }
+    /^[[:space:]]*(menuentry|submenu)[[:space:]]/ {
+      if (!standard || (!entries && $1 != "menuentry")) unsafe=1
+      entries++
+    }
+    /^[[:space:]]*linux[[:space:]]/ && entries == 1 && standard {
+      if ($2 !~ /^\/(boot\/)?vmlinuz-[a-zA-Z0-9.+~-]+$/ || kernel != "") unsafe=1
+      kernel=$2; sub(/^.*\/vmlinuz-/, "", kernel)
+    }
+    END { if (unsafe || !fallback || kernel == "") exit 1; print kernel }
+  ' "$1"
+}
+
+cleanup_old_kernel_candidates() {
+  local boot=${1:-/boot} modules=${2:-/lib/modules} running default package release output files backup='' abi='' state
+  local -a eligible=() releases=()
+  running=$(uname -r) || return 1
+  [[ ! -e "$boot/grub/custom.cfg" && ! -L "$boot/grub/custom.cfg" ]] || return 1
+  default=$(cleanup_grub_kernel "$boot" "$running") || return 1
+  output=$(dpkg-query -W -f='${db:Status-Abbrev} ${Package}\n' 'linux-image-*') || return 1
+  while IFS=' ' read -r state package; do
+    [[ "$state" == ii && "$package" =~ ^linux-image-[0-9][a-zA-Z0-9.+~-]+$ ]] || continue
+    release=${package#linux-image-}
+    release=${release%-unsigned}
+    [[ -s "$boot/vmlinuz-$release" && -s "$boot/initrd.img-$release" && -d "$modules/$release/kernel" ]] || continue
+    files=$(dpkg-query -L "$package") || continue
+    awk -v release="$release" '
+      $0 == "/boot/vmlinuz-" release { image=1 }
+      /^\/boot\// && substr($0,length($0)-length(release)) != "-" release { unsafe=1 }
+      /^\/(usr\/)?lib\/modules\// {
+        sub(/^\/(usr\/)?lib\/modules\//, "")
+        split($0, part, "/")
+        if (part[1] != release) unsafe=1
+      }
+      END { exit (!image || unsafe) }
+    ' <<<"$files" || continue
+    eligible+=("$package")
+    releases+=("$release")
+    if [[ "$release" != "$running" ]] && { [[ -z "$backup" ]] || dpkg --compare-versions "$release" gt "$backup"; }; then
+      backup=$release
+    fi
+  done <<<"$output"
+  [[ -n "$backup" ]] && printf '%s\n' "${releases[@]}" | grep -Fx "$running" >/dev/null || return 1
+  printf '%s\n' "${releases[@]}" | grep -Fx "$default" >/dev/null || return 1
+  for package in "${eligible[@]}"; do
+    release=${package#linux-image-}; release=${release%-unsigned}
+    [[ "$release" != "$running" && "$release" != "$default" && "$release" != "$backup" ]] || continue
+    # Protect a boot-related alias pointing to this kernel or initramfs.
+    for abi in /vmlinuz /initrd.img /vmlinuz.old /initrd.img.old "$boot/vmlinuz" "$boot/initrd.img" "$boot/vmlinuz.old" "$boot/initrd.img.old"; do
+      [[ -L "$abi" ]] || continue
+      case "$(readlink -f -- "$abi")" in */vmlinuz-"$release"|*/initrd.img-"$release") continue 2 ;; esac
+    done
+    printf '%s\n' "$package"
+  done
+  return 0
+}
+
+cleanup_old_kernels() {
+  local candidates plan actual versions audit size
+  local -a packages
+  CLEANUP_RESULT='跳过（无法可靠确认当前、默认或备用内核）'
+  command -v apt-get >/dev/null && command -v dpkg >/dev/null && command -v dpkg-query >/dev/null || return 0
+  audit=$(dpkg --audit) && [[ -z "$audit" ]] || { CLEANUP_RESULT='跳过（dpkg 状态异常）'; return; }
+  candidates=$(cleanup_old_kernel_candidates) || return 0
+  if [[ -z "$candidates" ]]; then CLEANUP_RESULT='无安全候选'; return; fi
+  mapfile -t packages <<<"$candidates"
+  CLEANUP_RESULT='跳过（内核删除计划涉及额外操作或无法预览）'
+  plan=$(apt-get -s remove -- "${packages[@]}") && actual=$(cleanup_apt_plan "$plan") || return 0
+  printf '\n旧内核完整删除预览\n%s\n' "$plan"
+  [[ "$(sort <<<"$actual")" == "$(sort <<<"$candidates")" ]] || return 0
+  size=$(dpkg-query -W -f='${Installed-Size}\n' -- "${packages[@]}" | awk '{ total += $1 } END { print total+0 }') || return 0
+  printf '候选包的预计已安装大小：%s\n' "$(format_mib "$size")"
+  versions=$(dpkg-query -W -- "${packages[@]}") || return 0
+  cleanup_remove_packages 旧内核 "$versions" "${packages[@]}"
+}
+
+run_system_cleanup() {
+  CURRENT_STEP='系统清理'
+  local before after total used apt='跳过（缺少 apt-get）' journal='跳过（缺少 journalctl）'
+  local tmpfiles='跳过（缺少 systemd-tmpfiles）' orphans kernels swaps=''
+  local CLEANUP_RESULT
+  before=$(root_free_kib) || die '无法读取清理前的根分区空间。'
+  IFS=' ' read -r total used < <(df -Pk / | awk 'NR == 2 { print $2, $3 }') || die '无法读取根分区容量。'
+  printf '磁盘总容量：%s\n已用空间：%s\n可用空间：%s\n' "$(format_mib "$total")" "$(format_mib "$used")" "$(format_mib "$before")"
+  if command -v swapon >/dev/null && swaps=$(swapon --show=NAME,SIZE --bytes); then
+    printf '活动 Swap（容量以字节显示）\n%s\n' "${swaps:-无}"
+  else
+    warn '无法读取活动 Swap。'
+  fi
+  if [[ -e "$SWAPFILE" || -L "$SWAPFILE" ]]; then log "检测到脚本 Swap 路径：$SWAPFILE"; fi
+  if command -v apt-get >/dev/null; then
+    if apt-get clean; then apt='完成'; else apt='失败'; fi
+  fi
+  if command -v journalctl >/dev/null; then
+    if journalctl --vacuum-size=50M; then journal='完成（归档日志，目标 50MiB）'; else journal='失败'; fi
+  fi
+  if command -v systemd-tmpfiles >/dev/null; then
+    if systemd-tmpfiles --clean --prefix=/tmp --prefix=/var/tmp \
+      --exclude-prefix=/tmp/smartdns --exclude-prefix=/tmp/sing-box --exclude-prefix=/tmp/fail2ban \
+      --exclude-prefix=/var/tmp/smartdns --exclude-prefix=/var/tmp/sing-box --exclude-prefix=/var/tmp/fail2ban; then
+      tmpfiles='完成'
+    else
+      tmpfiles='失败'
+    fi
+  fi
+  if ( : </dev/tty ) 2>/dev/null; then
+    cleanup_orphan_packages; orphans=$CLEANUP_RESULT
+    cleanup_old_kernels; kernels=$CLEANUP_RESULT
+  else
+    orphans='跳过（无交互终端）'; kernels=$orphans
+  fi
+  printf '\nVPS 系统清理完成\n系统：Debian %s\n清理前可用：%s\n' "$VERSION_ID" "$(format_mib "$before")"
+  if after=$(root_free_kib); then
+    printf '清理后可用：%s\n实际增加可用空间：%s\n' "$(format_mib "$after")" "$(format_mib "$((after - before))")"
+    if (( after >= MIN_ROOT_FREE_KIB )); then
+      printf '安装所需 2GiB 空间：PASS\n'
+    else
+      printf '安装所需 2GiB 空间：FAIL，还需释放 %s\n' "$(format_mib "$((MIN_ROOT_FREE_KIB - after))")"
+    fi
+  else
+    warn '无法读取清理后的根分区空间。'
+  fi
+  printf 'APT 缓存：%s\nJournal：%s\n临时文件：%s\n无用软件包：%s\n旧内核：%s\nSwap：未修改\n' \
+    "$apt" "$journal" "$tmpfiles" "$orphans" "$kernels"
+}
+
 main() {
   parse_args "$@"
   select_install_mode
+  if [[ "$INSTALL_MODE" == cleanup ]]; then
+    cleanup_preflight
+    run_system_cleanup
+    return
+  fi
   preflight
   acquire_lock
   case "$INSTALL_MODE" in
