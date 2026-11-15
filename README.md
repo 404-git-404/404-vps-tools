@@ -20,6 +20,8 @@ SSH 菜单选项 4（或 `--preserve-ssh`）保留原有 SSH 监听配置、认�
 
 Auto 探测当前 IPv6 连通性，保留服务商的 IPv6 配置与 SmartDNS 的 AAAA 应答，并备份迁移本脚本旧版 IPv6 禁用策略。显式 IPv4-only 才持久关闭 IPv6，Dual-Stack 则显式启用。SmartDNS 始终监听 IPv4 本地端口，IPv6 回环可用时添加 IPv6 监听。
 
+IPv4-only 在网络服务启动后逐接口关闭 IPv6，由 systemd 定时器重新校正热插拔或网络服务重配造成的变化。ifupdown 配置静态 IPv6 或 DHCPv6 时可短暂启用 IPv6。切回 Auto 或 Dual-Stack 会移除脚本的 IPv4-only 策略并恢复 IPv6 内核能力。静态地址和 DHCPv6 可在网络服务下次初始化或计划重启后恢复，本脚本不重启网络服务。
+
 Debian 初始化要求根分区至少有 2048MiB 可用空间。低内存且已启用 Swap 不足 512MiB 时，脚本按 RAM 和磁盘空间推荐 2048、1024 或 512MiB，创建后至少保留 1024MiB。确认后空间减少时会降档或跳过。符合容量的旧 Swap 文件可在确认后直接复用。
 
 选项 7（或 `--cleanup-only`）可在低于 2048MiB 时清理 APT 下载缓存、归档 Journal 和系统定义的过期临时文件。无用软件包和旧内核分别预览、分别确认，默认跳过。仅删除可安全确认的包，保留当前、默认和备用内核以及已有 Swap；报告按根分区的实际可用空间计算。
