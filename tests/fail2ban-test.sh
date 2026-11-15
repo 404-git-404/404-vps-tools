@@ -14,6 +14,106 @@ trap 'rm -rf -- "$TEST_TMP"' EXIT
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
 record() { local IFS=' '; echo "$*" >>"$TRACE"; }
 
+# Run the real menu, base APT step, Fail2ban setup and final report. Replace
+# unrelated setup so the test can exercise these paths without changing SSH.
+quick_fixture() {
+  INSTALL_MODE=quick
+  preflight() { :; }
+  acquire_lock() { :; }
+  read_tty() {
+    case "$1" in
+      *'请选择 SSH 端口'*) printf -v "$2" '%s' "$menu_ssh" ;;
+      '输入 SSH 端口: ') printf -v "$2" '%s' 43210 ;;
+      *'请选择网络模式'*) printf -v "$2" '%s' "$menu_network" ;;
+      *) fail "unexpected prompt: $1" ;;
+    esac
+  }
+  ssh_port_available() { :; }
+  collect_choices() {
+    [[ "$SSH_PORT" == "$expected_port" && "$NETWORK_REQUEST" == "$expected_network" &&
+      "$PRESERVE_SSH" == "$expected_preserve" ]] || fail 'wrong quick menu state'
+  }
+  install_early_dependencies() { :; }
+  confirm_ssh_listener_change() { :; }
+  ssh_listener_addresses() { :; }
+  collect_public_key() { :; }
+  install_authorized_key() { :; }
+  configure_swap() { :; }
+  ipv4_https_works() { :; }
+  configure_chrony() { :; }
+  configure_tcp_tuning() { :; }
+  install_sing_box() { :; }
+  backup_dns_state() { :; }
+  apply_network_stack() { :; }
+  cleanup_legacy_network_stack() { :; }
+  detect_network_stack() { NETWORK_STACK=$NETWORK_REQUEST; }
+  install_and_configure_smartdns() { :; }
+  configure_system_dns() { DNS_TX=false; }
+  configure_ssh() { :; }
+  configure_ufw() { :; }
+  configure_cf8443() { :; }
+  verify_ipv4_policy() { :; }
+}
+
+assert_fail2ban_running() {
+  [[ "$(dpkg-query -W -f='${Status}' fail2ban)" == 'install ok installed' ]]
+  systemctl is-enabled --quiet fail2ban.service
+  systemctl is-active --quiet fail2ban.service
+  fail2ban-client ping | grep -F 'pong'
+  fail2ban-client status sshd
+  fail2ban-client status sshd-slow
+}
+
+if [[ "${1:-}" == --quick-integration ]]; then
+  [[ -f /.dockerenv && "$TEST_DIR" == /repo/tests ]] || fail 'integration fixtures require the isolated CI container'
+  while IFS=: read -r menu_ssh menu_network expected_port expected_network; do
+    expected_preserve=false
+    apt-get purge -y fail2ban
+    if fail2ban_package_installed; then fail 'cold install fixture still has Fail2ban'; fi
+    for run in first repeat; do
+      printf 'Quick Fail2ban: SSH=%s network=%s run=%s\n' "$expected_port" "$expected_network" "$run"
+      (
+        quick_fixture
+        trap cleanup EXIT
+        BACKUP_DIR=$(mktemp -d "$TEST_TMP/backup.XXXXXXXX")
+        TMP_DIR=$(mktemp -d "$TEST_TMP/run.XXXXXXXX")
+        main --skip-upgrade
+      )
+      assert_fail2ban_running
+    done
+  done <<'MATRIX'
+:1:53651:auto
+2:2:53651:ipv4
+2:3:53651:dual
+1:3:22:dual
+3:1:43210:auto
+MATRIX
+  menu_ssh=2 menu_network=1 expected_port=53651 expected_network=auto expected_preserve=false
+  override=/etc/fail2ban/jail.d/zz-test-disable-sshd-slow.local
+  printf '[sshd-slow]\nenabled = false\n' >"$override"
+  if (quick_fixture; main --skip-upgrade) >"$TEST_TMP/missing-jail" 2>&1; then
+    fail 'quick install accepted the operator override that disables a required jail'
+  fi
+  grep -F 'Fail2ban Jail 未运行：sshd-slow' "$TEST_TMP/missing-jail"
+  rm -f -- "$override"
+  menu_ssh=4 menu_network=1 expected_port=53651 expected_network=auto expected_preserve=true
+  systemctl disable --now fail2ban.service
+  sha256sum /etc/fail2ban/jail.d/vps-init-sshd.local >"$TEST_TMP/config"
+  for _ in first repeat; do
+    (quick_fixture; main --skip-upgrade) >"$TEST_TMP/preserve"
+    grep -F '保留现状（已安装，服务状态 inactive）' "$TEST_TMP/preserve"
+    if systemctl is-enabled --quiet fail2ban.service || systemctl is-active --quiet fail2ban.service; then
+      fail 'preserve mode changed the service state'
+    fi
+    sha256sum -c "$TEST_TMP/config"
+  done
+  apt-get purge -y fail2ban
+  (quick_fixture; main --skip-upgrade) >"$TEST_TMP/preserve" 2>&1
+  grep -F '保留现状（未安装）' "$TEST_TMP/preserve"
+  if fail2ban_package_installed; then fail 'preserve mode installed Fail2ban'; fi
+  exit 0
+fi
+
 for scenario in fresh repeat reality config-error action-error no-backend; do
   (
     FAIL2BAN_DIR="$TEST_TMP/$scenario/etc"
@@ -40,7 +140,10 @@ for scenario in fresh repeat reality config-error action-error no-backend; do
     configure_ssh() { fail 'SSH configuration was reached'; }
     configure_ufw() { fail 'UFW configuration was reached'; }
     wait_for_package_manager() { record wait-apt; }
-    apt_get() { record apt "$@"; }
+    apt_get() {
+      record apt "$@"
+      if [[ "$1" == install ]]; then touch "$TMP_DIR/packages-installed"; fi
+    }
     make_mutable() { :; }
     install() {
       case "$1" in
@@ -52,8 +155,12 @@ for scenario in fresh repeat reality config-error action-error no-backend; do
     fail2ban_default_ignoreip() { echo 203.0.113.0/28; }
     sleep() { :; }
     dpkg-query() {
-      if [[ "$scenario" == fresh ]]; then return 1; fi
-      printf 'install ok installed'
+      if [[ "$scenario" == fresh && ! -f "$TMP_DIR/packages-installed" ]]; then return 1; fi
+      case "$2" in
+        "-f=\${Status}") printf 'install ok installed' ;;
+        "-f=\${db:Status-Status}") printf 'installed' ;;
+        *) fail 'unexpected dpkg query' ;;
+      esac
     }
     command() {
       if [[ "${1:-} ${2:-}" == '-v ufw' ]]; then return 0; fi
@@ -148,6 +255,100 @@ for scenario in fresh repeat reality config-error action-error no-backend; do
   )
 done
 
+for scenario in quick-ok missing-package apt-error inactive disabled no-pong missing-jail preserve absent-cli; do
+  (
+    quick_fixture
+    menu_ssh=2 menu_network=2 expected_port=53651 expected_network=ipv4 expected_preserve=false
+    args=(--skip-upgrade)
+    if [[ "$scenario" == quick-ok ]]; then args=(); fi
+    if [[ "$scenario" == preserve ]]; then
+      menu_ssh=4 expected_preserve=true
+    elif [[ "$scenario" == absent-cli ]]; then
+      args+=(--preserve-ssh)
+      expected_preserve=true
+    fi
+    FAIL2BAN_DIR="$TEST_TMP/quick-$scenario"
+    TRACE="$TEST_TMP/$scenario.trace"
+    out="$TEST_TMP/$scenario.out"
+    : >"$TRACE"
+    ss() { :; }
+    curl() { :; }
+    sshd() { :; }
+    ufw() { :; }
+    sleep() { :; }
+    wait_for_package_manager() { :; }
+    make_mutable() { :; }
+    apt-mark() { :; }
+    dpkg-query() {
+      [[ "${*: -1}" == fail2ban ]] || return 1
+      case "$scenario" in missing-package|preserve|absent-cli) return 1 ;; esac
+      printf 'installed'
+    }
+    apt_get() {
+      record apt "$@"
+      if [[ "$scenario" == apt-error && "$1" == install ]]; then
+        # The real wrapper exits nonzero and the install must stop.
+        return 100
+      fi
+    }
+    systemctl() {
+      record systemctl "$@"
+      case "$*" in
+        'is-active --quiet fail2ban.service') [[ "$scenario" != inactive ]] ;;
+        'is-enabled --quiet fail2ban.service') [[ "$scenario" != disabled ]] ;;
+        'enable fail2ban.service'|'restart fail2ban.service') : ;;
+        *) fail 'unexpected service operation' ;;
+      esac
+    }
+    fail2ban-client() {
+      record fail2ban-client "$@"
+      case "$*" in
+        -t|'status sshd') : ;;
+        ping) [[ "$scenario" != no-pong ]] ;;
+        'status sshd-slow') [[ "$scenario" != missing-jail ]] ;;
+        status) printf 'Jail list: sshd, sshd-slow\n' ;;
+        *) fail 'unexpected client operation' ;;
+      esac
+    }
+    expected=''
+    case "$scenario" in
+      missing-package) expected='dpkg 未确认 Fail2ban 已安装' ;;
+      apt-error) expected='退出码 100' ;;
+      inactive) expected='Fail2ban 服务未运行' ;;
+      disabled) expected='Fail2ban 未设置为开机自启' ;;
+      no-pong) expected='Fail2ban 未响应 fail2ban-client ping' ;;
+      missing-jail) expected='Fail2ban Jail 未运行：sshd-slow' ;;
+    esac
+    result=0
+    # Run the child as an ordinary command so Bash's ERR trap and errexit apply.
+    set +e
+    (set -Eeuo pipefail; trap 'on_error $LINENO' ERR; main "${args[@]}") >"$out" 2>&1
+    result=$?
+    set -e
+    if [[ -n "$expected" ]]; then
+      (( result != 0 )) || fail "$scenario unexpectedly succeeded"
+      grep -Fq "$expected" "$out" || { cat "$out" >&2; fail "$scenario diagnostic missing"; }
+      if grep -Fq 'VPS 初始化完成' "$out"; then fail 'failed run printed a successful final report'; fi
+    else
+      (( result == 0 )) || { cat "$out" >&2; fail "$scenario failed"; }
+    fi
+    if [[ "$expected_preserve" == true ]]; then
+      grep -Fq '保留现状（未安装）' "$out"
+      if grep -Eq '(^apt install .*[[:space:]]fail2ban[[:space:]]|^systemctl |^fail2ban-client )' "$TRACE"; then
+        fail 'preserve mode attempted to install or configure Fail2ban'
+      fi
+    else
+      grep -Eq '^apt install .*[[:space:]]fail2ban[[:space:]]' "$TRACE"
+      if [[ "$scenario" == quick-ok ]]; then
+        grep -Fxq 'apt full-upgrade -y' "$TRACE"
+        grep -Fq 'sshd 和 sshd-slow 已验证' "$out"
+      elif grep -Fq 'apt full-upgrade' "$TRACE"; then
+        fail '--skip-upgrade ran full-upgrade'
+      fi
+    fi
+  )
+done
+
 if (parse_args --fail2ban-only --smartdns-only); then fail 'conflicting modes accepted'; fi
 help_output=$(bash "$TEST_DIR/../debian-init.sh" --help)
 [[ "$help_output" == *--fail2ban-only* ]] || fail 'missing CLI help'
@@ -158,4 +359,4 @@ if [[ "$(uname -s)" == Linux ]] && command -v script >/dev/null; then
   grep -Fq '6. 仅安装/更新 Fail2ban' "$TEST_TMP/menu"
   grep -Fq 'selected=fail2ban' "$TEST_TMP/menu"
 fi
-echo 'PASS: Fail2ban independent install, backends, custom jails, rollback and entry points'
+echo 'PASS: Fail2ban quick install, preserve mode, standalone backends, custom jails and rollback'

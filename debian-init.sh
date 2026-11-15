@@ -850,6 +850,9 @@ update_system_and_tools() {
   if [[ "$PRESERVE_SSH" == false ]] && { ! command -v sshd >/dev/null || ! command -v ufw >/dev/null; }; then
     die '基础工具验证失败。'
   fi
+  if [[ "$PRESERVE_SSH" == false ]] && ! fail2ban_package_installed; then
+    die 'APT 基础工具安装已结束，但 dpkg 未确认 Fail2ban 已安装。'
+  fi
 }
 
 ssh_public_key_fingerprints() {
@@ -2434,8 +2437,14 @@ clear_fail2ban_probe() {
   FAIL2BAN_PROBE_IP=''
 }
 
+fail2ban_package_installed() {
+  local status
+  status=$(dpkg-query -W -f='${db:Status-Status}' fail2ban 2>/dev/null) && [[ "$status" == installed ]]
+}
+
 configure_fail2ban() {
   CURRENT_STEP='配置 Fail2ban'
+  fail2ban_package_installed || die 'Fail2ban 软件包未安装或尚未完成配置。'
   local action=${1:-ufw} reality=true action_config='ufw[blocktype=deny]' path peer=''
   local -a jails=(sshd sshd-slow)
   if [[ "$INSTALL_MODE" == fail2ban ]]; then
@@ -2493,7 +2502,7 @@ findtime = 24h
 bantime = 7d
 EOF
   if [[ "$reality" == true ]]; then
-    jails+=(sing-box-reality sing-box-reality-slow)
+    if [[ "$INSTALL_MODE" == fail2ban ]]; then jails+=(sing-box-reality sing-box-reality-slow); fi
     cat >"$FAIL2BAN_DIR/filter.d/vps-init-sing-box-reality.conf" <<'EOF'
 [Definition]
 failregex = ^.*inbound/vless\[[^]]+\]: process connection from \[?<HOST>\]?:\d+: TLS handshake: REALITY: processed invalid connection$
@@ -2541,17 +2550,21 @@ EOF
     systemctl enable fail2ban.service >/dev/null
     systemctl restart fail2ban.service
   fi
+  systemctl is-active --quiet fail2ban.service || die 'Fail2ban 服务未运行。'
   local attempt jail
   for ((attempt=0; attempt<15; attempt++)); do fail2ban-client ping >/dev/null 2>&1 && break; sleep 1; done
-  fail2ban-client ping >/dev/null 2>&1 || die 'Fail2ban 未就绪。'
-  if [[ "$INSTALL_MODE" == fail2ban ]]; then
-    systemctl is-active --quiet fail2ban.service || die 'Fail2ban 服务未运行。'
-    for jail in "${jails[@]}"; do
-      fail2ban-client status "$jail" >/dev/null || die "Fail2ban Jail 未运行：$jail"
+  fail2ban-client ping >/dev/null 2>&1 || die 'Fail2ban 未响应 fail2ban-client ping。'
+  for jail in "${jails[@]}"; do
+    fail2ban-client status "$jail" >/dev/null || die "Fail2ban Jail 未运行：$jail"
+    if [[ "$INSTALL_MODE" == fail2ban ]]; then
       verify_fail2ban_action "$jail" "$action" || die "Fail2ban 封禁动作验证失败：$jail ($action)"
-    done
+    fi
+  done
+  if [[ "$INSTALL_MODE" == fail2ban ]]; then
     systemctl enable fail2ban.service >/dev/null
-    systemctl is-enabled --quiet fail2ban.service || die 'Fail2ban 未设置为开机自启。'
+  fi
+  systemctl is-enabled --quiet fail2ban.service || die 'Fail2ban 未设置为开机自启。'
+  if [[ "$INSTALL_MODE" == fail2ban ]]; then
     FAIL2BAN_TX=false
     log "Fail2ban 封禁后端=$action；REALITY=$reality；备份=$BACKUP_DIR/fail2ban"
   fi
@@ -2559,9 +2572,17 @@ EOF
 }
 
 print_report() {
-  local ssh_listeners
+  local ssh_listeners fail2ban_status='已安装、自启并运行；sshd 和 sshd-slow 已验证'
   ssh_listeners=$(ssh_listener_addresses | sort -u | paste -sd ' ' -) || ssh_listeners=''
   if [[ "$NETWORK_REQUEST" == ipv4 ]]; then verify_ipv4_policy; fi
+  if [[ "$PRESERVE_SSH" == true ]]; then
+    if fail2ban_package_installed; then
+      fail2ban_status="保留现状（已安装，服务状态 $(systemctl is-active fail2ban.service 2>/dev/null || true)）"
+    else
+      fail2ban_status='保留现状（未安装）'
+      warn 'Fail2ban 未安装，保留 SSH 模式已跳过安装与配置。'
+    fi
+  fi
   cat <<EOF
 
 ============================================================
@@ -2575,7 +2596,7 @@ UFW           : $(ufw status 2>/dev/null | sed -n '1p' || echo unavailable)
 SmartDNS      : $(smartdns -v 2>/dev/null | head -1 || echo unavailable)
 SmartDNS 模式 : $([[ "$NETWORK_REQUEST" == ipv4 ]] && echo 'A only' || echo 'A + AAAA') / $SMARTDNS_TRANSPORT
 sing-box      : $(sing-box version 2>/dev/null | head -1 || echo unavailable)
-Fail2ban      : $(systemctl is-active fail2ban.service 2>/dev/null || true)
+Fail2ban      : $fail2ban_status
 TCP / qdisc   : $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo unavailable) / $(sysctl -n net.core.default_qdisc 2>/dev/null || echo unavailable)
 Swap          : $(awk '/SwapTotal:/ {printf "%.0f MiB", $2/1024}' /proc/meminfo)
 备份目录      : $BACKUP_DIR

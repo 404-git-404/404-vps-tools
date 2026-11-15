@@ -459,6 +459,9 @@ jobs:
           systemctl is-active --quiet smartdns.service
           systemctl is-active --quiet fail2ban.service
           TEST
+      - name: Verify quick-install Fail2ban package, service and SSH jails
+        if: matrix.repeat == 'false'
+        run: docker exec smartdns-migration bash /repo/tests/fail2ban-test.sh --quick-integration
       - name: Verify IPv4-only after ifupdown reconfiguration and hotplug
         if: matrix.repeat == 'false'
         run: |
