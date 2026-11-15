@@ -232,12 +232,16 @@ check_preserved_ssh_network_mode mapped ipv4 ipv4
 )
 
 # Redirect only file destinations. Exercise real policy generation and rollback.
-for policy in fresh provider legacy legacy-service ipv4 dual; do
+for policy in fresh provider legacy legacy-service ipv4 dual ipv4-auto ipv4-dual; do
   (
     export POLICY_TEST_DIR="$TEST_TMP/policy-$policy"
     export POLICY_TEST_SCENARIO="$policy"
     # shellcheck disable=SC2016 # Expand the test path in the child Bash.
     sed -e 's|^readonly NETWORK_SYSCTL=.*|readonly NETWORK_SYSCTL="$POLICY_TEST_DIR/network.conf"|' \
+      -e 's|^readonly IPV4_POLICY_HELPER=.*|readonly IPV4_POLICY_HELPER="$POLICY_TEST_DIR/libexec/vps-init-ipv4-only"|' \
+      -e 's|^readonly IPV4_POLICY_SERVICE=.*|readonly IPV4_POLICY_SERVICE="$POLICY_TEST_DIR/systemd/vps-init-ipv4-only.service"|' \
+      -e 's|^readonly IPV4_POLICY_TIMER=.*|readonly IPV4_POLICY_TIMER="$POLICY_TEST_DIR/systemd/vps-init-ipv4-only.timer"|' \
+      -e 's|^readonly IPV4_POLICY_IFUP=.*|readonly IPV4_POLICY_IFUP="$POLICY_TEST_DIR/ifup/vps-init-ipv4-only"|' \
       -e 's|^readonly LEGACY_NETWORK_UNIT=.*|readonly LEGACY_NETWORK_UNIT="$POLICY_TEST_DIR/404-network-stack.service"|' \
       -e 's|^readonly LEGACY_NETWORK_HELPER=.*|readonly LEGACY_NETWORK_HELPER="$POLICY_TEST_DIR/helper"|' \
       -e 's|^readonly LEGACY_IPV6_SYSCTL=.*|readonly LEGACY_IPV6_SYSCTL="$POLICY_TEST_DIR/99-disable-ipv6.conf"|' \
@@ -248,21 +252,60 @@ source "$1"
 trap - EXIT ERR HUP INT TERM
 IFS=$' \t\n'
 BACKUP_DIR="$POLICY_TEST_DIR/backup"
-mkdir -p "$BACKUP_DIR/dns"
+TMP_DIR="$POLICY_TEST_DIR"
+mkdir -p "$BACKUP_DIR/dns" "$TMP_DIR/proc/sys/net/ipv6/conf"
+for iface in all default lo ens18 vlan.20; do
+  mkdir -p "$TMP_DIR/proc/sys/net/ipv6/conf/$iface"
+  echo 1 >"$TMP_DIR/proc/sys/net/ipv6/conf/$iface/disable_ipv6"
+done
 trace="$POLICY_TEST_DIR/sysctl"
 : >"$trace"
+export trace
 make_mutable() { :; }
-install() { [[ "$1" == -d ]]; shift 3; mkdir -p "$@"; }
-sysctl() { if [[ "$1" == -n ]]; then echo 1; else printf '%s\n' "${*: -1}" >>"$trace"; fi; }
+install() {
+  if [[ "$1" == -d ]]; then
+    shift 3; mkdir -p "$@"
+  elif [[ "${4##*/}" == helper ]]; then
+    sed -e "s|/proc/sys/|$TMP_DIR/proc/sys/|g" -e "s|/run/lock/|$TMP_DIR/|g" "$4" >"$5"
+    chmod 0755 "$5"
+  else
+    cp -- "$4" "$5"
+  fi
+}
+sysctl() {
+  local key=${*: -1} node
+  key=${key//net.ipv6.conf./net/ipv6/conf/}
+  key=${key//.disable_ipv6//disable_ipv6}
+  node="$POLICY_TEST_DIR/proc/sys/${key%=*}"
+  if [[ "$1" == -n ]]; then cat "$node"; return; fi
+  printf '%s\n' "${*: -1}" >>"$trace"
+  if [[ "${MOCK_DENIED:-}" == "$key" ]]; then printf 'Read-only file system: %s\n' "$key" >&2; return 1; fi
+  printf '%s\n' "${key##*=}" >"$node"
+}
+ip() {
+  case "$*" in
+    '-o -6 address show') printf '%s' "${MOCK_IPV6_ADDR:-}" ;;
+    '-o -6 route show table all exact ::/0')
+      printf '%s' "${MOCK_IPV6_ROUTE:-}"
+      if [[ -f "$POLICY_TEST_DIR/nexthop-route" ]]; then cat "$POLICY_TEST_DIR/nexthop-route"; fi ;;
+    '-6 route del default table 42601 metric 1024') rm -f -- "$POLICY_TEST_DIR/nexthop-route" ;;
+    *) return 1 ;;
+  esac
+}
+flock() { :; }
+pgrep() { [[ "${MOCK_IFUP:-false}" == true ]]; }
+export -f sysctl ip flock pgrep
 systemctl() { printf '%s\n' "$*" >>"$trace"; }
-ipv6_probe_keys() { printf 'net/ipv6/conf/eth0/disable_ipv6\n'; }
+ipv6_probe_keys() { printf '%s\n' net/ipv6/conf/{lo,ens18,vlan.20}/disable_ipv6; }
+ipv6_global_present() { return 1; }
 case "$POLICY_TEST_SCENARIO" in
   provider) printf '# Provider settings\nnet.ipv6.conf.eth0.accept_ra = 2\n' >"$NETWORK_SYSCTL" ;;
   legacy) printf '# Managed by vps-init.sh\nnet.ipv6.conf.all.disable_ipv6 = 1\n' >"$NETWORK_SYSCTL" ;;
   legacy-service)
     printf 'Description=Apply 404-vps-tools IPv4-only network stack\n' >"$LEGACY_NETWORK_UNIT"
     printf 'net.ipv6.conf.all.disable_ipv6 = 1\n' >"$LEGACY_IPV6_SYSCTL" ;;
-  ipv4|dual) NETWORK_REQUEST=$POLICY_TEST_SCENARIO ;;
+  ipv4*) NETWORK_REQUEST=ipv4 ;;
+  dual) NETWORK_REQUEST=dual ;;
 esac
 NETWORK_STACK=ipv4
 apply_network_stack
@@ -284,10 +327,51 @@ case "$POLICY_TEST_SCENARIO" in
       [[ -f "$LEGACY_NETWORK_UNIT" && -f "$LEGACY_IPV6_SYSCTL" ]]
       grep -Fxq 'enable 404-network-stack.service' "$trace"
     fi ;;
-  ipv4|dual)
-    value=0
-    if [[ "$NETWORK_REQUEST" == ipv4 ]]; then value=1; fi
-    grep -Fxq "net.ipv6.conf.all.disable_ipv6 = $value" "$NETWORK_SYSCTL" ;;
+  ipv4*)
+    [[ ! -e "$NETWORK_SYSCTL" ]]
+    grep -Fxq 'OnUnitInactiveSec=15s' "$IPV4_POLICY_TIMER"
+    grep -Fq 'After=systemd-sysctl.service network.target networking.service' "$IPV4_POLICY_SERVICE"
+    grep -Fxq 'enable --now vps-init-ipv4-only.timer' "$trace"
+    # an interface reconfigured by a manager, despite global/default=1
+    sysctl -q -w net/ipv6/conf/vlan.20/disable_ipv6=0
+    MOCK_IPV6_ADDR='vlan.20 inet6 2001:db8::2/64' MOCK_IPV6_ROUTE='default via fe80::1 dev vlan.20' verify_ipv4_policy >"$TMP_DIR/verify" 2>&1
+    [[ "$IPV4_POLICY_STATUS" == FAIL* ]]
+    grep -Fq 'vlan.20: expected disable_ipv6=1, got 0' "$TMP_DIR/verify"
+    grep -Fq 'IPv6 route still present' "$TMP_DIR/verify"
+    printf '%s\n' 'default nhid 9000 via fe80::1 dev vlan.20 table 42601 proto ra metric 1024 pref medium' >"$TMP_DIR/nexthop-route"
+    if MOCK_DENIED=net/ipv6/conf/vlan.20/disable_ipv6=1 "$IPV4_POLICY_HELPER" >"$TMP_DIR/denied" 2>&1; then exit 1; fi
+    grep -Fq 'Read-only file system: net/ipv6/conf/vlan.20/disable_ipv6=1' "$TMP_DIR/denied"
+    [[ -f "$TMP_DIR/nexthop-route" ]]
+    MOCK_IFUP=true "$IPV4_POLICY_HELPER"
+    [[ "$(sysctl -n net/ipv6/conf/vlan.20/disable_ipv6)" == 0 ]]
+    "$IPV4_POLICY_HELPER"
+    [[ "$(sysctl -n net/ipv6/conf/vlan.20/disable_ipv6)" == 1 ]]
+    [[ ! -e "$TMP_DIR/nexthop-route" ]]
+    ADDRFAM=inet6 IFACE=vlan.20 "$IPV4_POLICY_HELPER" --ifup
+    [[ "$(sysctl -n net/ipv6/conf/vlan.20/disable_ipv6)" == 0 ]]
+    "$IPV4_POLICY_HELPER"
+    verify_ipv4_policy
+    [[ "$IPV4_POLICY_STATUS" == PASS* ]]
+    if [[ "$POLICY_TEST_SCENARIO" == ipv4 ]]; then
+      rollback_network_policy
+      for path in "${IPV4_POLICY_FILES[@]}"; do [[ ! -e "$path" ]]; done
+    else
+      BACKUP_DIR="$TMP_DIR/transition"
+      mkdir -p "$BACKUP_DIR/dns"
+      NETWORK_REQUEST=${POLICY_TEST_SCENARIO#ipv4-}
+      apply_network_stack
+      for path in "${IPV4_POLICY_FILES[@]}"; do [[ ! -e "$path" ]]; done
+      grep -Fxq 'net.ipv6.conf.all.disable_ipv6=0' "$trace"
+      if [[ "$NETWORK_REQUEST" == auto ]]; then
+        [[ ! -e "$NETWORK_SYSCTL" ]]
+      else
+        grep -Fxq 'net.ipv6.conf.all.disable_ipv6 = 0' "$NETWORK_SYSCTL"
+      fi
+      rollback_network_policy
+      for path in "${IPV4_POLICY_FILES[@]}"; do cmp "$path" "$BACKUP_DIR/dns/${path##*/}"; done
+    fi ;;
+  dual)
+    grep -Fxq 'net.ipv6.conf.all.disable_ipv6 = 0' "$NETWORK_SYSCTL" ;;
 esac
 TEST
   )

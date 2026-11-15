@@ -17,6 +17,11 @@ readonly SSH_DIR='/etc/ssh/sshd_config.d'
 readonly SSH_DROPIN='/etc/ssh/sshd_config.d/00-vps-init.conf'
 readonly AUTHORIZED_KEYS='/root/.ssh/authorized_keys'
 readonly NETWORK_SYSCTL='/etc/sysctl.d/99-vps-init-network.conf'
+readonly IPV4_POLICY_HELPER='/usr/local/libexec/vps-init-ipv4-only'
+readonly IPV4_POLICY_SERVICE='/etc/systemd/system/vps-init-ipv4-only.service'
+readonly IPV4_POLICY_TIMER='/etc/systemd/system/vps-init-ipv4-only.timer'
+readonly IPV4_POLICY_IFUP='/etc/network/if-pre-up.d/vps-init-ipv4-only'
+readonly -a IPV4_POLICY_FILES=("$IPV4_POLICY_HELPER" "$IPV4_POLICY_SERVICE" "$IPV4_POLICY_TIMER" "$IPV4_POLICY_IFUP")
 readonly TCP_SYSCTL='/etc/sysctl.d/99-vps-init-tcp.conf'
 readonly BBR_MODULES='/etc/modules-load.d/vps-init-bbr.conf'
 readonly SMARTDNS_CONF='/etc/smartdns/smartdns.conf'
@@ -98,6 +103,9 @@ PERSIST_RESOLV_IMMUTABLE=false
 IPV6_OLD_DEFAULT=''
 declare -A IPV6_OLD_INTERFACES=()
 NETWORK_POLICY_CHANGED=false
+IPV4_TIMER_WAS_ENABLED=false
+IPV4_TIMER_WAS_ACTIVE=false
+IPV4_POLICY_STATUS='未核验'
 LEGACY_NETWORK_CHANGED=false
 LEGACY_NETWORK_WAS_ACTIVE=false
 LEGACY_NETWORK_WAS_ENABLED=false
@@ -147,6 +155,7 @@ usage() {
   --skip-upgrade             仅 apt update，不执行 full-upgrade
   --sing-box-version VER     指定 sing-box 版本；未指定时已安装版本不会被重跑升级
   --network-stack MODE       auto、ipv4、dual（默认 auto），显式参数跳过网络菜单
+                             ipv4 持久禁用各接口 IPv6，保留原始网络配置
   --cloudflare-8443          启用 Cloudflare-only 8443/tcp + 每日刷新
   --no-cloudflare-8443       删除本脚本管理的 Cloudflare 8443 规则/定时器
   --base-only                只完成系统更新和基础工具安装
@@ -282,9 +291,6 @@ rollback_dns() {
     rollback_legacy_network_stack
     rollback_network_policy
   fi
-  if [[ "$IPV6_OLD_ALL" =~ ^[01]$ ]]; then sysctl -q -w "net.ipv6.conf.all.disable_ipv6=$IPV6_OLD_ALL" 2>/dev/null || true; fi
-  if [[ "$IPV6_OLD_DEFAULT" =~ ^[01]$ ]]; then sysctl -q -w "net.ipv6.conf.default.disable_ipv6=$IPV6_OLD_DEFAULT" 2>/dev/null || true; fi
-  if [[ "$IPV6_OLD_LO" =~ ^[01]$ ]]; then sysctl -q -w "net.ipv6.conf.lo.disable_ipv6=$IPV6_OLD_LO" 2>/dev/null || true; fi
   if [[ -L "$BACKUP_DIR/dns/resolv.conf.symlink" ]]; then
     rm -f /etc/resolv.conf
     ln -s "$(readlink "$BACKUP_DIR/dns/resolv.conf.symlink")" /etc/resolv.conf 2>/dev/null || true
@@ -1141,9 +1147,169 @@ legacy_ipv6_unit_managed() {
     grep -Eq '^Description=Apply (404-vps-tools|404notfound) IPv4-only network stack$' "$LEGACY_NETWORK_UNIT"
 }
 
+managed_ipv4_policy_file() {
+  [[ -f "$1" && ! -L "$1" ]] &&
+    grep -Fxq '# Managed by vps-init.sh: IPv4-only policy' "$1"
+}
+
+install_ipv4_policy() {
+  local path staged
+  for path in "${IPV4_POLICY_FILES[@]}"; do
+    mkdir -p -- "${path%/*}"
+    make_mutable "$path"
+  done
+  staged=$(mktemp -d "$TMP_DIR/ipv4-policy.XXXXXXXX")
+  cat >"$staged/helper" <<'IPV4_HELPER'
+#!/bin/bash
+# Managed by vps-init.sh: IPv4-only policy
+set -Eeuo pipefail
+export LC_ALL=C
+
+# Keep ifupdown's inet6 static and DHCPv6 methods working. They need IPv6
+# temporarily for the original configuration to complete.
+if [[ "${1:-}" == --ifup ]]; then
+  [[ "${ADDRFAM:-}" == inet6 && -n "${IFACE:-}" && "$IFACE" != */* ]] || exit 0
+  exec 9>/run/lock/vps-init-ipv4-only.lock
+  flock -w 5 9 || exit 0
+  key="net/ipv6/conf/$IFACE/disable_ipv6"
+  if [[ "$(sysctl -n "$key" 2>/dev/null)" == 1 ]]; then
+    sysctl -q -w "$key=0" || :
+  fi
+  exit 0
+fi
+
+status=0
+if [[ "${1:-}" != --check ]]; then
+  exec 9>/run/lock/vps-init-ipv4-only.lock
+  flock 9
+  # A timer can fire during a hotplug ifup, not just during boot.
+  if pgrep -x ifup >/dev/null; then
+    printf 'IPv4-only deferred while ifupdown configures interfaces.\n' >&2
+    exit 0
+  fi
+  # A device created during the scan inherits the policy from default.
+  for scope in default all; do
+    key="net/ipv6/conf/$scope/disable_ipv6"
+    if [[ "$(sysctl -n "$key" 2>/dev/null)" != 1 ]]; then
+      sysctl -q -w "$key=1" || status=1
+    fi
+  done
+  for node in /proc/sys/net/ipv6/conf/*/disable_ipv6; do
+    [[ -e "$node" && "$node" != */all/* && "$node" != */default/* ]] || continue
+    key=${node#/proc/sys/}
+    if [[ "$(sysctl -n "$key" 2>/dev/null)" != 1 ]]; then
+      sysctl -q -w "$key=1" || { [[ ! -e "$node" ]] || status=1; }
+    fi
+  done
+fi
+
+nodes=(/proc/sys/net/ipv6/conf/{all,default,lo}/disable_ipv6)
+for node in /proc/sys/net/ipv6/conf/*/disable_ipv6; do
+  [[ -e "$node" && "$node" != */all/* && "$node" != */default/* && "$node" != */lo/* ]] || continue
+  nodes+=("$node")
+done
+for node in "${nodes[@]}"; do
+  key=${node#/proc/sys/}
+  if ! value=$(sysctl -n "$key" 2>&1) || [[ "$value" != 1 ]]; then
+    printf '%s: expected disable_ipv6=1, got %s\n' "${key%/disable_ipv6}" "${value:-unknown}" >&2
+    status=1
+  fi
+done
+for check in address route; do
+  if [[ "$check" == address ]]; then
+    args=(address show)
+  else
+    args=(route show table all exact ::/0)
+  fi
+  if ! out=$(ip -o -6 "${args[@]}" 2>&1); then
+    printf 'Cannot check IPv6 %s: %s\n' "$check" "$out" >&2
+    status=1
+    continue
+  fi
+  # Nexthop-backed RA defaults can survive disable_ipv6, and "ip route
+  # flush" can fail to replay their attributes as a delete request. Delete
+  # by route selectors instead of replaying nexthop or gateway attributes.
+  if [[ "$check" == route && -n "$out" && "${1:-}" != --check ]] && (( status == 0 )); then
+    while IFS= read -r route; do
+      read -r -a fields <<<"$route"
+      selectors=()
+      for ((i=0; i+1<${#fields[@]}; i++)); do
+        case "${fields[i]}" in
+          table|from|metric) selectors+=("${fields[i]}" "${fields[i+1]}"); ((i+=1)) ;;
+          dev|via|proto|nhid|expires|pref) ((i+=1)) ;;
+          nexthop) break ;;
+        esac
+      done
+      ip -6 route del default "${selectors[@]}" || status=1
+    done <<<"$out"
+    if ! out=$(ip -o -6 "${args[@]}" 2>&1); then
+      printf 'Cannot recheck IPv6 routes: %s\n' "$out" >&2
+      status=1
+      continue
+    fi
+  fi
+  if [[ -n "$out" ]]; then
+    printf 'IPv6 %s still present:\n%s\n' "$check" "$out" >&2
+    status=1
+  fi
+done
+exit "$status"
+IPV4_HELPER
+  cat >"$staged/service" <<EOF
+# Managed by vps-init.sh: IPv4-only policy
+[Unit]
+Description=Enforce IPv4-only on network interfaces
+After=systemd-sysctl.service network.target networking.service systemd-networkd.service NetworkManager.service
+ConditionPathIsReadWrite=/proc/sys/net/ipv6/conf/default/disable_ipv6
+ConditionCapability=CAP_NET_ADMIN
+
+[Service]
+Type=oneshot
+TimeoutStartSec=10s
+ExecStart=$IPV4_POLICY_HELPER
+EOF
+  cat >"$staged/timer" <<'EOF'
+# Managed by vps-init.sh: IPv4-only policy
+[Unit]
+Description=Reapply IPv4-only after network interfaces are configured
+
+[Timer]
+OnActiveSec=1s
+OnUnitInactiveSec=15s
+AccuracySec=1s
+
+[Install]
+WantedBy=timers.target
+EOF
+  install -m 0755 -- "$staged/helper" "$IPV4_POLICY_HELPER"
+  install -m 0644 -- "$staged/service" "$IPV4_POLICY_SERVICE"
+  install -m 0644 -- "$staged/timer" "$IPV4_POLICY_TIMER"
+  printf '#!/bin/bash\n# Managed by vps-init.sh: IPv4-only policy\nset -Eeuo pipefail\nexec %q --ifup\n' "$IPV4_POLICY_HELPER" >"$staged/ifup"
+  install -m 0755 -- "$staged/ifup" "$IPV4_POLICY_IFUP"
+  systemctl daemon-reload
+}
+
+verify_ipv4_policy() {
+  local out
+  if out=$("$IPV4_POLICY_HELPER" --check 2>&1); then
+    IPV4_POLICY_STATUS='PASS（逐接口已禁用，无 IPv6 地址或默认路由）'
+  else
+    IPV4_POLICY_STATUS='FAIL（内核 IPv6 未完全禁用，SmartDNS 仍为 A only）'
+    warn "$out"
+  fi
+  log "IPv4-only 内核核验：$IPV4_POLICY_STATUS"
+}
+
 backup_network_policy() {
-  local key value
+  local key value path
   if [[ -e "$NETWORK_SYSCTL" || -L "$NETWORK_SYSCTL" ]]; then cp -a "$NETWORK_SYSCTL" "$BACKUP_DIR/dns/network-sysctl"; fi
+  for path in "${IPV4_POLICY_FILES[@]}"; do
+    if managed_ipv4_policy_file "$path"; then cp -a -- "$path" "$BACKUP_DIR/dns/${path##*/}"; fi
+  done
+  if [[ -f "$IPV4_POLICY_TIMER" ]]; then
+    if systemctl is-enabled --quiet "${IPV4_POLICY_TIMER##*/}"; then IPV4_TIMER_WAS_ENABLED=true; fi
+    if systemctl is-active --quiet "${IPV4_POLICY_TIMER##*/}"; then IPV4_TIMER_WAS_ACTIVE=true; fi
+  fi
   IPV6_OLD_DEFAULT=$(sysctl -n net.ipv6.conf.default.disable_ipv6 2>/dev/null || true)
   while IFS= read -r key; do
     if value=$(sysctl -n "$key" 2>/dev/null) && [[ "$value" =~ ^[01]$ ]]; then
@@ -1154,7 +1320,21 @@ backup_network_policy() {
 }
 
 rollback_network_policy() {
-  local key value
+  local key value path saved reload=false
+  if managed_ipv4_policy_file "$IPV4_POLICY_TIMER"; then
+    systemctl disable --now "${IPV4_POLICY_TIMER##*/}" || warn "无法停止 $IPV4_POLICY_TIMER"
+    systemctl stop "${IPV4_POLICY_SERVICE##*/}" || warn "无法停止 $IPV4_POLICY_SERVICE"
+  fi
+  for path in "${IPV4_POLICY_FILES[@]}"; do
+    saved="$BACKUP_DIR/dns/${path##*/}"
+    if [[ -f "$saved" ]]; then
+      cp -a -- "$saved" "$path" || warn "无法恢复 $path"
+      reload=true
+    elif managed_ipv4_policy_file "$path"; then
+      rm -f -- "$path" || warn "无法移除 $path"
+      reload=true
+    fi
+  done
   if [[ -L "$BACKUP_DIR/dns/network-sysctl" ]]; then
     : # Auto did not modify this provider-owned link.
   elif [[ -f "$BACKUP_DIR/dns/network-sysctl" ]]; then
@@ -1171,56 +1351,79 @@ rollback_network_policy() {
       sysctl -q -w "$key=$value" >/dev/null 2>&1 || warn "无法恢复 $key"
     fi
   done
+  if [[ "$reload" == true ]]; then
+    systemctl daemon-reload || warn '无法重载 systemd 配置。'
+    if [[ "$IPV4_TIMER_WAS_ENABLED" == true ]]; then systemctl enable "${IPV4_POLICY_TIMER##*/}" || warn "无法启用 $IPV4_POLICY_TIMER"; fi
+    if [[ "$IPV4_TIMER_WAS_ACTIVE" == true ]]; then systemctl start "${IPV4_POLICY_TIMER##*/}" || warn "无法启动 $IPV4_POLICY_TIMER"; fi
+  fi
   NETWORK_POLICY_CHANGED=false
 }
 
 apply_network_stack() {
   CURRENT_STEP='应用网络栈'
-  local value=0 scope out restricted=false
+  local scope out path had_policy=false restore_runtime=false
+  local -a policy_files=()
+  if [[ "$NETWORK_REQUEST" == ipv4 ]] && ssh_session_uses_ipv6; then
+    die '当前 SSH 会话正在通过 IPv6；为避免断线，拒绝关闭 IPv6。'
+  fi
+  for path in "${IPV4_POLICY_FILES[@]}"; do
+    [[ -e "$path" || -L "$path" ]] || continue
+    managed_ipv4_policy_file "$path" || die "$path 不是脚本管理的 IPv4-only 配置。"
+    policy_files+=("$path")
+    had_policy=true
+  done
   if [[ -e "$NETWORK_SYSCTL" || -L "$NETWORK_SYSCTL" ]] && ! managed_ipv6_policy "$NETWORK_SYSCTL"; then
     if [[ "$NETWORK_REQUEST" != auto ]]; then die "$NETWORK_SYSCTL 不是脚本管理的配置。"; fi
     warn "保留非脚本管理的 $NETWORK_SYSCTL"
   fi
   if [[ "$NETWORK_REQUEST" == auto ]]; then
-    managed_ipv6_policy "$NETWORK_SYSCTL" || legacy_ipv6_unit_managed || legacy_ipv6_sysctl_managed || return 0
-  elif [[ "$NETWORK_REQUEST" == ipv4 ]]; then
-    value=1
+    [[ "$had_policy" == true ]] || managed_ipv6_policy "$NETWORK_SYSCTL" ||
+      legacy_ipv6_unit_managed || legacy_ipv6_sysctl_managed || return 0
   fi
   backup_network_policy
+  if [[ "$had_policy" == true ]] || legacy_ipv6_unit_managed || legacy_ipv6_sysctl_managed; then
+    restore_runtime=true
+  fi
+  if managed_ipv4_policy_file "$IPV4_POLICY_TIMER"; then
+    systemctl disable --now "${IPV4_POLICY_TIMER##*/}"
+  fi
+  if managed_ipv4_policy_file "$IPV4_POLICY_SERVICE"; then
+    systemctl stop "${IPV4_POLICY_SERVICE##*/}"
+  fi
+  if managed_ipv6_policy "$NETWORK_SYSCTL"; then
+    if grep -Eq 'disable_ipv6[[:space:]]*=[[:space:]]*1[[:space:]]*$' "$NETWORK_SYSCTL"; then restore_runtime=true; fi
+    make_mutable "$NETWORK_SYSCTL"
+    rm -f -- "$NETWORK_SYSCTL"
+  fi
+  if [[ "$NETWORK_REQUEST" == ipv4 ]]; then
+    install_ipv4_policy
+    if ! out=$("$IPV4_POLICY_HELPER" 2>&1); then warn "$out"; fi
+    systemctl enable --now "${IPV4_POLICY_TIMER##*/}"
+    return 0
+  fi
+  if [[ "$had_policy" == true ]]; then
+    for path in "${policy_files[@]}"; do make_mutable "$path"; done
+    rm -f -- "${policy_files[@]}"
+    systemctl daemon-reload
+  fi
   if [[ "$NETWORK_REQUEST" == auto ]]; then
-    local restore_runtime=false
-    if legacy_ipv6_unit_managed || legacy_ipv6_sysctl_managed; then
-      restore_runtime=true
-    fi
-    if managed_ipv6_policy "$NETWORK_SYSCTL"; then
-      if grep -Eq 'disable_ipv6[[:space:]]*=[[:space:]]*1[[:space:]]*$' "$NETWORK_SYSCTL"; then restore_runtime=true; fi
-      make_mutable "$NETWORK_SYSCTL"
-      rm -f -- "$NETWORK_SYSCTL"
-    fi
-    log "Auto 正在迁移旧版 IPv6 禁用策略；备份=$BACKUP_DIR"
+    log "Auto 正在迁移脚本管理的 IPv6 策略；备份=$BACKUP_DIR"
     [[ "$restore_runtime" == true ]] || return 0
   else
-    make_mutable "$NETWORK_SYSCTL"
     cat >"$NETWORK_SYSCTL" <<EOF
 # Managed by vps-init.sh
-net.ipv6.conf.all.disable_ipv6 = $value
-net.ipv6.conf.default.disable_ipv6 = $value
-net.ipv6.conf.lo.disable_ipv6 = $value
+net.ipv6.conf.all.disable_ipv6 = 0
+net.ipv6.conf.default.disable_ipv6 = 0
+net.ipv6.conf.lo.disable_ipv6 = 0
 EOF
   fi
   for scope in all default lo; do
-    # Writing all=0 broadcasts to every interface, even when a provider has
-    # disabled an individual link. Use it only for explicit policy or migration.
-    if ! out=$(sysctl -w "net.ipv6.conf.$scope.disable_ipv6=$value" 2>&1); then
-      if grep -Eqi 'permission denied|operation not permitted|read-only' <<<"$out"; then
-        restricted=true
-      else
-        die "设置 IPv6 sysctl 失败：$out"
-      fi
+    if ! out=$(sysctl -w "net.ipv6.conf.$scope.disable_ipv6=0" 2>&1); then
+      warn "恢复 IPv6 能力失败（$scope）：$out"
     fi
   done
-  if [[ "$restricted" == true ]]; then
-    warn '宿主/容器禁止修改 IPv6 sysctl；SmartDNS 仍按检测结果配置，但内核级开关无法保证。'
+  if [[ "$restore_runtime" == true ]] && ! ipv6_global_present; then
+    warn '原始 IPv6 配置已保留；静态地址和 DHCPv6 可能需等到网络服务下次初始化或计划重启后恢复。'
   fi
 }
 
@@ -2358,6 +2561,7 @@ EOF
 print_report() {
   local ssh_listeners
   ssh_listeners=$(ssh_listener_addresses | sort -u | paste -sd ' ' -) || ssh_listeners=''
+  if [[ "$NETWORK_REQUEST" == ipv4 ]]; then verify_ipv4_policy; fi
   cat <<EOF
 
 ============================================================
@@ -2365,6 +2569,7 @@ VPS 初始化完成
 ============================================================
 系统          : ${PRETTY_NAME:-Debian}
 网络栈        : $NETWORK_STACK（策略 $NETWORK_REQUEST）
+$(if [[ "$NETWORK_REQUEST" == ipv4 ]]; then printf '内核 IPv6     : %s\n' "$IPV4_POLICY_STATUS"; fi)
 SSH 实际监听  : ${ssh_listeners:-未检测到}$(if [[ "$PRESERVE_SSH" == true ]]; then printf '（保留现有配置）'; fi)
 UFW           : $(ufw status 2>/dev/null | sed -n '1p' || echo unavailable)
 SmartDNS      : $(smartdns -v 2>/dev/null | head -1 || echo unavailable)

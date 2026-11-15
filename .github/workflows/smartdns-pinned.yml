@@ -459,6 +459,98 @@ jobs:
           systemctl is-active --quiet smartdns.service
           systemctl is-active --quiet fail2ban.service
           TEST
+      - name: Verify IPv4-only after ifupdown reconfiguration and hotplug
+        if: matrix.repeat == 'false'
+        run: |
+          docker exec -i smartdns-migration bash -Eeuo pipefail -s <<'TEST'
+          apt-get install -y --no-install-recommends ifupdown
+          fixture=/tmp/ipv4-policy-interfaces
+          cat >"$fixture" <<'IFACES'
+          iface vps-test0 inet static
+              address 192.0.2.2/24
+          iface vps-test0 inet6 static
+              address 2001:db8::2/64
+              gateway 2001:db8::1
+              dad-attempts 0
+          IFACES
+          ip link add vps-test0 type veth peer name vps-peer0
+          ip link set vps-peer0 up
+          ifup -i "$fixture" vps-test0
+          ipv4=$(ip -o -4 addr show dev vps-test0)
+          ip -6 route show default | grep -F 'via 2001:db8::1 dev vps-test0'
+          # systemd-networkd can install RA defaults through nexthop objects.
+          # Use a separate routing table so this fixture cannot affect IPv4.
+          ip nexthop add id 42601 via 2001:db8::1 dev vps-test0
+          ip -6 route add default nhid 42601 proto ra table 42601
+          ip -6 route show table 42601 | grep -F 'default nhid 42601'
+          source /repo/debian-init.sh
+          set_policy() {
+            BACKUP_DIR=$(mktemp -d)
+            TMP_DIR=$(mktemp -d)
+            mkdir "$BACKUP_DIR/dns"
+            NETWORK_REQUEST=$1
+            SSH_CONNECTION='192.0.2.1 54321 192.0.2.2 22'
+            apply_network_stack
+          }
+          helper=/usr/local/libexec/vps-init-ipv4-only
+          timer=vps-init-ipv4-only.timer
+          wait_for_policy() {
+            for _ in {1..25}; do
+              if "$helper" --check >/tmp/ipv4-policy-check 2>&1; then return; fi
+              sleep 1
+            done
+            cat /tmp/ipv4-policy-check >&2
+            return 1
+          }
+          sha256sum "$fixture" >/tmp/ipv4-policy-config.sha256
+          set_policy ipv4
+          systemctl is-enabled --quiet "$timer"
+          systemctl is-active --quiet "$timer"
+          wait_for_policy
+          test -z "$(ip -6 route show table all exact ::/0)"
+          test "$(ip -o -4 addr show dev vps-test0)" = "$ipv4"
+          ip link add vps-test1 type veth peer name vps-peer1
+          test "$(sysctl -n net.ipv6.conf.vps-test1.disable_ipv6)" = 1
+          ifdown -i "$fixture" vps-test0
+          ifup -i "$fixture" vps-test0
+          wait_for_policy
+          test "$(ip -o -4 addr show dev vps-test0)" = "$ipv4"
+          sha256sum "$helper" >/tmp/ipv4-policy-helper.sha256
+          set_policy ipv4
+          sha256sum -c /tmp/ipv4-policy-helper.sha256
+          set_policy auto
+          test ! -e "$helper"
+          test ! -e /etc/sysctl.d/99-vps-init-network.conf
+          test "$(sysctl -n net.ipv6.conf.vps-test0.disable_ipv6)" = 0
+          set_policy ipv4
+          wait_for_policy
+          set_policy dual
+          test ! -e "$helper"
+          test "$(sysctl -n net.ipv6.conf.vps-test0.disable_ipv6)" = 0
+          ifdown -i "$fixture" vps-test0
+          ifup -i "$fixture" vps-test0
+          ip -6 route show default | grep -F 'via 2001:db8::1 dev vps-test0'
+          sha256sum -c /tmp/ipv4-policy-config.sha256
+          set_policy ipv4
+          wait_for_policy
+          TEST
+      - name: Verify IPv4-only on the next isolated systemd boot
+        if: matrix.repeat == 'false'
+        run: |
+          docker restart --time 20 smartdns-migration
+          docker exec -i smartdns-migration bash -Eeuo pipefail -s <<'TEST'
+          for _ in {1..30}; do
+            if systemctl is-active --quiet vps-init-ipv4-only.timer &&
+              /usr/local/libexec/vps-init-ipv4-only --check >/tmp/ipv4-policy-boot-check 2>&1; then
+              ip -o -4 route show default | grep -q '^default'
+              exit 0
+            fi
+            sleep 1
+          done
+          journalctl -b -u vps-init-ipv4-only.service --no-pager >&2
+          cat /tmp/ipv4-policy-boot-check >&2
+          exit 1
+          TEST
       - name: Show service diagnostics
         if: failure()
         run: docker exec smartdns-migration journalctl -u smartdns.service -n 100 --no-pager || true
