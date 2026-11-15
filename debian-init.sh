@@ -1215,11 +1215,6 @@ for node in "${nodes[@]}"; do
     status=1
   fi
 done
-# Nexthop-backed RA defaults can survive disable_ipv6 (e.g. systemd-networkd).
-# Remove only IPv6 defaults and only after verifying the interface settings.
-if [[ "${1:-}" != --check ]] && (( status == 0 )); then
-  ip -6 route flush table all exact ::/0 || status=1
-fi
 for check in address route; do
   if [[ "$check" == address ]]; then
     args=(address show)
@@ -1229,7 +1224,31 @@ for check in address route; do
   if ! out=$(ip -o -6 "${args[@]}" 2>&1); then
     printf 'Cannot check IPv6 %s: %s\n' "$check" "$out" >&2
     status=1
-  elif [[ -n "$out" ]]; then
+    continue
+  fi
+  # Nexthop-backed RA defaults can survive disable_ipv6, and "ip route
+  # flush" can fail to replay their attributes as a delete request. Delete
+  # by route selectors instead of replaying nexthop or gateway attributes.
+  if [[ "$check" == route && -n "$out" && "${1:-}" != --check ]] && (( status == 0 )); then
+    while IFS= read -r route; do
+      read -r -a fields <<<"$route"
+      selectors=()
+      for ((i=0; i+1<${#fields[@]}; i++)); do
+        case "${fields[i]}" in
+          table|from|metric) selectors+=("${fields[i]}" "${fields[i+1]}"); ((i+=1)) ;;
+          dev|via|proto|nhid|expires|pref) ((i+=1)) ;;
+          nexthop) break ;;
+        esac
+      done
+      ip -6 route del default "${selectors[@]}" || status=1
+    done <<<"$out"
+    if ! out=$(ip -o -6 "${args[@]}" 2>&1); then
+      printf 'Cannot recheck IPv6 routes: %s\n' "$out" >&2
+      status=1
+      continue
+    fi
+  fi
+  if [[ -n "$out" ]]; then
     printf 'IPv6 %s still present:\n%s\n' "$check" "$out" >&2
     status=1
   fi
