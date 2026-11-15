@@ -478,6 +478,11 @@ jobs:
           ifup -i "$fixture" vps-test0
           ipv4=$(ip -o -4 addr show dev vps-test0)
           ip -6 route show default | grep -F 'via 2001:db8::1 dev vps-test0'
+          # systemd-networkd can install RA defaults through nexthop objects.
+          # Use a separate routing table so this fixture cannot affect IPv4.
+          ip nexthop add id 42601 via 2001:db8::1 dev vps-test0
+          ip -6 route add default nhid 42601 proto ra table 42601
+          ip -6 route show table 42601 | grep -F 'default nhid 42601'
           source /repo/debian-init.sh
           set_policy() {
             BACKUP_DIR=$(mktemp -d)
@@ -502,6 +507,7 @@ jobs:
           systemctl is-enabled --quiet "$timer"
           systemctl is-active --quiet "$timer"
           wait_for_policy
+          test -z "$(ip -6 route show table all exact ::/0)"
           test "$(ip -o -4 addr show dev vps-test0)" = "$ipv4"
           ip link add vps-test1 type veth peer name vps-peer1
           test "$(sysctl -n net.ipv6.conf.vps-test1.disable_ipv6)" = 1

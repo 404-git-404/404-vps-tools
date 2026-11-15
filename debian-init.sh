@@ -1215,6 +1215,11 @@ for node in "${nodes[@]}"; do
     status=1
   fi
 done
+# Nexthop-backed RA defaults can survive disable_ipv6 (e.g. systemd-networkd).
+# Remove only IPv6 defaults and only after verifying the interface settings.
+if [[ "${1:-}" != --check ]] && (( status == 0 )); then
+  ip -6 route flush table all exact ::/0 || status=1
+fi
 for check in address route; do
   if [[ "$check" == address ]]; then
     args=(address show)

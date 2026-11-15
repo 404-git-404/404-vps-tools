@@ -285,7 +285,10 @@ sysctl() {
 ip() {
   case "$*" in
     '-o -6 address show') printf '%s' "${MOCK_IPV6_ADDR:-}" ;;
-    '-o -6 route show table all exact ::/0') printf '%s' "${MOCK_IPV6_ROUTE:-}" ;;
+    '-o -6 route show table all exact ::/0')
+      printf '%s' "${MOCK_IPV6_ROUTE:-}"
+      if [[ -f "$POLICY_TEST_DIR/nexthop-route" ]]; then cat "$POLICY_TEST_DIR/nexthop-route"; fi ;;
+    '-6 route flush table all exact ::/0') rm -f -- "$POLICY_TEST_DIR/nexthop-route" ;;
     *) return 1 ;;
   esac
 }
@@ -335,12 +338,15 @@ case "$POLICY_TEST_SCENARIO" in
     [[ "$IPV4_POLICY_STATUS" == FAIL* ]]
     grep -Fq 'vlan.20: expected disable_ipv6=1, got 0' "$TMP_DIR/verify"
     grep -Fq 'IPv6 route still present' "$TMP_DIR/verify"
+    printf '%s\n' 'default nhid 9000 via fe80::1 dev vlan.20 proto ra' >"$TMP_DIR/nexthop-route"
     if MOCK_DENIED=net/ipv6/conf/vlan.20/disable_ipv6=1 "$IPV4_POLICY_HELPER" >"$TMP_DIR/denied" 2>&1; then exit 1; fi
     grep -Fq 'Read-only file system: net/ipv6/conf/vlan.20/disable_ipv6=1' "$TMP_DIR/denied"
+    [[ -f "$TMP_DIR/nexthop-route" ]]
     MOCK_IFUP=true "$IPV4_POLICY_HELPER"
     [[ "$(sysctl -n net/ipv6/conf/vlan.20/disable_ipv6)" == 0 ]]
     "$IPV4_POLICY_HELPER"
     [[ "$(sysctl -n net/ipv6/conf/vlan.20/disable_ipv6)" == 1 ]]
+    [[ ! -e "$TMP_DIR/nexthop-route" ]]
     ADDRFAM=inet6 IFACE=vlan.20 "$IPV4_POLICY_HELPER" --ifup
     [[ "$(sysctl -n net/ipv6/conf/vlan.20/disable_ipv6)" == 0 ]]
     "$IPV4_POLICY_HELPER"
