@@ -497,6 +497,16 @@ jobs:
           }
           helper=/usr/local/libexec/vps-init-ipv4-only
           timer=vps-init-ipv4-only.timer
+          timer_path=/org/freedesktop/systemd1/unit/vps_2dinit_2dipv4_2donly_2etimer
+          check_timer() {
+            local schedule
+            systemctl is-enabled --quiet "$timer"
+            systemctl is-active --quiet "$timer"
+            schedule=$(busctl get-property org.freedesktop.systemd1 "$timer_path" org.freedesktop.systemd1.Timer TimersMonotonic)
+            grep -F '"OnActiveUSec" 1000000 ' <<<"$schedule"
+            grep -F "\"OnUnitInactiveUSec\" $1 " <<<"$schedule"
+            test "$(busctl get-property org.freedesktop.systemd1 "$timer_path" org.freedesktop.systemd1.Timer AccuracyUSec)" = "t $2"
+          }
           wait_for_policy() {
             for _ in {1..25}; do
               if "$helper" --check >/tmp/ipv4-policy-check 2>&1; then return; fi
@@ -507,8 +517,7 @@ jobs:
           }
           sha256sum "$fixture" >/tmp/ipv4-policy-config.sha256
           set_policy ipv4
-          systemctl is-enabled --quiet "$timer"
-          systemctl is-active --quiet "$timer"
+          check_timer 3600000000 60000000
           wait_for_policy
           test -z "$(ip -6 route show table all exact ::/0)"
           test "$(ip -o -4 addr show dev vps-test0)" = "$ipv4"
@@ -516,19 +525,36 @@ jobs:
           test "$(sysctl -n net.ipv6.conf.vps-test1.disable_ipv6)" = 1
           ifdown -i "$fixture" vps-test0
           ifup -i "$fixture" vps-test0
+          # Exercise the same one-shot without waiting for the hourly schedule.
+          systemctl start vps-init-ipv4-only.service
           wait_for_policy
           test "$(ip -o -4 addr show dev vps-test0)" = "$ipv4"
           sha256sum "$helper" >/tmp/ipv4-policy-helper.sha256
+          sed -i 's/^OnUnitInactiveSec=1h$/OnUnitInactiveSec=15s/; s/^AccuracySec=1min$/AccuracySec=1s/' "/etc/systemd/system/$timer"
+          systemctl daemon-reload
+          systemctl restart "$timer"
+          check_timer 15000000 1000000
+          old_activation=$(systemctl show --value -p ActiveEnterTimestampMonotonic "$timer")
           set_policy ipv4
+          check_timer 3600000000 60000000
+          test "$(systemctl show --value -p ActiveEnterTimestampMonotonic "$timer")" -gt "$old_activation"
+          grep -Fx 'OnUnitInactiveSec=15s' "$BACKUP_DIR/dns/$timer"
+          set_policy ipv4
+          check_timer 3600000000 60000000
+          test -L "/etc/systemd/system/timers.target.wants/$timer"
           sha256sum -c /tmp/ipv4-policy-helper.sha256
           set_policy auto
           test ! -e "$helper"
+          test "$(systemctl show --value -p LoadState "$timer")" = not-found
+          test ! -L "/etc/systemd/system/timers.target.wants/$timer"
           test ! -e /etc/sysctl.d/99-vps-init-network.conf
           test "$(sysctl -n net.ipv6.conf.vps-test0.disable_ipv6)" = 0
           set_policy ipv4
           wait_for_policy
           set_policy dual
           test ! -e "$helper"
+          test "$(systemctl show --value -p LoadState "$timer")" = not-found
+          test ! -L "/etc/systemd/system/timers.target.wants/$timer"
           test "$(sysctl -n net.ipv6.conf.vps-test0.disable_ipv6)" = 0
           ifdown -i "$fixture" vps-test0
           ifup -i "$fixture" vps-test0
@@ -542,9 +568,15 @@ jobs:
         run: |
           docker restart --time 20 smartdns-migration
           docker exec -i smartdns-migration bash -Eeuo pipefail -s <<'TEST'
-          for _ in {1..30}; do
+          timer_path=/org/freedesktop/systemd1/unit/vps_2dinit_2dipv4_2donly_2etimer
+          for _ in {1..75}; do
             if systemctl is-active --quiet vps-init-ipv4-only.timer &&
+              triggered=$(busctl get-property org.freedesktop.systemd1 "$timer_path" org.freedesktop.systemd1.Timer LastTriggerUSecMonotonic) &&
+              [[ "$triggered" =~ ^t\ [1-9][0-9]*$ ]] &&
               /usr/local/libexec/vps-init-ipv4-only --check >/tmp/ipv4-policy-boot-check 2>&1; then
+              systemctl is-enabled --quiet vps-init-ipv4-only.timer
+              schedule=$(busctl get-property org.freedesktop.systemd1 "$timer_path" org.freedesktop.systemd1.Timer TimersMonotonic)
+              grep -F '"OnUnitInactiveUSec" 3600000000 ' <<<"$schedule"
               ip -o -4 route show default | grep -q '^default'
               exit 0
             fi

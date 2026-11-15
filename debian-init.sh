@@ -1278,8 +1278,8 @@ Description=Reapply IPv4-only after network interfaces are configured
 
 [Timer]
 OnActiveSec=1s
-OnUnitInactiveSec=15s
-AccuracySec=1s
+OnUnitInactiveSec=1h
+AccuracySec=1min
 
 [Install]
 WantedBy=timers.target

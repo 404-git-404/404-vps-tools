@@ -329,7 +329,9 @@ case "$POLICY_TEST_SCENARIO" in
     fi ;;
   ipv4*)
     [[ ! -e "$NETWORK_SYSCTL" ]]
-    grep -Fxq 'OnUnitInactiveSec=15s' "$IPV4_POLICY_TIMER"
+    grep -Fxq 'OnActiveSec=1s' "$IPV4_POLICY_TIMER"
+    grep -Fxq 'OnUnitInactiveSec=1h' "$IPV4_POLICY_TIMER"
+    grep -Fxq 'AccuracySec=1min' "$IPV4_POLICY_TIMER"
     grep -Fq 'After=systemd-sysctl.service network.target networking.service' "$IPV4_POLICY_SERVICE"
     grep -Fxq 'enable --now vps-init-ipv4-only.timer' "$trace"
     # an interface reconfigured by a manager, despite global/default=1
