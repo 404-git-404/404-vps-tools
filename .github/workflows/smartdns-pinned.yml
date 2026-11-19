@@ -420,6 +420,9 @@ jobs:
             fi
           done
           TEST
+      - name: Verify UFW family transitions and actual kernel rules
+        if: matrix.repeat == 'false'
+        run: docker exec smartdns-migration bash /repo/tests/ufw-sync-test.sh --integration
       - name: Exercise low-space cleanup on Debian
         if: matrix.repeat == 'false'
         run: |
