@@ -60,7 +60,7 @@ PROFILE
       if grep -Eq '^### tuple ### .* (45676|45677|45678|45679) ' "$UFW_RULES6"; then fail 'copied complex rule'; fi
       [[ "$(grep -c '^### tuple ### allow tcp 45671 ' "$UFW_RULES6")" == 1 ]]
       ip6tables -S ufw6-user-input | grep -F -- '--dport 45671 -j ACCEPT'
-      ip6tables -S ufw6-user-output | grep -F -- '--dport 45672:45674 -j DROP'
+      ip6tables -S ufw6-user-output | grep -E -- '--dports? 45672:45674 -j DROP'
       ip6tables -S ufw6-user-input | grep -F -- '--dport 45675 -j REJECT'
       deny_line=$(grep -n '^### tuple ### deny tcp 45680 ' "$UFW_RULES6" | cut -d: -f1)
       allow_line=$(grep -n '^### tuple ### allow tcp 45680:45690 ' "$UFW_RULES6" | cut -d: -f1)
