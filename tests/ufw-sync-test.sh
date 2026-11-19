@@ -3,6 +3,7 @@
 set -Eeuo pipefail
 repo=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 work=$(mktemp -d)
+rc=0
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
 if [[ "${1:-}" == --integration ]]; then
