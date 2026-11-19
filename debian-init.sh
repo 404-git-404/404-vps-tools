@@ -6,6 +6,7 @@ umask 077
 
 export PATH='/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
 export DEBIAN_FRONTEND=noninteractive
+export APT_LISTCHANGES_FRONTEND=none
 export LC_ALL=C
 
 readonly DEFAULT_SSH_PORT='53651'
@@ -16,6 +17,9 @@ readonly SSH_MAIN='/etc/ssh/sshd_config'
 readonly SSH_DIR='/etc/ssh/sshd_config.d'
 readonly SSH_DROPIN='/etc/ssh/sshd_config.d/00-vps-init.conf'
 readonly AUTHORIZED_KEYS='/root/.ssh/authorized_keys'
+readonly UFW_DEFAULT='/etc/default/ufw'
+readonly UFW_RULES='/etc/ufw/user.rules'
+readonly UFW_RULES6='/etc/ufw/user6.rules'
 readonly NETWORK_SYSCTL='/etc/sysctl.d/99-vps-init-network.conf'
 readonly IPV4_POLICY_HELPER='/usr/local/libexec/vps-init-ipv4-only'
 readonly IPV4_POLICY_SERVICE='/etc/systemd/system/vps-init-ipv4-only.service'
@@ -57,9 +61,15 @@ SSH_PORT_SET=false
 KEEP_SSH_22_SET=false
 PRESERVE_SSH=false
 declare -a SSH_TEMP_HOLDS=()
+declare -a UPDATE_TEMP_HOLDS=()
+CONFIG_CONFIRMED=false
+SWAP_CHOICE_COLLECTED=false
+SWAP_CONFIRMED_MIB=0
+SSH_LISTENERS_CONFIRMED=false
+SSH_CONFIRMED_LISTENERS=''
+REUSED_KEY_FINGERPRINTS=''
 SSH_KEYS_TX=false
 SSH_KEY_DIR_STATE=''
-DO_FULL_UPGRADE_SET=false
 BASE_ONLY=false
 INSTALL_MODE=''
 SINGBOX_RUNTIME_MASK=false
@@ -129,12 +139,13 @@ usage() {
   bash debian-init.sh
   bash debian-init.sh [选项]
 
-交互菜单：快速安装、自定义安装、退出、仅安装/更新 SmartDNS、仅部署 sing-box、仅安装/更新 Fail2ban、系统清理。
+交互菜单：快速安装、自定义安装、退出、仅安装/更新 SmartDNS、仅部署 sing-box、仅安装/更新 Fail2ban、系统清理、仅更新系统。
 仅部署 sing-box 独立运行节点配置向导；完整初始化只安装 sing-box，不创建节点。
 
 默认流程：
   - Debian 12/13 amd64/arm64
-  - 询问 SSH 公钥、SSH 端口、是否保留 22、是否 full-upgrade
+  - 开始前收集 SSH、网络、公钥、安全确认和 Swap，显示摘要并统一确认
+  - 快速/自定义安装默认 apt update 和 full-upgrade -y；--skip-upgrade 可跳过升级
   - SSH 公钥提示可直接回车，查看指纹并确认复用已有公钥
   - 低内存且无合适 Swap 时才询问是否创建推荐 Swap
   - 快速安装默认只监听 SSH 53651，可改选 22 或自定义单端口
@@ -163,12 +174,14 @@ usage() {
   --sing-box-only            仅安装 sing-box 并进入节点配置向导
   --fail2ban-only            仅安装/更新 Fail2ban 并验证 Jail
   --cleanup-only             系统清理，删除软件包和旧内核需分别确认
+  --update-only              仅系统更新，保留 sing-box/SmartDNS hold，不安装初始化工具
   --help                     显示帮助
 EOF
 }
 
 read_tty() {
   local prompt=$1 var=$2
+  [[ "$CONFIG_CONFIRMED" == false ]] || die "执行阶段出现未预收集的交互：$prompt"
   [[ -r /dev/tty && -w /dev/tty ]] || die '需要交互输入，但当前没有可用 /dev/tty。'
   printf '%s' "$prompt" >/dev/tty
   IFS= read -r "${var?}" </dev/tty || die '读取交互输入失败。'
@@ -238,6 +251,7 @@ make_mutable() {
 cleanup() {
   local rc=$?
   set +e
+  restore_update_package_holds
   restore_ssh_package_holds
   restore_ipv6_probe_state || true
   rollback_fail2ban || true
@@ -393,13 +407,13 @@ parse_args() {
       --keep-22) KEEP_SSH_22=true; KEEP_SSH_22_SET=true; shift ;;
       --close-22) KEEP_SSH_22=false; KEEP_SSH_22_SET=true; shift ;;
       --preserve-ssh) PRESERVE_SSH=true; shift ;;
-      --full-upgrade) DO_FULL_UPGRADE=true; DO_FULL_UPGRADE_SET=true; shift ;;
-      --skip-upgrade) DO_FULL_UPGRADE=false; DO_FULL_UPGRADE_SET=true; shift ;;
+      --full-upgrade) DO_FULL_UPGRADE=true; shift ;;
+      --skip-upgrade) DO_FULL_UPGRADE=false; shift ;;
       --sing-box-version) [[ $# -ge 2 ]] || die '--sing-box-version 缺少参数。'; SING_BOX_VERSION=${2#v}; shift 2 ;;
       --network-stack) [[ $# -ge 2 ]] || die '--network-stack 缺少参数。'; NETWORK_REQUEST=$2; NETWORK_REQUEST_SET=true; shift 2 ;;
       --cloudflare-8443) CF8443_MODE='enable'; shift ;;
       --no-cloudflare-8443) CF8443_MODE='disable'; shift ;;
-      --base-only|--smartdns-only|--sing-box-only|--fail2ban-only|--cleanup-only)
+      --base-only|--smartdns-only|--sing-box-only|--fail2ban-only|--cleanup-only|--update-only)
         [[ -z "$INSTALL_MODE" ]] || die '只能选择一种独立运行模式。'
         case "$1" in
           --base-only) BASE_ONLY=true; INSTALL_MODE=base ;;
@@ -407,6 +421,7 @@ parse_args() {
           --sing-box-only) INSTALL_MODE=singbox ;;
           --fail2ban-only) INSTALL_MODE=fail2ban ;;
           --cleanup-only) INSTALL_MODE=cleanup ;;
+          --update-only) INSTALL_MODE=update ;;
         esac
         shift ;;
       --help|-h) usage; exit 0 ;;
@@ -473,7 +488,7 @@ preflight() {
 
 apt_get() {
   local lock_timeout=$APT_WAIT_MAX
-  local NEEDRESTART_MODE=${NEEDRESTART_MODE:-}
+  local NEEDRESTART_MODE=${NEEDRESTART_MODE:-a}
   if [[ "$PRESERVE_SSH" == true ]]; then NEEDRESTART_MODE=l; fi
   export NEEDRESTART_MODE
   apt-get \
@@ -699,7 +714,9 @@ create_swap() (
   log "已启用 ${target}MiB Swap：$SWAPFILE"
 )
 
-configure_swap() {
+collect_swap_choice() {
+  SWAP_CHOICE_COLLECTED=true
+  SWAP_CONFIRMED_MIB=0
   recommend_swap
   (( SWAP_RECOMMENDED_MIB > 0 )) || return 0
   local action='创建' question='创建？'
@@ -712,8 +729,14 @@ configure_swap() {
   fi
   if ask_yes_no "$(printf '检测到 %s RAM、当前 Swap %sMiB\n当前磁盘空间推荐%s %sMiB Swap\n%s' \
     "$(format_mib "$(mem_total_kib)")" "$(swap_total_mib)" "$action" "$SWAP_RECOMMENDED_MIB" "$question")" true; then
-    if ! create_swap "$SWAP_RECOMMENDED_MIB"; then warn 'Swap 配置未完成，继续初始化。'; fi
+    SWAP_CONFIRMED_MIB=$SWAP_RECOMMENDED_MIB
   fi
+}
+
+configure_swap() {
+  if [[ "$SWAP_CHOICE_COLLECTED" == false ]]; then collect_swap_choice; fi
+  (( SWAP_CONFIRMED_MIB > 0 )) || return 0
+  if ! create_swap "$SWAP_CONFIRMED_MIB"; then warn 'Swap 配置未完成，继续初始化。'; fi
 }
 
 collect_choices() {
@@ -726,9 +749,6 @@ collect_choices() {
   validate_port "$SSH_PORT" || die "SSH 端口无效：$SSH_PORT。"
   if [[ "$PRESERVE_SSH" == false && "$KEEP_SSH_22_SET" == false ]]; then
     if ask_yes_no '保留 SSH 22/tcp 作为备用？' true; then KEEP_SSH_22=true; else KEEP_SSH_22=false; fi
-  fi
-  if [[ "$DO_FULL_UPGRADE_SET" == false ]]; then
-    if ask_yes_no '执行 apt full-upgrade？' true; then DO_FULL_UPGRADE=true; else DO_FULL_UPGRADE=false; fi
   fi
 }
 
@@ -750,12 +770,6 @@ collect_quick_choices() {
   local choice='' port=''
   if [[ "$KEEP_SSH_22_SET" == false ]]; then KEEP_SSH_22=false; fi
   if [[ "$PRESERVE_SSH" == false && "$SSH_PORT_SET" == false ]]; then
-    if ! command -v ss >/dev/null 2>&1; then
-      wait_for_package_manager
-      apt_get update
-      apt_get install -y iproute2
-      command -v ss >/dev/null || die '缺少 ss，无法检查 SSH 端口。'
-    fi
     while true; do
       read_tty $'\n1. 22 only\n2. 53651 only（默认）\n3. 自定义端口 only\n4. 保留现有 SSH 配置\n请选择 SSH 端口 [1-4]: ' choice
       case "${choice:-2}" in
@@ -769,6 +783,7 @@ collect_quick_choices() {
           break ;;
         *) warn '无效选择。'; continue ;;
       esac
+      if validate_port "$port"; then ensure_port_validation_dependency; fi
       if validate_port "$port" && ssh_port_available "$port"; then
         SSH_PORT=$port
         KEEP_SSH_22=false
@@ -777,6 +792,13 @@ collect_quick_choices() {
       warn "端口无效、已占用或无法检查：$port"
     done
   fi
+  collect_network_choice
+  SSH_PORT_SET=true
+  KEEP_SSH_22_SET=true
+}
+
+collect_network_choice() {
+  local choice=''
   if [[ "$NETWORK_REQUEST_SET" == false ]]; then
     while true; do
       read_tty $'\n1. Auto（默认）\n2. IPv4-only\n3. Dual-Stack\n请选择网络模式 [1-3]: ' choice
@@ -788,9 +810,6 @@ collect_quick_choices() {
       esac
     done
   fi
-  SSH_PORT_SET=true
-  KEEP_SSH_22_SET=true
-  DO_FULL_UPGRADE_SET=true
 }
 
 restore_ssh_package_holds() {
@@ -799,17 +818,27 @@ restore_ssh_package_holds() {
     SSH_TEMP_HOLDS=()
   else
     warn "无法恢复临时包 hold：${SSH_TEMP_HOLDS[*]}"
+    return 1
   fi
 }
 
-update_system_and_tools() {
-  CURRENT_STEP='系统更新与基础工具'
-  local sing_was_held=false smart_was_held=false sing_temp_hold=false smart_temp_hold=false upgrade_rc=0
+restore_update_package_holds() {
+  (( ${#UPDATE_TEMP_HOLDS[@]} )) || return 0
+  if apt-mark unhold "${UPDATE_TEMP_HOLDS[@]}" >/dev/null; then
+    UPDATE_TEMP_HOLDS=()
+  else
+    warn "无法恢复临时包 hold：${UPDATE_TEMP_HOLDS[*]}"
+    return 1
+  fi
+}
+
+update_system() {
+  CURRENT_STEP='系统更新'
   local package held installed
-  local -a access_packages=(openssh-server ufw fail2ban)
+  local upgrade_rc=0
+  wait_for_package_manager
+  held=$(apt-mark showhold) || die '无法读取原有 APT hold 状态。'
   if [[ "$PRESERVE_SSH" == true ]]; then
-    access_packages=()
-    held=$(apt-mark showhold)
     for package in openssh-server openssh-client openssh-sftp-server ufw fail2ban; do
       installed=$(dpkg-query -W -f='${db:Status-Status}' "$package" 2>/dev/null || true)
       if [[ "$installed" == installed ]] && ! grep -Fxq "$package" <<<"$held"; then
@@ -818,26 +847,42 @@ update_system_and_tools() {
       fi
     done
   fi
-  wait_for_package_manager
   apt_get update
   if [[ "$DO_FULL_UPGRADE" == true ]]; then
-    if apt-mark showhold 2>/dev/null | grep -Fxq sing-box; then sing_was_held=true || true; fi
-    if apt-mark showhold 2>/dev/null | grep -Fxq smartdns; then smart_was_held=true || true; fi
-    if dpkg-query -W sing-box >/dev/null 2>&1 && [[ "$sing_was_held" == false ]]; then
-      apt-mark hold sing-box >/dev/null
-      sing_temp_hold=true
-      log 'full-upgrade 前临时 hold 已安装的 sing-box，避免重跑隐式升级。'
-    fi
-    if dpkg-query -W smartdns >/dev/null 2>&1 && [[ "$smart_was_held" == false ]]; then
-      apt-mark hold smartdns >/dev/null
-      smart_temp_hold=true
-      log 'full-upgrade 前临时 hold SmartDNS，避免 Debian 版本号覆盖 GitHub Release。'
-    fi
+    for package in sing-box smartdns; do
+      installed=$(dpkg-query -W -f='${db:Status-Status}' "$package" 2>/dev/null || true)
+      if [[ "$installed" == installed ]] && ! grep -Fxq "$package" <<<"$held"; then
+        # Track before mutation so ERR/signal/EXIT can always restore the hold.
+        UPDATE_TEMP_HOLDS+=("$package")
+        apt-mark hold "$package" >/dev/null
+        log "full-upgrade 前临时 hold $package，避免非预期升级。"
+      fi
+    done
     if apt_get full-upgrade -y; then upgrade_rc=0; else upgrade_rc=$?; fi
-    [[ "$sing_temp_hold" == false ]] || apt-mark unhold sing-box >/dev/null 2>&1 || true
-    [[ "$smart_temp_hold" == false ]] || apt-mark unhold smartdns >/dev/null 2>&1 || true
-    (( upgrade_rc == 0 )) || die "apt full-upgrade 失败（退出码 $upgrade_rc）；临时 hold 已恢复。"
+    restore_update_package_holds || die '系统更新结束，但临时 hold 恢复失败。'
+    (( upgrade_rc == 0 )) || die "apt full-upgrade 失败（退出码 $upgrade_rc）。"
   fi
+  log "系统更新完成；full-upgrade=$DO_FULL_UPGRADE。"
+}
+
+run_system_update_only() {
+  update_system
+  restore_ssh_package_holds
+  local boot_kernel=''
+  if [[ -e /vmlinuz ]]; then boot_kernel=$(readlink -f /vmlinuz); boot_kernel=${boot_kernel##*/vmlinuz-}; fi
+  if [[ -e /run/reboot-required || -e /var/run/reboot-required ]] ||
+    [[ -n "$boot_kernel" && "$boot_kernel" != "$(uname -r)" ]]; then
+    log '系统报告需要重启；请安排重启。'
+  else
+    log '系统未报告需要重启（/run/reboot-required）；内核升级后请核对运行版本。'
+  fi
+}
+
+update_system_and_tools() {
+  update_system
+  CURRENT_STEP='安装基础工具'
+  local -a access_packages=(openssh-server ufw fail2ban)
+  if [[ "$PRESERVE_SSH" == true ]]; then access_packages=(); fi
   apt_get install -y \
     ca-certificates curl wget git rsync tar unzip xz-utils jq nano gnupg openssl socat cron \
     "${access_packages[@]}" dnsutils iproute2 iputils-ping netcat-openbsd mtr-tiny traceroute tcpdump \
@@ -939,6 +984,7 @@ collect_public_key() {
         if ask_yes_no '是否复用已有公钥？' true; then
           check_reused_key_permissions
           REUSE_PUBLIC_KEY=true
+          REUSED_KEY_FINGERPRINTS=$fingerprints
           return 0
         fi
       else
@@ -959,7 +1005,13 @@ collect_public_key() {
 
 install_authorized_key() {
   CURRENT_STEP='安装 SSH 公钥'
-  [[ "$REUSE_PUBLIC_KEY" == false ]] || return 0
+  if [[ "$REUSE_PUBLIC_KEY" == true ]]; then
+    check_authorized_keys_path
+    check_reused_key_permissions
+    [[ -n "$REUSED_KEY_FINGERPRINTS" && "$(ssh_public_key_fingerprints "$AUTHORIZED_KEYS")" == "$REUSED_KEY_FINGERPRINTS" ]] ||
+      die '已确认复用的 SSH 公钥发生变化，请重新运行配置。'
+    return 0
+  fi
   local fingerprint existing='' last_byte
   fingerprint=$(ssh_public_key_fingerprints <<<"$PUBLIC_KEY") || die 'SSH 公钥无法通过 ssh-keygen 校验。'
   check_authorized_keys_path
@@ -2031,7 +2083,7 @@ ufw_allow_port() {
 }
 
 preauthorize_ufw_ssh() {
-  if ufw status 2>/dev/null | grep -q '^Status: active$'; then
+  if ufw_is_active; then
     ufw_allow_port "$SSH_PORT" vps-init-ssh
     if ssh_has_backup_port; then ufw_allow_port 22 vps-init-ssh-backup; fi
   fi
@@ -2093,6 +2145,8 @@ ssh_listener_addresses() {
 confirm_ssh_listener_change() {
   local addresses ports
   addresses=$(ssh_listener_addresses) || die '无法读取现有 SSH 监听。'
+  SSH_CONFIRMED_LISTENERS=$(sort -u <<<"$addresses")
+  SSH_LISTENERS_CONFIRMED=true
   ports=$(awk 'NF { sub(/^.*:/, ""); print }' <<<"$addresses" | sort -u)
   if [[ "$ports" != *$'\n'* ]]; then return 0; fi
   warn "现有 SSH 监听多个端口，切换到端口 $SSH_PORT 可能改变 IPv4/IPv6 或 NAT 的访问路径。"
@@ -2108,12 +2162,11 @@ configure_ssh() {
     log '保留 SSH 监听、认证和服务。'
     return 0
   fi
-  systemctl is-active --quiet ssh.service || die 'ssh.service 未运行。'
-  [[ -f "$SSH_MAIN" && ! -L "$SSH_MAIN" ]] || die "$SSH_MAIN 必须是普通文件。"
-  [[ ! -L "$SSH_DIR" ]] || die "$SSH_DIR 不能是符号链接。"
-  reject_symlink "$SSH_DROPIN"
-  if systemctl is-active --quiet ssh.socket 2>/dev/null; then die '检测到 ssh.socket 激活；为避免锁死，请先转换为 ssh.service 后再运行。'; fi
-  ssh_port_available "$SSH_PORT" || die "$SSH_PORT/tcp 已被占用或无法检查。"
+  check_ssh_change_prerequisites
+  if [[ "$SSH_LISTENERS_CONFIRMED" == true ]]; then
+    [[ "$(ssh_listener_addresses | sort -u)" == "$SSH_CONFIRMED_LISTENERS" ]] ||
+      die 'SSH 监听自确认后发生变化，拒绝覆盖；请重新运行配置。'
+  fi
   backup_ssh_state
   backup_ufw_state
   SSH_TX=true
@@ -2145,9 +2198,15 @@ configure_ssh() {
 
 backup_ufw_state() {
   install -d -m 0700 "$BACKUP_DIR/ufw"
-  ufw status 2>/dev/null | grep -q '^Status: active$' && UFW_OLD_ACTIVE=true || UFW_OLD_ACTIVE=false
+  ufw_is_active && UFW_OLD_ACTIVE=true || UFW_OLD_ACTIVE=false
   [[ ! -d /etc/ufw ]] || cp -a /etc/ufw "$BACKUP_DIR/ufw/etc-ufw"
   [[ ! -e /etc/default/ufw ]] || cp -a /etc/default/ufw "$BACKUP_DIR/ufw/default-ufw"
+}
+
+ufw_is_active() {
+  local status
+  status=$(ufw status 2>/dev/null) || return 1
+  grep -q '^Status: active$' <<<"$status"
 }
 
 ufw_delete_comment_rules() {
@@ -2166,8 +2225,168 @@ ufw_delete_comment_rules() {
   done
 }
 
+set_ufw_ipv6() {
+  [[ -f "$UFW_DEFAULT" && ! -L "$UFW_DEFAULT" ]] || die "$UFW_DEFAULT 必须是普通文件。"
+  make_mutable "$UFW_DEFAULT"
+  if grep -q '^IPV6=' "$UFW_DEFAULT"; then
+    sed -i -E "s/^IPV6=.*/IPV6=$1/" "$UFW_DEFAULT"
+  else
+    printf '\nIPV6=%s\n' "$1" >>"$UFW_DEFAULT"
+  fi
+}
+
+ufw_generic_ipv6_number() {
+  local body=${1#'### tuple ### '} target source='Anywhere (v6)' action
+  local -a parts=()
+  body=${body%' comment='*}
+  IFS=' ' read -r -a parts <<<"$body"
+  (( ${#parts[@]} == 7 )) || return 0
+  [[ "${parts[3]}" == ::/0 && "${parts[4]}" == any && "${parts[5]}" == ::/0 ]] || return 0
+  case "${parts[6]}" in in|out) ;; *) return 0 ;; esac
+  action=${parts[0]%%_*}
+  target=${parts[2]}
+  if [[ "$target" == any ]]; then
+    target=Anywhere
+    if [[ "${parts[1]}" != any ]]; then source="Anywhere/${parts[1]} (v6)"; fi
+  fi
+  if [[ "${parts[1]}" != any ]]; then target+="/${parts[1]}"; fi
+  target+=" (v6) ${action^^} ${parts[6]^^} $source"
+  ufw status numbered | awk -v target="$target" '
+    /^\[[[:space:]]*[0-9]+\]/ {
+      n=$0; sub(/^\[[[:space:]]*/,"",n); sub(/\].*/,"",n)
+      sub(/^\[[^]]*\][[:space:]]*/,""); sub(/[[:space:]]+#.*/,"")
+      sub(/ \((log|log-all|out)[^)]*\)$/,""); gsub(/[[:space:]]+/," "); sub(/ $/,"")
+      if ($0==target) print n
+    }'
+}
+
+ufw_sync_generic_ipv6() {
+  # Read UFW's persisted tuples, including inactive rules. Never eval show-added
+  # output or replay a generic command: that could change IPv4 actions/comments.
+  local line body comment hex action protocol port destination source_port source direction reason existing match
+  local i j anchor position
+  local -a fields=() command_args=() originals=()
+  [[ -r "$UFW_RULES" && -r "$UFW_RULES6" ]] || die '无法读取 UFW 规则文件。'
+  mapfile -t originals <"$UFW_RULES"
+  for ((i=0; i<${#originals[@]}; i++)); do
+    line=${originals[i]}
+    [[ "$line" == '### tuple ### '* ]] || continue
+    body=${line#'### tuple ### '}
+    comment=''
+    hex=''
+    if [[ "$body" == *' comment='* ]]; then
+      hex=${body##*' comment='}
+      body=${body%' comment='*}
+    fi
+    IFS=' ' read -r -a fields <<<"$body"
+    reason=''
+    if (( ${#fields[@]} != 7 )); then
+      reason='应用配置或未知 tuple 格式'
+    else
+      action=${fields[0]} protocol=${fields[1]} port=${fields[2]} destination=${fields[3]}
+      source_port=${fields[4]} source=${fields[5]} direction=${fields[6]}
+      case "$action" in allow|deny|reject|allow_log|deny_log|reject_log|allow_log-all|deny_log-all|reject_log-all) ;; *) reason='LIMIT、路由或未知动作' ;; esac
+      case "$protocol" in tcp|udp|any) ;; *) reason='无法安全映射的协议' ;; esac
+      case "$direction" in in|out) ;; *) reason='接口限定或未知方向' ;; esac
+      if [[ "$destination" != 0.0.0.0/0 || "$source" != 0.0.0.0/0 || "$source_port" != any ]]; then
+        reason='源/目标地址、CIDR 或源端口限制'
+      fi
+      if [[ "$port" != any && ! "$port" =~ ^[0-9]+([,:][0-9]+)*$ ]]; then reason='未知端口格式'; fi
+      if [[ -n "$hex" ]]; then
+        if [[ "$hex" =~ ^([[:xdigit:]]{2})+$ && ! "$hex" =~ ^(..)*(00|0[aAdD]) ]]; then
+          # shellcheck disable=SC2001 # Decode each hex byte, not a substring replacement.
+          comment=$(printf '%b' "$(sed 's/../\\x&/g' <<<"$hex")")
+        else
+          reason='无法安全保留的注释编码'
+        fi
+      fi
+    fi
+    if [[ -n "$reason" ]]; then warn "跳过 IPv4 UFW 同步（$reason）：$line"; continue; fi
+    match="$protocol $port ::/0 any ::/0 $direction"
+    existing=$(awk -v key="$match" '
+      /^### tuple ### / { line=$0; sub(/^### tuple ### /,"",line); sub(/ comment=.*/,"",line)
+        sub(/^[^ ]+ /,"",line); if(line==key) print $0 }
+    ' "$UFW_RULES6")
+    if [[ -n "$existing" ]]; then
+      # UFW may replace an existing action/comment on append. Preserve ownership
+      # and policy, even when the operator's IPv6 action differs from IPv4.
+      if [[ "$existing" != "### tuple ### $action $match"* ]]; then warn "保留冲突的 IPv6 UFW 规则，未覆盖：$existing"; fi
+      continue
+    fi
+    command_args=("${action%%_*}" "$direction")
+    if [[ "$action" == *_* ]]; then command_args+=("${action#*_}"); fi
+    if [[ "$protocol" != any ]]; then command_args+=(proto "$protocol"); fi
+    command_args+=(from ::/0 to ::/0)
+    if [[ "$port" != any ]]; then command_args+=(port "$port"); fi
+    if [[ -n "$comment" ]]; then command_args+=(comment "$comment"); fi
+    # Insert before the next existing counterpart, preserving IPv4 rule order
+    # (e.g. DENY an exception before a broader ALLOW) without moving user IPv6 rules.
+    for ((j=i+1; j<${#originals[@]}; j++)); do
+      anchor=${originals[j]//0.0.0.0\/0/::\/0}
+      [[ "$anchor" == '### tuple ### '* ]] || continue
+      grep -Fq -- "${anchor%' comment='*}" "$UFW_RULES6" || continue
+      position=$(ufw_generic_ipv6_number "$anchor")
+      if [[ "$position" =~ ^[0-9]+$ ]]; then command_args=(insert "$position" "${command_args[@]}"); break; fi
+    done
+    ufw "${command_args[@]}" >/dev/null
+    grep -Fq "### tuple ### $action $match" "$UFW_RULES6" || die 'IPv6 UFW 规则写入验证失败。'
+    log "已补充 IPv6 UFW：$action $direction $port/$protocol"
+  done
+  # The synchronizer must never rewrite an IPv4 rule, including its comment.
+  cmp -s "$UFW_RULES" <(printf '%s\n' "${originals[@]}") || die '同步期间 IPv4 UFW 规则发生变化。'
+}
+
+ufw_ipv6_rule_numbers() {
+  # Use UFW's own parser: specific IPv6 endpoints have no '(v6)' marker, while
+  # an IPv4 comment may contain that text. It also groups app tuples
+  # into the exact same numbers as `ufw status numbered` and `ufw delete NUM`.
+  /usr/bin/python3 - <<'UFW_NUMBERS'
+import gettext
+import sys
+gettext.install('ufw')
+from ufw.frontend import UFWFrontend
+
+# UFW validates its launcher and parent ownership, including sys.argv[0].
+# Python stdin uses '-', so point that check at the actual packaged launcher.
+sys.argv[0] = '/usr/sbin/ufw'
+backend = UFWFrontend(False).backend
+if not backend.use_ipv6():
+    raise RuntimeError('IPV6=yes is required before enumerating IPv6 rules')
+total = backend.get_rules_count(False) + backend.get_rules_count(True)
+numbers = []
+for number in range(total, 0, -1):
+    rule = backend.get_rule_by_number(number)
+    if rule is None:
+        raise RuntimeError('Unrecognized UFW rule number')
+    if rule.v6:
+        numbers.append(number)
+print('\n'.join(map(str, numbers)))
+UFW_NUMBERS
+}
+
+ufw_remove_ipv6_rules() {
+  local nums n before original_v4
+  original_v4=$(sha256sum "$UFW_RULES") || return 1
+  # The UFW parser also works while inactive. Re-read after every batch; app
+  # profiles can expand to several tuples behind one visible rule number.
+  while true; do
+    nums=$(ufw_ipv6_rule_numbers) || return 1
+    [[ -n "$nums" ]] || break
+    before=$nums
+    while IFS= read -r n; do
+      [[ "$n" =~ ^[0-9]+$ ]] || return 1
+      ufw --force delete "$n" >/dev/null || return 1
+    done <<<"$nums"
+    nums=$(ufw_ipv6_rule_numbers) || return 1
+    [[ "$nums" != "$before" ]] || return 1
+  done
+  ! grep -q '^### tuple ### ' "$UFW_RULES6" || return 1
+  [[ "$(sha256sum "$UFW_RULES")" == "$original_v4" ]]
+}
+
 configure_ufw() {
   CURRENT_STEP='配置 UFW'
+  local ipv6_was_enabled=false status
   if [[ "$PRESERVE_SSH" == true ]]; then
     log '保留现有 UFW 状态与放行规则。'
     return 0
@@ -2176,13 +2395,20 @@ configure_ufw() {
     backup_ufw_state
     UFW_TX=true
   fi
-  make_mutable /etc/default/ufw
-  if [[ -f /etc/default/ufw ]]; then
-    if [[ "$NETWORK_REQUEST" == ipv4 ]]; then
-      sed -i -E 's/^IPV6=.*/IPV6=no/' /etc/default/ufw
-    else
-      sed -i -E 's/^IPV6=.*/IPV6=yes/' /etc/default/ufw
+  if [[ "$NETWORK_REQUEST" != auto || "$NETWORK_STACK" == dual ]]; then
+    if grep -Eiq "^IPV6=['\"]?yes['\"]?$" "$UFW_DEFAULT"; then ipv6_was_enabled=true; fi
+    # Expose hidden user6.rules before numbered deletion. Load both families
+    # with SSH protection in place before touching existing IPv6 rules.
+    set_ufw_ipv6 yes
+    if [[ "$ipv6_was_enabled" == false && "$UFW_OLD_ACTIVE" == true ]]; then
+      # Rule commands reload user6.rules too. The IPv6 base chains must exist
+      # first when moving from IPV6=no, or ip6tables-restore can fail mid-command.
+      ufw reload >/dev/null
     fi
+  fi
+  if [[ "$NETWORK_REQUEST" == ipv4 ]]; then
+    ufw_remove_ipv6_rules || die '清理 IPv6 UFW 失败，拒绝关闭 IPv6 支持。'
+    set_ufw_ipv6 no
   fi
   ufw default deny incoming >/dev/null
   ufw default allow outgoing >/dev/null
@@ -2196,7 +2422,11 @@ configure_ufw() {
   else
     ufw --force enable >/dev/null
   fi
-  ufw status | grep -q '^Status: active$' || die 'UFW 未成功启用。'
+  ufw_is_active || die 'UFW 未成功启用。'
+  if [[ "$NETWORK_REQUEST" == dual || ( "$NETWORK_REQUEST" == auto && "$NETWORK_STACK" == dual ) ]]; then
+    ufw_sync_generic_ipv6
+    ufw reload >/dev/null
+  fi
   ufw_delete_comment_rules vps-init-ssh "$SSH_PORT/tcp"
   if ssh_has_backup_port; then
     ufw_delete_comment_rules vps-init-ssh-backup 22/tcp
@@ -2205,9 +2435,11 @@ configure_ufw() {
     ufw_delete_comment_rules vps-init-ssh-backup
     ufw_allow_port "$SSH_PORT" vps-init-ssh
   fi
-  ufw status | grep -Eq "^${SSH_PORT}/tcp[[:space:]]+ALLOW" || die 'UFW 未放行新 SSH 端口。'
+  status=$(ufw status) || die '无法验证 UFW 最终状态。'
+  grep -q '^Status: active$' <<<"$status" || die 'UFW 未成功启用。'
+  grep -Eq "^${SSH_PORT}/tcp[[:space:]]+ALLOW" <<<"$status" || die 'UFW 未放行新 SSH 端口。'
   if ssh_has_backup_port; then
-    ufw status | grep -Eq '^22/tcp[[:space:]]+ALLOW' || die 'UFW 未放行 SSH 备用端口。'
+    grep -Eq '^22/tcp[[:space:]]+ALLOW' <<<"$status" || die 'UFW 未放行 SSH 备用端口。'
   fi
   UFW_TX=false
   SSH_TX=false
@@ -2610,8 +2842,8 @@ select_install_mode() {
   [[ -z "$INSTALL_MODE" ]] || return 0
   local choice=''
   while true; do
-    printf '\n1. 快速安装\n2. 自定义安装\n3. 退出\n4. 仅安装/更新 SmartDNS\n5. 仅部署 sing-box\n6. 仅安装/更新 Fail2ban\n7. 系统清理\n' >/dev/tty
-    read_tty '请选择 [1-7]: ' choice
+    printf '\n1. 快速安装\n2. 自定义安装\n3. 退出\n4. 仅安装/更新 SmartDNS\n5. 仅部署 sing-box\n6. 仅安装/更新 Fail2ban\n7. 系统清理\n8. 仅更新系统\n' >/dev/tty
+    read_tty '请选择 [1-8]: ' choice
     case "$choice" in
       1) INSTALL_MODE=quick; return 0 ;;
       2) INSTALL_MODE=custom; return 0 ;;
@@ -2620,28 +2852,89 @@ select_install_mode() {
       5) INSTALL_MODE=singbox; return 0 ;;
       6) INSTALL_MODE=fail2ban; return 0 ;;
       7) INSTALL_MODE=cleanup; return 0 ;;
+      8) INSTALL_MODE=update; return 0 ;;
       *) printf '无效选择。\n' >/dev/tty ;;
     esac
   done
 }
 
-custom_phase_one() {
-  if [[ "$DO_FULL_UPGRADE_SET" == false ]]; then
-    if ask_yes_no '执行 apt full-upgrade？' true; then DO_FULL_UPGRADE=true; else DO_FULL_UPGRADE=false; fi
-    DO_FULL_UPGRADE_SET=true
-  fi
-  install_early_dependencies
-  update_system_and_tools
+collect_custom_phase_choice() {
   local choice=''
   while true; do
-    printf '\n基础工具已经安装完成。\n1. 继续完整初始化\n2. 退出，用于测试 IP、线路和基础环境\n' >/dev/tty
+    printf '\n选择基础工具安装后的流程：\n1. 继续完整初始化\n2. 完成基础工具后退出，用于测试 IP、线路和基础环境\n' >/dev/tty
     read_tty '请选择 [1-2]: ' choice
     case "$choice" in
       1) return 0 ;;
-      2) log '已在基础工具阶段停止；备份目录：'"$BACKUP_DIR"; exit 0 ;;
+      2) BASE_ONLY=true; return 0 ;;
       *) printf '无效选择。\n' >/dev/tty ;;
     esac
   done
+}
+
+ensure_key_validation_dependency() {
+  command -v ssh-keygen >/dev/null 2>&1 && return 0
+  CURRENT_STEP='安装公钥验证所需的最小依赖'
+  wait_for_package_manager
+  apt_get update
+  apt_get install -y --no-install-recommends openssh-client
+  command -v ssh-keygen >/dev/null || die '安装后仍缺少 ssh-keygen。'
+}
+
+ensure_port_validation_dependency() {
+  command -v ss >/dev/null 2>&1 && return 0
+  wait_for_package_manager
+  apt_get update
+  apt_get install -y --no-install-recommends iproute2
+  command -v ss >/dev/null || die '缺少 ss，无法检查 SSH 端口。'
+}
+
+check_ssh_change_prerequisites() {
+  systemctl is-active --quiet ssh.service || die 'ssh.service 未运行。'
+  [[ -f "$SSH_MAIN" && ! -L "$SSH_MAIN" ]] || die "$SSH_MAIN 必须是普通文件。"
+  [[ ! -L "$SSH_DIR" ]] || die "$SSH_DIR 不能是符号链接。"
+  reject_symlink "$SSH_DROPIN"
+  if systemctl is-active --quiet ssh.socket 2>/dev/null; then die '检测到 ssh.socket 激活；为避免锁死，请先转换为 ssh.service 后再运行。'; fi
+  ssh_port_available "$SSH_PORT" || die "$SSH_PORT/tcp 已被占用或无法检查。"
+}
+
+collect_initialization_config() {
+  CURRENT_STEP='收集初始化配置'
+  case "$INSTALL_MODE" in
+    quick) collect_quick_choices; collect_choices ;;
+    custom)
+      collect_custom_phase_choice
+      collect_choices
+      if [[ "$BASE_ONLY" == false ]]; then collect_network_choice; fi
+      ;;
+  esac
+  if [[ "$BASE_ONLY" == false ]]; then
+    if [[ "$NETWORK_REQUEST" == ipv4 ]] && ssh_session_uses_ipv6; then
+      die '当前 SSH 会话正在通过 IPv6；请用 IPv4 SSH 登录后再关闭 IPv6。'
+    fi
+    if [[ "$PRESERVE_SSH" == false ]]; then
+      ensure_port_validation_dependency
+      ensure_key_validation_dependency
+      collect_public_key
+      check_ssh_change_prerequisites
+      confirm_ssh_listener_change
+    fi
+  fi
+  collect_swap_choice
+  print_initialization_summary
+  # --base-only historically supports automation without a terminal confirmation.
+  if [[ "$INSTALL_MODE" != base ]]; then
+    ask_yes_no '确认以上配置并开始自动安装？' false || die '用户取消，未开始初始化。'
+  fi
+  CONFIG_CONFIRMED=true
+}
+
+print_initialization_summary() {
+  local ssh="端口 $SSH_PORT/tcp；备用 22=$KEEP_SSH_22" key='使用已验证的新公钥' network=$NETWORK_REQUEST
+  if [[ "$REUSE_PUBLIC_KEY" == true ]]; then key='复用已确认的公钥'; fi
+  if [[ "$PRESERVE_SSH" == true ]]; then ssh='保留原有监听、认证及 UFW'; key='保留原有公钥'; fi
+  if [[ "$BASE_ONLY" == true ]]; then ssh='不配置'; key='不配置'; network='不修改'; fi
+  printf '\n本次执行配置：\n模式：%s；仅基础工具：%s\nSSH：%s\n公钥：%s\n网络：%s\nfull-upgrade：%s；Swap：%sMiB（0 表示不创建）\n' \
+    "$INSTALL_MODE" "$BASE_ONLY" "$ssh" "$key" "$network" "$DO_FULL_UPGRADE" "$SWAP_CONFIRMED_MIB"
 }
 
 install_component_dependencies() {
@@ -3006,29 +3299,15 @@ main() {
     smartdns) run_smartdns_only; return 0 ;;
     singbox) run_singbox_only; return 0 ;;
     fail2ban) run_fail2ban_only; return 0 ;;
+    update) run_system_update_only; return 0 ;;
   esac
-  if [[ "$INSTALL_MODE" == quick ]]; then
-    collect_quick_choices
-  fi
-  if [[ "$BASE_ONLY" == false && "$NETWORK_REQUEST" == ipv4 ]] && ssh_session_uses_ipv6; then
-    die '当前 SSH 会话正在通过 IPv6；请用 IPv4 SSH 登录后再关闭 IPv6。'
-  fi
-  if [[ "$INSTALL_MODE" == custom ]]; then
-    custom_phase_one
-  fi
-  collect_choices
-  if [[ "$INSTALL_MODE" != custom ]]; then
-    install_early_dependencies
-  fi
+  collect_initialization_config
+  install_early_dependencies
   if [[ "$BASE_ONLY" == false && "$PRESERVE_SSH" == false ]]; then
-    confirm_ssh_listener_change
-    collect_public_key
     install_authorized_key
   fi
   configure_swap
-  if [[ "$INSTALL_MODE" != custom ]]; then
-    update_system_and_tools
-  fi
+  update_system_and_tools
   if [[ "$BASE_ONLY" == true ]]; then
     log '已按 --base-only 完成系统更新与基础工具安装。'
     return 0

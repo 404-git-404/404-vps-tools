@@ -122,11 +122,12 @@ done
 )
 
 if [[ "$(uname -s)" == Linux ]] && command -v script >/dev/null; then
-  for mode in quick custom exit smartdns singbox fail2ban cleanup; do
-    case "$mode" in quick) option=1;; custom) option=2;; exit) option=3;; smartdns) option=4;; singbox) option=5;; fail2ban) option=6;; cleanup) option=7;; esac
+  for mode in quick custom exit smartdns singbox fail2ban cleanup update; do
+    case "$mode" in quick) option=1;; custom) option=2;; exit) option=3;; smartdns) option=4;; singbox) option=5;; fail2ban) option=6;; cleanup) option=7;; update) option=8;; esac
     printf '%s\n' "$option" | script -qec "bash -c 'source \"$repo/debian-init.sh\"; select_install_mode; echo selected=\$INSTALL_MODE'" /dev/null >"$test_dir/menu" ||
       { cat "$test_dir/menu"; fail "menu option $option failed"; }
     grep -Fq '7. 系统清理' "$test_dir/menu" || fail 'cleanup menu label missing'
+    grep -Fq '8. 仅更新系统' "$test_dir/menu" || fail 'update menu label missing'
     if [[ "$mode" == exit ]]; then
       if grep -Fq 'selected=' "$test_dir/menu"; then fail 'exit continued to dispatch'; fi
     else

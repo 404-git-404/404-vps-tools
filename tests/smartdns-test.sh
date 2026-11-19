@@ -174,6 +174,7 @@ check_preserved_ssh_network_mode() (
           ipv4) printf -v "$2" 2 ;;
           dual) printf -v "$2" 3 ;;
         esac ;;
+      '确认以上配置并开始自动安装？'*) printf -v "$2" y ;;
       *) fail 'unexpected prompt in preserve mode' ;;
     esac
   }
@@ -184,6 +185,7 @@ check_preserved_ssh_network_mode() (
   configure_fail2ban() { fail 'preserve mode attempted to reconfigure Fail2ban'; }
   install_early_dependencies() { echo dependencies >>"$phase_trace"; }
   configure_swap() { :; }
+  collect_swap_choice() { :; }
   update_system_and_tools() { :; }
   ipv4_https_works() { :; }
   configure_chrony() { :; }

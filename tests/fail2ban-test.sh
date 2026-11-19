@@ -25,6 +25,7 @@ quick_fixture() {
       *'请选择 SSH 端口'*) printf -v "$2" '%s' "$menu_ssh" ;;
       '输入 SSH 端口: ') printf -v "$2" '%s' 43210 ;;
       *'请选择网络模式'*) printf -v "$2" '%s' "$menu_network" ;;
+      '确认以上配置并开始自动安装？'*) printf -v "$2" y ;;
       *) fail "unexpected prompt: $1" ;;
     esac
   }
@@ -34,6 +35,9 @@ quick_fixture() {
       "$PRESERVE_SSH" == "$expected_preserve" ]] || fail 'wrong quick menu state'
   }
   install_early_dependencies() { :; }
+  check_ssh_change_prerequisites() { :; }
+  ensure_key_validation_dependency() { :; }
+  collect_swap_choice() { :; }
   confirm_ssh_listener_change() { :; }
   ssh_listener_addresses() { :; }
   collect_public_key() { :; }
