@@ -2342,9 +2342,13 @@ ufw_ipv6_rule_numbers() {
   # into the exact same numbers as `ufw status numbered` and `ufw delete NUM`.
   /usr/bin/python3 - <<'UFW_NUMBERS'
 import gettext
+import sys
 gettext.install('ufw')
 from ufw.frontend import UFWFrontend
 
+# UFW validates its launcher and parent ownership, including sys.argv[0].
+# Python stdin uses '-', so point that check at the actual packaged launcher.
+sys.argv[0] = '/usr/sbin/ufw'
 backend = UFWFrontend(False).backend
 if not backend.use_ipv6():
     raise RuntimeError('IPV6=yes is required before enumerating IPv6 rules')
