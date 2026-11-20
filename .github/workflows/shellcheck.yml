@@ -10,6 +10,7 @@ permissions:
 jobs:
   shellcheck:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - name: Check out repository
         uses: actions/checkout@v6
@@ -35,6 +36,9 @@ jobs:
             tests/ufw-sync-test.sh
             tests/system-update-test.sh
             tests/init-flow-test.sh
+            tests/ci-workflow-test.sh
+            .github/scripts/ci-fetch.sh
+            .github/scripts/ci-required-checks.sh
           )
           for script in "${scripts[@]}"; do
             test -s "$script"
@@ -55,7 +59,8 @@ jobs:
             tests/cleanup-test.sh \
             tests/ufw-sync-test.sh \
             tests/system-update-test.sh \
-            tests/init-flow-test.sh; do
+            tests/init-flow-test.sh \
+            tests/ci-workflow-test.sh; do
             test -x "$executable_script"
           done
           for script in yt-region gg-status alpine-init.sh; do
@@ -133,6 +138,11 @@ jobs:
           PATH="$RUNNER_TEMP/mawk-bin:$PATH" bash tests/ufw-sync-test.sh
           PATH="$RUNNER_TEMP/mawk-bin:$PATH" bash tests/system-update-test.sh
           PATH="$RUNNER_TEMP/mawk-bin:$PATH" bash tests/init-flow-test.sh
+          PATH="$RUNNER_TEMP/mawk-bin:$PATH" bash tests/ci-workflow-test.sh
+
+      - name: Validate Actions workflows and inline shell
+        timeout-minutes: 3
+        run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
 
       - name: Verify real Swap activation on the runner VM
         run: sudo bash tests/swap-test.sh --kernel
@@ -157,6 +167,9 @@ jobs:
             tests/ufw-sync-test.sh \
             tests/system-update-test.sh \
             tests/init-flow-test.sh \
+            tests/ci-workflow-test.sh \
+            .github/scripts/ci-fetch.sh \
+            .github/scripts/ci-required-checks.sh \
             /tmp/node-wizard.sh \
             /tmp/update-cloudflare-ufw
           shellcheck -s sh yt-region gg-status alpine-init.sh

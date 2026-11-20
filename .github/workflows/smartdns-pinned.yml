@@ -15,17 +15,18 @@ jobs:
   release-assets:
     name: Release assets and package metadata
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - name: Check out repository
         uses: actions/checkout@v6
 
       - name: Fetch actual Release asset names and URLs
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          curl --fail --location --silent --show-error \
-            --connect-timeout 10 --max-time 120 --retry 3 --retry-delay 2 \
-            --retry-connrefused \
+          bash .github/scripts/ci-fetch.sh --github-api \
             "https://api.github.com/repos/404-git-404/404-vps-tools/releases/tags/$RELEASE_TAG" \
-            -o /tmp/release.json
+            /tmp/release.json
           jq -e '
             .tag_name == "smartdns-debian-pinned-2026-07" and
             .draft == false and
@@ -60,13 +61,12 @@ jobs:
           ' /tmp/release.json
 
       - name: Confirm Release is not latest
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          http_code=$(curl --location --silent --show-error \
-            --header 'Cache-Control: no-cache' \
-            --connect-timeout 10 --max-time 120 --retry 3 --retry-delay 2 \
-            --retry-connrefused \
+          http_code=$(bash .github/scripts/ci-fetch.sh --github-api --allow-not-found \
             https://api.github.com/repos/404-git-404/404-vps-tools/releases/latest \
-            --output /tmp/latest.json --write-out '%{http_code}')
+            /tmp/latest.json)
           case "$http_code" in
             200) test "$(jq -r .tag_name /tmp/latest.json)" != "$RELEASE_TAG" ;;
             404) ;;
@@ -82,9 +82,7 @@ jobs:
           jq -r '.assets[] | [.name, .browser_download_url] | @tsv' \
             /tmp/release.json |
             while IFS=$'\t' read -r name url; do
-              curl --fail --location --silent --show-error \
-                --connect-timeout 10 --max-time 120 --retry 3 --retry-delay 2 \
-                --retry-connrefused "$url" -o "/tmp/assets/$name"
+              bash .github/scripts/ci-fetch.sh "$url" "/tmp/assets/$name"
               test -s "/tmp/assets/$name"
             done
           cd /tmp/assets
@@ -127,8 +125,8 @@ jobs:
             local candidate=$1
             local expected_version=$2
             local expected_architecture=$3
-            test "$(dpkg-deb --field "$candidate" Package)" = smartdns
-            test "$(dpkg-deb --field "$candidate" Version)" = "$expected_version"
+            test "$(dpkg-deb --field "$candidate" Package)" = smartdns || return 1
+            test "$(dpkg-deb --field "$candidate" Version)" = "$expected_version" || return 1
             test "$(dpkg-deb --field "$candidate" Architecture)" = \
               "$expected_architecture"
           }
@@ -136,10 +134,23 @@ jobs:
             echo 'amd64 package unexpectedly passed the arm64 mapping.' >&2
             exit 1
           fi
+          if verify_metadata "$package" wrong-version amd64; then
+            echo 'Package unexpectedly passed a wrong version expectation.' >&2
+            exit 1
+          fi
+          mkdir -p /tmp/wrong-package/DEBIAN
+          printf 'Package: ci-wrong-package\nVersion: 40+dfsg-1\nArchitecture: amd64\nMaintainer: CI <ci@example.invalid>\nDescription: metadata rejection fixture\n' \
+            >/tmp/wrong-package/DEBIAN/control
+          dpkg-deb --build --root-owner-group /tmp/wrong-package /tmp/wrong-package.deb
+          if verify_metadata /tmp/wrong-package.deb 40+dfsg-1 amd64; then
+            echo 'Non-SmartDNS package unexpectedly passed metadata validation.' >&2
+            exit 1
+          fi
 
   release-package:
     name: Debian ${{ matrix.debian }} / ${{ matrix.arch }} pinned package
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     container: debian:${{ matrix.debian }}
     strategy:
       fail-fast: false
@@ -163,7 +174,7 @@ jobs:
           trap - EXIT ERR HUP INT TERM
           dpkg() { if [[ "$1" == --print-architecture ]]; then echo "$PACKAGE_ARCH"; else command dpkg "$@"; fi; }
           smartdns_pkg_values
-          curl -fL --retry 3 --connect-timeout 10 --max-time 180 "$SMARTDNS_URL" -o /tmp/smartdns.deb
+          bash .github/scripts/ci-fetch.sh "$SMARTDNS_URL" /tmp/smartdns.deb
           echo "$SMARTDNS_SHA  /tmp/smartdns.deb" | sha256sum --check --status
           test "$(dpkg-deb --field /tmp/smartdns.deb Package)" = smartdns
           package_arch=$(dpkg-deb --field /tmp/smartdns.deb Architecture)
@@ -197,12 +208,16 @@ jobs:
               dig @127.0.0.1 -p 6053 debian.org A +short +time=6 +tries=2 | grep -E '^([0-9]{1,3}\.){3}[0-9]{1,3}$'
               dig @127.0.0.1 -p 6053 google.com A +tcp +short +time=6 +tries=2 | grep -E '^([0-9]{1,3}\.){3}[0-9]{1,3}$'
               if [[ "$stack" == auto ]]; then
-                ! grep -Fq '[::1]' /tmp/smartdns.conf
+                if grep -Fq '[::1]' /tmp/smartdns.conf; then
+                  echo 'Auto without IPv6 loopback unexpectedly generated an IPv6 listener.' >&2
+                  exit 1
+                fi
                 dig @127.0.0.1 -p 6053 google.com AAAA +short +time=6 +tries=2 | grep -E '^[0-9a-fA-F:]*:[0-9a-fA-F:]+$'
               elif [[ "$stack" == dual ]]; then
                 dig @::1 -p 6053 google.com AAAA +short +time=6 +tries=2 | grep -E '^[0-9a-fA-F:]*:[0-9a-fA-F:]+$'
               else
                 aaaa=$(dig @127.0.0.1 -p 6053 google.com AAAA +noall +comments +authority +time=6 +tries=2)
+                grep -F 'status: NOERROR' <<<"$aaaa"
                 grep -F 'ANSWER: 0' <<<"$aaaa"
                 grep -w SOA <<<"$aaaa"
               fi
@@ -210,13 +225,21 @@ jobs:
                 grep -E 'ALPN negotiated: h2$' /tmp/smartdns.log || { cat /tmp/smartdns.log; exit 1; }
               fi
               kill "$pid"
-              wait "$pid" || true
+              if wait "$pid"; then
+                :
+              else
+                rc=$?
+                # SIGTERM is expected after the explicit kill; other exits fail.
+                if [[ "$rc" != 143 ]]; then cat /tmp/smartdns.log; exit "$rc"; fi
+              fi
               trap - EXIT
             done
           done
 
   migration:
     # These required check names describe the starting Debian package version.
+    # v40/v46 only parse the minimal legacy seed config. The installer then
+    # upgrades to the SHA-pinned target in debian-init.sh before modern config/DNS checks.
     name: ${{ matrix.check }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -228,16 +251,19 @@ jobs:
             debian: '12'
             package: smartdns_40+dfsg-1_bookworm_amd64.deb
             sha: 8388fb543f870fc77d17dbaa9874277d2ef37d120ad2ab24af730d7032a80bcb
+            version: 40+dfsg-1
             repeat: 'false'
           - check: Debian 13 v46 integration
             debian: '13'
             package: smartdns_46.1+dfsg-1.1.deb13u1_trixie_amd64.deb
             sha: d2dfe591dbdabf3655c2ead30975ee20f6720346552bda989b212ccffde5ba4e
+            version: 46.1+dfsg-1.1~deb13u1
             repeat: 'false'
           - check: Debian 12 amd64 full updater regression
             debian: '12'
             package: smartdns_40+dfsg-1_bookworm_amd64.deb
             sha: 8388fb543f870fc77d17dbaa9874277d2ef37d120ad2ab24af730d7032a80bcb
+            version: 40+dfsg-1
             repeat: 'true'
     steps:
       - uses: actions/checkout@v6
@@ -267,15 +293,22 @@ jobs:
         env:
           LEGACY_PACKAGE: ${{ matrix.package }}
           LEGACY_SHA: ${{ matrix.sha }}
+          LEGACY_VERSION: ${{ matrix.version }}
           REPEAT: ${{ matrix.repeat }}
         run: |
-          docker exec -i --env RELEASE_BASE --env LEGACY_PACKAGE --env LEGACY_SHA --env REPEAT smartdns-migration bash -Eeuo pipefail -s <<'TEST'
+          docker exec -i --env RELEASE_BASE --env LEGACY_PACKAGE --env LEGACY_SHA --env LEGACY_VERSION --env REPEAT smartdns-migration bash -Eeuo pipefail -s <<'TEST'
           printf '#!/bin/sh\nexit 101\n' >/usr/sbin/policy-rc.d
           chmod 0755 /usr/sbin/policy-rc.d
-          curl -fsSL --retry 3 "$RELEASE_BASE/$LEGACY_PACKAGE" -o /tmp/legacy.deb
+          bash /repo/.github/scripts/ci-fetch.sh "$RELEASE_BASE/$LEGACY_PACKAGE" /tmp/legacy.deb
           echo "$LEGACY_SHA  /tmp/legacy.deb" | sha256sum --check --status
+          test "$(dpkg-deb --field /tmp/legacy.deb Package)" = smartdns
+          test "$(dpkg-deb --field /tmp/legacy.deb Version)" = "$LEGACY_VERSION"
+          test "$(dpkg-deb --field /tmp/legacy.deb Architecture)" = amd64
           apt-get update
           apt-get install -y --allow-downgrades /tmp/legacy.deb
+          test "$(dpkg-query -W -f='${Version}' smartdns)" = "$LEGACY_VERSION"
+          printf 'Migration starts from Debian package %s: ' "$LEGACY_VERSION"
+          smartdns -v
           rm /usr/sbin/policy-rc.d
           mkdir -p /var/cache/smartdns
           printf 'bind 127.0.0.1:53\nbind-tcp 127.0.0.1:53\nserver 1.1.1.1\nserver-tcp 8.8.8.8\n' >/etc/smartdns/smartdns.conf
@@ -286,11 +319,21 @@ jobs:
           bash /repo/debian-init.sh --smartdns-only --network-stack ipv4
           systemctl is-active --quiet smartdns.service
           test "$(systemctl is-enabled smartdns.service)" = enabled
-          test "$(dpkg-query -W -f='${Version}' smartdns)" = 2026.08.05-0921
-          ! apt-mark showhold | grep -Fxq smartdns
+          target_version=$(bash -c 'source /repo/debian-init.sh; printf "%s" "$SMARTDNS_DEB_VERSION"')
+          test "$(dpkg-query -W -f='${Version}' smartdns)" = "$target_version"
+          printf 'Migration target Debian package %s: ' "$target_version"
+          smartdns -v
+          holds=$(apt-mark showhold)
+          if grep -Fxq smartdns <<<"$holds"; then
+            echo 'SmartDNS migration failed to remove its legacy hold.' >&2
+            exit 1
+          fi
           grep -Fxq 'nameserver 127.0.0.1' /etc/resolv.conf
           getent ahostsv4 debian.org >/dev/null
-          test "$(dig @127.0.0.1 debian.org AAAA +short +time=4 +tries=1)" = ''
+          aaaa=$(dig @127.0.0.1 debian.org AAAA +noall +comments +authority +time=4 +tries=1)
+          grep -F 'status: NOERROR' <<<"$aaaa"
+          grep -F 'ANSWER: 0' <<<"$aaaa"
+          grep -w SOA <<<"$aaaa"
           backup=$(find /root/vps-init-backups -path '*/dns/smartdns.conf' -type f | head -1)
           cmp /tmp/before.conf "$backup"
           if [[ "$REPEAT" == true ]]; then
@@ -591,7 +634,34 @@ jobs:
           TEST
       - name: Show service diagnostics
         if: failure()
-        run: docker exec smartdns-migration journalctl -u smartdns.service -n 100 --no-pager || true
+        run: |
+          # Diagnostics are best-effort only; the original failing step remains failed.
+          docker exec smartdns-migration bash -c '
+            for component in smartdns ssh fail2ban vps-init-ipv4-only; do
+              echo "=== $component ==="
+              systemctl status "$component.service" --no-pager || true
+              journalctl -b -u "$component.service" -n 80 --no-pager || true
+            done
+            dpkg-query -W smartdns ufw openssh-server fail2ban || true
+            smartdns -v || true
+            ip -brief address || true
+            ip -6 route show table all || true
+            ufw status numbered || true
+            ip6tables -S || true
+          ' || true
       - name: Remove test container
         if: always()
         run: docker rm -f smartdns-migration >/dev/null 2>&1 || true
+
+  validation-gate:
+    name: Pinned SmartDNS validation gate
+    if: ${{ always() }}
+    needs: [release-assets, release-package, migration]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+      - name: Require every package and integration job to succeed
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
+        run: bash .github/scripts/ci-required-checks.sh
