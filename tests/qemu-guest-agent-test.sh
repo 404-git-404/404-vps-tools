@@ -17,8 +17,9 @@ if [[ ${1:-} == --package-manager ]]; then
   INSTALL_MODE=quick
   remove_qemu_guest_agent
 
-  build_fixture() {
+  build_fixture() (
     local name=$1 depends=${2:-}
+    umask 022
     mkdir -p "$work/$name/DEBIAN"
     {
       printf 'Package: %s\nVersion: 1\nArchitecture: all\nMaintainer: Test\nDescription: Test package\n' "$name"
@@ -26,7 +27,7 @@ if [[ ${1:-} == --package-manager ]]; then
     } >"$work/$name/DEBIAN/control"
     dpkg-deb --build "$work/$name" "$work/$name.deb"
     dpkg --install "$work/$name.deb"
-  }
+  )
 
   build_fixture qemu-guest-agent
   build_fixture qemu-agent-test-dependent qemu-guest-agent
