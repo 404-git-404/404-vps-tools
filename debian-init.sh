@@ -72,6 +72,7 @@ SSH_KEYS_TX=false
 SSH_KEY_DIR_STATE=''
 BASE_ONLY=false
 INSTALL_MODE=''
+REMOVE_QEMU_GUEST_AGENT=false
 SINGBOX_RUNTIME_MASK=false
 NETWORK_REQUEST='auto'
 NETWORK_REQUEST_SET=false
@@ -139,7 +140,7 @@ usage() {
   bash debian-init.sh
   bash debian-init.sh [选项]
 
-交互菜单：快速安装、自定义安装、退出、仅安装/更新 SmartDNS、仅部署 sing-box、仅安装/更新 Fail2ban、系统清理、仅更新系统。
+交互菜单：快速安装、自定义安装、退出、仅安装/更新 SmartDNS、仅部署 sing-box、仅安装/更新 Fail2ban、系统清理、仅更新系统、卸载 QEMU Guest Agent。
 仅部署 sing-box 独立运行节点配置向导；完整初始化只安装 sing-box，不创建节点。
 
 默认流程：
@@ -456,6 +457,7 @@ preflight() {
   # shellcheck disable=SC1091
   . /etc/os-release
   [[ "${ID:-}" == debian && "${VERSION_ID:-}" =~ ^(12|13)$ ]] || die '仅支持 Debian 12/13。'
+  if [[ "$INSTALL_MODE" == qemu-agent-remove ]]; then return 0; fi
   if [[ ! -d /run/systemd/system ]] || ! command -v systemctl >/dev/null 2>&1; then
     die '需要正在运行的 systemd。'
   fi
@@ -2842,8 +2844,8 @@ select_install_mode() {
   [[ -z "$INSTALL_MODE" ]] || return 0
   local choice=''
   while true; do
-    printf '\n1. 快速安装\n2. 自定义安装\n3. 退出\n4. 仅安装/更新 SmartDNS\n5. 仅部署 sing-box\n6. 仅安装/更新 Fail2ban\n7. 系统清理\n8. 仅更新系统\n' >/dev/tty
-    read_tty '请选择 [1-8]: ' choice
+    printf '\n1. 快速安装\n2. 自定义安装\n3. 退出\n4. 仅安装/更新 SmartDNS\n5. 仅部署 sing-box\n6. 仅安装/更新 Fail2ban\n7. 系统清理\n8. 仅更新系统\n9. 卸载 QEMU Guest Agent\n' >/dev/tty
+    read_tty '请选择 [1-9]: ' choice
     case "$choice" in
       1) INSTALL_MODE=quick; return 0 ;;
       2) INSTALL_MODE=custom; return 0 ;;
@@ -2853,6 +2855,7 @@ select_install_mode() {
       6) INSTALL_MODE=fail2ban; return 0 ;;
       7) INSTALL_MODE=cleanup; return 0 ;;
       8) INSTALL_MODE=update; return 0 ;;
+      9) INSTALL_MODE=qemu-agent-remove; return 0 ;;
       *) printf '无效选择。\n' >/dev/tty ;;
     esac
   done
@@ -2900,11 +2903,12 @@ check_ssh_change_prerequisites() {
 collect_initialization_config() {
   CURRENT_STEP='收集初始化配置'
   case "$INSTALL_MODE" in
-    quick) collect_quick_choices; collect_choices ;;
+    quick) REMOVE_QEMU_GUEST_AGENT=true; collect_quick_choices; collect_choices ;;
     custom)
       collect_custom_phase_choice
       collect_choices
       if [[ "$BASE_ONLY" == false ]]; then collect_network_choice; fi
+      if ask_yes_no '是否卸载 QEMU Guest Agent？' false; then REMOVE_QEMU_GUEST_AGENT=true; fi
       ;;
   esac
   if [[ "$BASE_ONLY" == false ]]; then
@@ -2930,11 +2934,16 @@ collect_initialization_config() {
 
 print_initialization_summary() {
   local ssh="端口 $SSH_PORT/tcp；备用 22=$KEEP_SSH_22" key='使用已验证的新公钥' network=$NETWORK_REQUEST
+  local qemu_guest_agent='保留'
   if [[ "$REUSE_PUBLIC_KEY" == true ]]; then key='复用已确认的公钥'; fi
   if [[ "$PRESERVE_SSH" == true ]]; then ssh='保留原有监听、认证及 UFW'; key='保留原有公钥'; fi
   if [[ "$BASE_ONLY" == true ]]; then ssh='不配置'; key='不配置'; network='不修改'; fi
   printf '\n本次执行配置：\n模式：%s；仅基础工具：%s\nSSH：%s\n公钥：%s\n网络：%s\nfull-upgrade：%s；Swap：%sMiB（0 表示不创建）\n' \
     "$INSTALL_MODE" "$BASE_ONLY" "$ssh" "$key" "$network" "$DO_FULL_UPGRADE" "$SWAP_CONFIRMED_MIB"
+  if [[ "$INSTALL_MODE" == quick || "$INSTALL_MODE" == custom ]]; then
+    if [[ "$REMOVE_QEMU_GUEST_AGENT" == true ]]; then qemu_guest_agent='已安装则卸载'; fi
+    printf 'QEMU Guest Agent：%s\n' "$qemu_guest_agent"
+  fi
 }
 
 install_component_dependencies() {
@@ -3003,6 +3012,57 @@ run_fail2ban_only() {
     nft --check add table inet vps_init_fail2ban_check || die 'UFW 未启用，nftables 也无法写入规则。'
   fi
   configure_fail2ban "$action"
+}
+
+qemu_guest_agent_status() {
+  local status
+  if status=$(dpkg-query -W -f='${db:Status-Status}' -- qemu-guest-agent 2>/dev/null); then
+    printf '%s\n' "$status"
+  elif [[ $? == 1 ]]; then
+    printf '%s\n' 'not-installed'
+  else
+    return 1
+  fi
+}
+
+remove_qemu_guest_agent() {
+  local status plan packages
+  CURRENT_STEP='检查 QEMU Guest Agent 安装状态'
+  status=$(qemu_guest_agent_status) || die '无法查询 qemu-guest-agent 安装状态。'
+  case "$status" in
+    not-installed|config-files) log 'qemu-guest-agent 未安装，无需卸载。'; return 0 ;;
+    installed) ;;
+    *) die "qemu-guest-agent 状态异常（$status），无法卸载。" ;;
+  esac
+
+  wait_for_package_manager
+  CURRENT_STEP='模拟卸载 QEMU Guest Agent'
+  plan=$(LC_ALL=C apt_get -s -o APT::Get::AutomaticRemove=false -o APT::Get::Purge=false remove -- qemu-guest-agent) ||
+    die 'APT 模拟卸载 qemu-guest-agent 失败。'
+  if [[ "$INSTALL_MODE" == qemu-agent-remove ]]; then
+    log 'QEMU Guest Agent 卸载预览：'
+    printf '%s\n' "$plan"
+  fi
+  if ! packages=$(cleanup_apt_plan "$plan") || [[ ! "$packages" =~ ^qemu-guest-agent(:[a-z0-9-]+)?$ ]]; then
+    die 'APT 模拟结果并非仅卸载 qemu-guest-agent，已阻止执行。'
+  fi
+  if [[ "$INSTALL_MODE" == qemu-agent-remove ]]; then
+    if ! ask_yes_no '确认卸载 QEMU Guest Agent？' false; then
+      log '已取消卸载 QEMU Guest Agent。'
+      return 0
+    fi
+    wait_for_package_manager
+  fi
+
+  CURRENT_STEP='卸载 QEMU Guest Agent'
+  # dpkg checks dependencies under its own lock and only removes the specified
+  # package, even if package state changes after the APT simulation.
+  dpkg --no-force-depends,depends-version --remove -- "$packages" ||
+    die '卸载 qemu-guest-agent 失败（dpkg 返回错误）。'
+  status=$(qemu_guest_agent_status) || die '无法验证 qemu-guest-agent 卸载结果。'
+  [[ "$status" == not-installed || "$status" == config-files ]] ||
+    die "qemu-guest-agent 卸载后状态异常（$status）。"
+  log 'qemu-guest-agent 已卸载。'
 }
 
 cleanup_preflight() {
@@ -3300,8 +3360,10 @@ main() {
     singbox) run_singbox_only; return 0 ;;
     fail2ban) run_fail2ban_only; return 0 ;;
     update) run_system_update_only; return 0 ;;
+    qemu-agent-remove) remove_qemu_guest_agent; return 0 ;;
   esac
   collect_initialization_config
+  if [[ "$REMOVE_QEMU_GUEST_AGENT" == true ]]; then remove_qemu_guest_agent; fi
   install_early_dependencies
   if [[ "$BASE_ONLY" == false && "$PRESERVE_SSH" == false ]]; then
     install_authorized_key

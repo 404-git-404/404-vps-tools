@@ -36,6 +36,7 @@ jobs:
             tests/ufw-sync-test.sh
             tests/system-update-test.sh
             tests/init-flow-test.sh
+            tests/qemu-guest-agent-test.sh
             tests/ci-workflow-test.sh
             .github/scripts/ci-fetch.sh
             .github/scripts/ci-required-checks.sh
@@ -60,6 +61,7 @@ jobs:
             tests/ufw-sync-test.sh \
             tests/system-update-test.sh \
             tests/init-flow-test.sh \
+            tests/qemu-guest-agent-test.sh \
             tests/ci-workflow-test.sh; do
             test -x "$executable_script"
           done
@@ -138,6 +140,7 @@ jobs:
           PATH="$RUNNER_TEMP/mawk-bin:$PATH" bash tests/ufw-sync-test.sh
           PATH="$RUNNER_TEMP/mawk-bin:$PATH" bash tests/system-update-test.sh
           PATH="$RUNNER_TEMP/mawk-bin:$PATH" bash tests/init-flow-test.sh
+          PATH="$RUNNER_TEMP/mawk-bin:$PATH" bash tests/qemu-guest-agent-test.sh
           PATH="$RUNNER_TEMP/mawk-bin:$PATH" bash tests/ci-workflow-test.sh
 
       - name: Validate Actions workflows and inline shell
@@ -150,6 +153,13 @@ jobs:
       - name: Run Debian and Alpine containers
         run: |
           bash tests/gg-status-container-test.sh
+
+      - name: Verify QEMU Guest Agent removal on Debian 12 and 13
+        run: |
+          for debian_version in 12 13; do
+            docker run --rm --network none --volume "$PWD:/repo:ro" "debian:$debian_version" \
+              bash /repo/tests/qemu-guest-agent-test.sh --package-manager
+          done
 
       - name: Run ShellCheck
         run: |
@@ -167,6 +177,7 @@ jobs:
             tests/ufw-sync-test.sh \
             tests/system-update-test.sh \
             tests/init-flow-test.sh \
+            tests/qemu-guest-agent-test.sh \
             tests/ci-workflow-test.sh \
             .github/scripts/ci-fetch.sh \
             .github/scripts/ci-required-checks.sh \
