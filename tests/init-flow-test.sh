@@ -11,14 +11,14 @@ trap - ERR HUP INT TERM
 trap 'rm -rf -- "$work"' EXIT
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
-for scenario in port22 default custom-port preserve reuse missing-keygen existing-swap no-swap low-memory multi multi-cancel ipv6-guard cancel custom-full custom-base cli base; do
+for scenario in port22 default custom-port preserve reuse missing-keygen existing-swap no-swap low-memory multi multi-cancel ipv6-guard cancel custom-full custom-base custom-remove cli base; do
   trace="$work/$scenario.trace"
   : >"$trace"
   set +e
   (
     set -Ee
     INSTALL_MODE=quick
-    case "$scenario" in custom-full|custom-base) INSTALL_MODE=custom;; base) INSTALL_MODE='';; esac
+    case "$scenario" in custom-full|custom-base|custom-remove) INSTALL_MODE=custom;; base) INSTALL_MODE='';; esac
     preflight() { :; }
     acquire_lock() { :; }
     command() {
@@ -54,6 +54,8 @@ for scenario in port22 default custom-port preserve reuse missing-keygen existin
         *'Swap'*'？'*) printf -v "$2" y ;;
         '请选择 [1-2]: ')
           if [[ "$scenario" == custom-base ]]; then printf -v "$2" 2; else printf -v "$2" 1; fi ;;
+        '是否卸载 QEMU Guest Agent？ [y/N] ')
+          if [[ "$scenario" == custom-remove ]]; then printf -v "$2" Y; else printf -v "$2" ''; fi ;;
         '确认以上配置并开始自动安装？'*)
           if grep -q '^execute ' "$trace"; then fail 'mutation before final confirmation'; fi
           [[ "$SSH_KEYS_TX" == false && "$SSH_TX" == false && "$UFW_TX" == false && "$DNS_TX" == false ]]
@@ -87,6 +89,7 @@ for scenario in port22 default custom-port preserve reuse missing-keygen existin
     mem_total_kib() { echo 524288; }
     swap_total_mib() { if [[ "$scenario" == existing-swap ]]; then echo 1024; else echo 0; fi; }
     execute() { [[ "$CONFIG_CONFIRMED" == true ]] || fail "early mutation $1"; echo "execute $1" >>"$trace"; }
+    remove_qemu_guest_agent() { execute remove-qemu-agent; }
     create_swap() { [[ "$1" == 1024 ]]; execute swap; }
     install_early_dependencies() { execute dependencies; }
     install_authorized_key() { execute key; }
@@ -138,7 +141,25 @@ for scenario in port22 default custom-port preserve reuse missing-keygen existin
   if [[ "$scenario" == custom-base || "$scenario" == base ]]; then
     if grep -Eq '^execute (ssh|ufw|key|network|smartdns|singbox)$' "$trace"; then fail 'base-only changed components'; fi
   fi
+  case "$scenario" in
+    custom-full|custom-base|custom-remove)
+      grep -Fxq 'prompt 是否卸载 QEMU Guest Agent？ [y/N] ' "$trace"
+      ;;
+    *)
+      if grep -Fq 'prompt 是否卸载 QEMU Guest Agent？' "$trace"; then fail "$scenario asked about QEMU Guest Agent"; fi
+      ;;
+  esac
+  case "$scenario" in
+    custom-full|custom-base|base|multi-cancel|ipv6-guard|cancel)
+      if grep -Fxq 'execute remove-qemu-agent' "$trace"; then fail "$scenario removed QEMU Guest Agent"; fi
+      ;;
+    *)
+      grep -Fxq 'execute remove-qemu-agent' "$trace"
+      grep -Fxq 'QEMU Guest Agent：已安装则卸载' "$work/$scenario.output"
+      ;;
+  esac
 done
+grep -Fxq 'QEMU Guest Agent：保留' "$work/custom-full.output"
 grep -Fxq minimal-keygen "$work/missing-keygen.trace"
 if (
   check_ssh_change_prerequisites() { :; }

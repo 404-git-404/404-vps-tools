@@ -163,6 +163,7 @@ check_preserved_ssh_network_mode() (
   CONTAINER_KIND=lxc
   preflight() { :; }
   acquire_lock() { :; }
+  qemu_guest_agent_status() { echo not-installed; }
   # Simulate menu choice 4 and explicitly select the requested network mode.
   command() { if [[ "$*" == '-v ss' ]]; then return 0; fi; builtin command "$@"; }
   read_tty() {
