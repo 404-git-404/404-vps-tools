@@ -50,6 +50,10 @@ readonly MIN_ROOT_FREE_KIB=$((2 * 1024 * 1024))
 readonly LEGACY_NETWORK_UNIT='/etc/systemd/system/404-network-stack.service'
 readonly LEGACY_NETWORK_HELPER='/usr/local/libexec/404-network-stack'
 readonly LEGACY_IPV6_SYSCTL='/etc/sysctl.d/99-disable-ipv6.conf'
+readonly SYSCTL_CONF='/etc/sysctl.conf'
+# Same precedence as systemd-sysctl: a file name in an earlier directory masks later ones.
+readonly -a SYSCTL_SCAN_DIRS=(/etc/sysctl.d /run/sysctl.d /usr/local/lib/sysctl.d /usr/lib/sysctl.d)
+readonly FALLBACK_DNS='1.1.1.1'
 
 CURRENT_STEP='启动'
 TMP_DIR=''
@@ -77,6 +81,8 @@ SINGBOX_RUNTIME_MASK=false
 NETWORK_REQUEST='auto'
 NETWORK_REQUEST_SET=false
 NETWORK_STACK='unknown'
+STRAY_IPV6_ACTION=''
+STRAY_IPV6_RESULT=''
 SING_BOX_VERSION=''
 PUBKEY_ARGUMENT=''
 PUBKEY_FILE=''
@@ -124,6 +130,9 @@ LEGACY_NETWORK_WAS_ENABLED=false
 # Files whose i/a attributes were temporarily cleared. Values are original lsattr flags.
 declare -A ORIGINAL_ATTRS=()
 declare -a IPV6_PROBE_CHANGED=()
+declare -a STRAY_IPV6_LINES=()
+declare -a STRAY_IPV6_FILES=()
+declare -a STRAY_IPV6_CHANGED_FILES=()
 declare -a FAIL2BAN_MANAGED_FILES=(
   jail.d/00-vps-init-defaults.local
   jail.d/vps-init-sshd.local
@@ -150,9 +159,11 @@ usage() {
   - SSH 公钥提示可直接回车，查看指纹并确认复用已有公钥
   - 低内存且无合适 Swap 时才询问是否创建推荐 Swap
   - 快速安装默认只监听 SSH 53651，可改选 22 或自定义单端口
-  - Auto 探测当前 IPv6 连通性，失败时仍保留 IPv6 和 DNS AAAA 能力
+  - Auto 探测当前 IPv6 连通性，只得出 ipv4 或 dual，永远不主动禁用 IPv6
+  - Auto 在确认前检查重启后仍会生效的非脚本 disable_ipv6=1；可备份并注释，或保留并按 ipv4 处理
   - 仅显式选择 ipv4 才持久禁用 IPv6，dual 则显式启用
-  - SmartDNS 自动选择 IPv4-only 或 IPv4+IPv6；优先 DoH（H2），失败自动回退 UDP/TCP 53
+  - SmartDNS 仅监听 127.0.0.1:53（UDP+TCP）；优先 DoH（H2），失败自动回退 UDP/TCP 53
+  - /etc/resolv.conf 使用 127.0.0.1，备用 1.1.1.1，SmartDNS 异常时系统仍可解析
   - 443/tcp + 443/udp 默认开放
   - Cloudflare 8443 默认不启用，使用 --cloudflare-8443 显式启用
 
@@ -302,6 +313,7 @@ rollback_dns() {
   elif [[ -e "$BACKUP_DIR/dns/no-smartdns-conf" ]]; then
     rm -f -- "$SMARTDNS_CONF"
   fi
+  restore_stray_ipv6_files
   if [[ "$NETWORK_POLICY_CHANGED" == true ]]; then
     rollback_legacy_network_stack
     rollback_network_policy
@@ -1188,6 +1200,137 @@ detect_network_stack() {
   log "网络模式：$NETWORK_STACK（请求：$NETWORK_REQUEST）"
 }
 
+sysctl_policy_files() {
+  # Files that can re-apply disable_ipv6 at boot and are not owned by this script.
+  local dir path real
+  local -A seen_names=() seen_real=()
+  for dir in "${SYSCTL_SCAN_DIRS[@]}"; do
+    [[ -d "$dir" ]] || continue
+    for path in "$dir"/*.conf; do
+      [[ -e "$path" || -L "$path" ]] || continue
+      # A same-named file earlier in the search path masks this one, even as a /dev/null link.
+      [[ -z "${seen_names[${path##*/}]+x}" ]] || continue
+      seen_names[${path##*/}]=1
+      real=$(readlink -f -- "$path" 2>/dev/null) || continue
+      [[ -f "$real" && -z "${seen_real[$real]+x}" ]] || continue
+      seen_real[$real]=1
+      if managed_ipv6_policy "$real"; then continue; fi
+      if [[ "$path" == "$LEGACY_IPV6_SYSCTL" ]] && legacy_ipv6_sysctl_managed; then continue; fi
+      printf '%s\n' "$real"
+    done
+  done
+  real=$(readlink -f -- "$SYSCTL_CONF" 2>/dev/null) || return 0
+  if [[ -f "$real" && -z "${seen_real[$real]+x}" ]]; then printf '%s\n' "$real"; fi
+}
+
+stray_ipv6_disable_line_numbers() {
+  awk '
+    BEGIN { re = "^[[:space:]]*-?net[./]ipv6[./]conf[./][^[:space:]=]+[./]disable_ipv6[[:space:]]*=[[:space:]]*1[[:space:]]*$" }
+    $0 ~ re { print FNR }
+  ' "$1"
+}
+
+scan_stray_ipv6_disable() {
+  local file number found
+  STRAY_IPV6_LINES=()
+  STRAY_IPV6_FILES=()
+  while IFS= read -r file; do
+    found=false
+    while IFS= read -r number; do
+      [[ -n "$number" ]] || continue
+      STRAY_IPV6_LINES+=("$file:$number: $(sed -n "${number}p" "$file")")
+      found=true
+    done < <(stray_ipv6_disable_line_numbers "$file")
+    if [[ "$found" == true ]]; then STRAY_IPV6_FILES+=("$file"); fi
+  done < <(sysctl_policy_files)
+}
+
+tty_available() {
+  [[ -r /dev/tty && -w /dev/tty ]]
+}
+
+# Runs while choices are collected so the answer is part of the single confirmation.
+collect_stray_ipv6_policy() {
+  local line choice=''
+  STRAY_IPV6_ACTION=''
+  STRAY_IPV6_RESULT=''
+  [[ "$NETWORK_REQUEST" == auto && "$BASE_ONLY" == false ]] || return 0
+  scan_stray_ipv6_disable
+  (( ${#STRAY_IPV6_LINES[@]} )) || return 0
+  warn '检测到非脚本管理的 disable_ipv6=1 设置；重启后 IPv6 会被关闭：'
+  for line in "${STRAY_IPV6_LINES[@]}"; do printf '  %s\n' "$line" >&2; done
+  if [[ "$NETWORK_REQUEST_SET" == false ]] && tty_available; then
+    while true; do
+      read_tty $'\n1. 备份整个文件后仅注释上述行，按 Dual-Stack 处理（仅当 Auto 判定为 dual 时修改）\n2. 保留，Auto 按 IPv4 处理（默认）\n请选择 [1-2]: ' choice
+      case "${choice:-2}" in
+        1) STRAY_IPV6_ACTION=comment; break ;;
+        2) STRAY_IPV6_ACTION=keep; break ;;
+        *) warn '无效选择。' ;;
+      esac
+    done
+  else
+    STRAY_IPV6_ACTION=keep
+    warn '无交互选择：默认保留这些设置，Auto 按 IPv4 处理。'
+  fi
+}
+
+comment_stray_ipv6_files() {
+  local file number backup
+  local -a numbers=() sed_args=()
+  [[ -n "$BACKUP_DIR" && -n "$TMP_DIR" ]] || die '备份或临时目录未初始化，拒绝修改 sysctl 配置。'
+  for file in "${STRAY_IPV6_FILES[@]}"; do
+    [[ -f "$file" && ! -L "$file" ]] || continue
+    mapfile -t numbers < <(stray_ipv6_disable_line_numbers "$file")
+    (( ${#numbers[@]} )) || continue
+    # make_mutable keeps a full copy of the file before the first change.
+    make_mutable "$file"
+    backup="$BACKUP_DIR/files$file"
+    [[ -f "$backup" ]] || die "无法备份 $file。"
+    STRAY_IPV6_CHANGED_FILES+=("$file")
+    sed_args=()
+    for number in "${numbers[@]}"; do sed_args+=(-e "${number}s/^/# Disabled by vps-init.sh: /"); done
+    sed "${sed_args[@]}" "$file" >"$TMP_DIR/sysctl-stray" || die "无法处理 $file。"
+    cat "$TMP_DIR/sysctl-stray" >"$file"
+    log "已注释 $file 中 ${#numbers[@]} 行 disable_ipv6=1；完整备份=$backup"
+  done
+}
+
+restore_stray_ipv6_files() {
+  local file
+  for file in "${STRAY_IPV6_CHANGED_FILES[@]}"; do
+    if [[ -f "$BACKUP_DIR/files$file" ]]; then
+      cat "$BACKUP_DIR/files$file" >"$file" || warn "无法恢复 $file"
+    else
+      warn "缺少 $file 的备份，无法恢复。"
+    fi
+  done
+  STRAY_IPV6_CHANGED_FILES=()
+}
+
+# After detection: reflect what the system will look like after a reboot.
+apply_stray_ipv6_policy() {
+  CURRENT_STEP='处理重启后 IPv6 策略'
+  local line
+  [[ "$NETWORK_REQUEST" == auto && -n "$STRAY_IPV6_ACTION" ]] || return 0
+  if [[ "$NETWORK_STACK" != dual ]]; then
+    STRAY_IPV6_RESULT='无需处理（Auto 判定为 ipv4，配置未改动）'
+    return 0
+  fi
+  if [[ "$STRAY_IPV6_ACTION" == comment ]]; then
+    comment_stray_ipv6_files
+    scan_stray_ipv6_disable
+    if (( ${#STRAY_IPV6_LINES[@]} == 0 )); then
+      STRAY_IPV6_RESULT='已备份并注释，按 dual 处理'
+      return 0
+    fi
+    warn '仍有 disable_ipv6=1 设置会在重启后生效：'
+    for line in "${STRAY_IPV6_LINES[@]}"; do printf '  %s\n' "$line" >&2; done
+  fi
+  NETWORK_STACK=ipv4
+  STRAY_IPV6_RESULT='已保留，按 ipv4 处理'
+  warn '重启后 IPv6 将被这些设置关闭，网络栈按 ipv4 处理。需要双栈时请手动清理后重新运行。'
+}
+
 managed_ipv6_policy() {
   [[ -f "$1" && ! -L "$1" ]] || return 1
   awk '
@@ -1741,18 +1884,13 @@ backup_dns_state() {
 }
 
 write_smartdns_config() {
-  local out=$1 transport=${2:-h2} listeners=${3:-auto} aaaa_soa=no
+  local out=$1 transport=${2:-h2} aaaa_soa=no
+  # Listen on IPv4 loopback only: it exists regardless of any later disable_ipv6 policy.
+  if [[ "$NETWORK_REQUEST" == ipv4 ]]; then aaaa_soa=yes; fi
   {
-    cat <<'EOF'
+    cat <<EOF
 bind 127.0.0.1:53
 bind-tcp 127.0.0.1:53
-EOF
-    if [[ "$NETWORK_REQUEST" == ipv4 ]]; then
-      aaaa_soa=yes
-    elif [[ "$listeners" == auto ]] && ipv6_loopback_available; then
-      printf '%s\n' 'bind [::1]:53' 'bind-tcp [::1]:53'
-    fi
-    cat <<EOF
 
 cache-persist yes
 cache-file /var/cache/smartdns/smartdns.cache
@@ -1805,11 +1943,6 @@ EOF
   esac
 }
 
-ipv6_loopback_available() {
-  ip -6 addr show dev lo up 2>/dev/null |
-    awk '$1 == "inet6" && $2 == "::1/128" && !/ (tentative|dadfailed)( |$)/ { found=1 } END { exit !found }'
-}
-
 smartdns_health_check() {
   local a='' aaaa='' tcp_a='' upstream=''
   # Use a fresh name so persistent or expired cache entries cannot pass the upstream check.
@@ -1835,13 +1968,7 @@ smartdns_try_transport() {
   make_mutable "$SMARTDNS_CONF"
   install -m 0644 "$staged" "$SMARTDNS_CONF" || return 1
 
-  if ! systemctl restart smartdns.service >/dev/null 2>&1; then
-    grep -Fxq 'bind [::1]:53' "$staged" || return 1
-    warn 'SmartDNS 双监听启动失败，保留 A/AAAA 并重试 IPv4 监听。'
-    write_smartdns_config "$staged" "$transport" ipv4-listener || return 1
-    install -m 0644 "$staged" "$SMARTDNS_CONF" || return 1
-    systemctl restart smartdns.service >/dev/null 2>&1 || return 1
-  fi
+  systemctl restart smartdns.service >/dev/null 2>&1 || return 1
   sleep 2
   systemctl is-active --quiet smartdns.service || return 1
   smartdns_health_check
@@ -1991,10 +2118,8 @@ rollback_legacy_network_stack() {
 configure_system_dns() {
   CURRENT_STEP='固定系统 DNS'
   local staged="$TMP_DIR/resolv.conf"
-  cat >"$staged" <<'EOF'
-nameserver 127.0.0.1
-options timeout:2 attempts:2
-EOF
+  # SmartDNS first; the fallback keeps the host resolvable if SmartDNS stops.
+  printf 'nameserver 127.0.0.1\nnameserver %s\noptions timeout:2 attempts:2\n' "$FALLBACK_DNS" >"$staged"
   make_mutable /etc/resolv.conf
   if mountpoint -q /etc/resolv.conf 2>/dev/null; then
     if cp "$staged" /etc/resolv.conf 2>/dev/null; then
@@ -2829,6 +2954,9 @@ SSH 实际监听  : ${ssh_listeners:-未检测到}$(if [[ "$PRESERVE_SSH" == tru
 UFW           : $(ufw status 2>/dev/null | sed -n '1p' || echo unavailable)
 SmartDNS      : $(smartdns -v 2>/dev/null | head -1 || echo unavailable)
 SmartDNS 模式 : $([[ "$NETWORK_REQUEST" == ipv4 ]] && echo 'A only' || echo 'A + AAAA') / $SMARTDNS_TRANSPORT
+SmartDNS 监听 : 127.0.0.1:53（UDP+TCP）
+备用 DNS      : $FALLBACK_DNS（resolv.conf 第二个 nameserver）
+$(if [[ -n "$STRAY_IPV6_RESULT" ]]; then printf '非脚本 IPv6 : %s\n' "$STRAY_IPV6_RESULT"; fi)
 sing-box      : $(sing-box version 2>/dev/null | head -1 || echo unavailable)
 Fail2ban      : $fail2ban_status
 TCP / qdisc   : $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo unavailable) / $(sysctl -n net.core.default_qdisc 2>/dev/null || echo unavailable)
@@ -2922,6 +3050,7 @@ collect_initialization_config() {
       check_ssh_change_prerequisites
       confirm_ssh_listener_change
     fi
+    collect_stray_ipv6_policy
   fi
   collect_swap_choice
   print_initialization_summary
@@ -2943,6 +3072,13 @@ print_initialization_summary() {
   if [[ "$INSTALL_MODE" == quick || "$INSTALL_MODE" == custom ]]; then
     if [[ "$REMOVE_QEMU_GUEST_AGENT" == true ]]; then qemu_guest_agent='已安装则卸载'; fi
     printf 'QEMU Guest Agent：%s\n' "$qemu_guest_agent"
+  fi
+  case "$STRAY_IPV6_ACTION" in
+    comment) printf '重启后 IPv6：发现 %s 行非脚本 disable_ipv6=1；Auto 判定 dual 时备份并注释，否则不改动\n' "${#STRAY_IPV6_LINES[@]}" ;;
+    keep) printf '重启后 IPv6：发现 %s 行非脚本 disable_ipv6=1；保留，Auto 按 ipv4 处理\n' "${#STRAY_IPV6_LINES[@]}" ;;
+  esac
+  if [[ "$BASE_ONLY" == false ]]; then
+    printf 'DNS：SmartDNS 仅监听 127.0.0.1:53；resolv.conf 备用 %s\n' "$FALLBACK_DNS"
   fi
 }
 
@@ -3385,6 +3521,7 @@ main() {
   apply_network_stack
   cleanup_legacy_network_stack
   detect_network_stack
+  apply_stray_ipv6_policy
   install_and_configure_smartdns
   configure_system_dns
   configure_ssh

@@ -22,18 +22,20 @@ for architecture in amd64 arm64; do
 done
 unset -f dpkg
 
-ipv6_loopback_available() { return 0; }
-for stack in ipv4 dual; do
+# SmartDNS listens on IPv4 loopback only, in every mode, whether or not ::1 exists.
+for stack in ipv4 dual auto; do
   NETWORK_STACK=$stack
   NETWORK_REQUEST=$stack
   for transport in h2 dns53; do
     write_smartdns_config "$TEST_TMP/$stack-$transport.conf" "$transport"
     config=$(cat "$TEST_TMP/$stack-$transport.conf")
     [[ "$config" == *'bind 127.0.0.1:53'* && "$config" == *'bind-tcp 127.0.0.1:53'* ]] || fail 'missing local UDP/TCP listener'
+    assert_eq 2 "$(grep -c '^bind' "$TEST_TMP/$stack-$transport.conf")" "$stack $transport listener count"
+    if grep -Fq '::1' "$TEST_TMP/$stack-$transport.conf"; then fail "$stack $transport config contains ::1"; fi
     if [[ "$stack" == ipv4 ]]; then
-      [[ "$config" == *'force-AAAA-SOA yes'* && "$config" != *'bind [::1]:53'* ]] || fail 'IPv4 DNS leaked IPv6'
+      [[ "$config" == *'force-AAAA-SOA yes'* ]] || fail 'IPv4 DNS leaked IPv6'
     else
-      [[ "$config" == *'force-AAAA-SOA no'* && "$config" == *'bind [::1]:53'* ]] || fail 'dual DNS missing IPv6'
+      [[ "$config" == *'force-AAAA-SOA no'* ]] || fail "$stack DNS blocks AAAA"
     fi
     upstreams=$(grep '^server' "$TEST_TMP/$stack-$transport.conf")
     if [[ "$transport" == h2 ]]; then
@@ -195,6 +197,7 @@ check_preserved_ssh_network_mode() (
   backup_dns_state() { :; }
   apply_network_stack() { echo "apply=$NETWORK_REQUEST" >>"$phase_trace"; }
   cleanup_legacy_network_stack() { :; }
+  sysctl_policy_files() { :; }
   ipv6_global_present() { [[ "$connection" == ipv6 ]]; }
   ipv6_route_present() { [[ "$connection" == ipv6 ]]; }
   ipv6_https_works() { [[ "$connection" == ipv6 ]]; }
@@ -383,12 +386,13 @@ TEST
 done
 
 (
-  ipv6_loopback_available() { return 1; }
-  write_smartdns_config "$TEST_TMP/auto-no-loopback.conf"
-  grep -Fxq 'bind 127.0.0.1:53' "$TEST_TMP/auto-no-loopback.conf"
-  grep -Fxq 'bind-tcp 127.0.0.1:53' "$TEST_TMP/auto-no-loopback.conf"
-  grep -Fxq 'force-AAAA-SOA no' "$TEST_TMP/auto-no-loopback.conf"
-  if grep -Fq '[::1]' "$TEST_TMP/auto-no-loopback.conf"; then fail 'unavailable IPv6 listener enabled'; fi
+  # The default transport and Auto request never depend on host IPv6 state.
+  NETWORK_REQUEST=auto
+  write_smartdns_config "$TEST_TMP/auto-default.conf"
+  grep -Fxq 'bind 127.0.0.1:53' "$TEST_TMP/auto-default.conf"
+  grep -Fxq 'bind-tcp 127.0.0.1:53' "$TEST_TMP/auto-default.conf"
+  grep -Fxq 'force-AAAA-SOA no' "$TEST_TMP/auto-default.conf"
+  if grep -Fq '::1' "$TEST_TMP/auto-default.conf"; then fail 'Auto config contains ::1'; fi
 )
 
 # Validate the production address/route filters and the exact curl arguments.
@@ -607,6 +611,302 @@ fi
   assert_eq "$expected" "$(cat "$TRACE")" 'sing-box startup protection'
   assert_eq false "$SINGBOX_RUNTIME_MASK" 'runtime mask released'
 )
+
+# Auto: boot-time disable_ipv6=1 settings that this script does not own.
+stray_dir=$(mktemp -d "$TEST_TMP/stray.XXXXXX")
+stray_dir=$(cd -- "$stray_dir" && pwd -P)
+sed -e "s|^readonly SYSCTL_CONF=.*|readonly SYSCTL_CONF='$stray_dir/etc/sysctl.conf'|" \
+  -e "s|^readonly -a SYSCTL_SCAN_DIRS=.*|readonly -a SYSCTL_SCAN_DIRS=('$stray_dir/etc/sysctl.d' '$stray_dir/run/sysctl.d' '$stray_dir/usr/local/lib/sysctl.d' '$stray_dir/usr/lib/sysctl.d')|" \
+  -e "s|^readonly NETWORK_SYSCTL=.*|readonly NETWORK_SYSCTL='$stray_dir/etc/sysctl.d/99-vps-init-network.conf'|" \
+  -e "s|^readonly LEGACY_IPV6_SYSCTL=.*|readonly LEGACY_IPV6_SYSCTL='$stray_dir/etc/sysctl.d/99-disable-ipv6.conf'|" \
+  "$REPO_ROOT/debian-init.sh" >"$stray_dir/installer.sh"
+bash -s "$stray_dir" <<'TEST'
+set -Eeuo pipefail
+d=$1
+# shellcheck disable=SC1091
+source "$d/installer.sh"
+trap - EXIT ERR HUP INT TERM
+IFS=$' \t\n'
+# The offending-line listing goes to stderr; keep it out of the test output.
+exec 3>&2 2>>"$d/stderr.log"
+fail() { printf 'FAIL: %s\n' "$*" >&3; exit 1; }
+eq() { [[ "$1" == "$2" ]] || fail "$3: expected [$1], got [$2]"; }
+log() { :; }
+warn() { printf '%s\n' "$*" >>"$d/warn.log"; }
+# Keep the test independent of host attribute tools and chmod behavior.
+lsattr() { :; }
+chattr() { :; }
+install() { [[ "$1" == -d ]] && mkdir -p -- "${@: -1}"; }
+
+fixtures() {
+  rm -rf "$d/etc" "$d/usr" "$d/run" "$d/backup" "$d/tmp" "$d/orig" "$d/warn.log"
+  mkdir -p "$d"/{etc/sysctl.d,run/sysctl.d,usr/local/lib/sysctl.d,usr/lib/sysctl.d,backup,tmp,orig}
+  BACKUP_DIR="$d/backup"
+  TMP_DIR="$d/tmp"
+  : >"$d/warn.log"
+  printf '%s\n' '# legacy' 'net.ipv6.conf.all.disable_ipv6 = 1' 'net.ipv6.conf.default.disable_ipv6=1' '  net.ipv6.conf.lo.disable_ipv6 = 1' 'net.ipv6.conf.all.accept_ra = 2' >"$d/etc/sysctl.d/99-disable-ipv6.conf"
+  printf '%s\n' 'net.ipv6.icmp.echo_ignore_all = 1' 'net/ipv6/conf/eth0/disable_ipv6 = 1' >"$d/etc/sysctl.d/99-disable-ping-ipv6.conf"
+  printf '%s\n' '#net.ipv6.conf.all.disable_ipv6 = 1' 'net.ipv6.conf.all.disable_ipv6 = 0' 'net.ipv4.ip_forward = 0' >"$d/etc/sysctl.conf"
+  printf '%s\n' '# Managed by vps-init.sh' 'net.ipv6.conf.all.disable_ipv6 = 1' >"$d/etc/sysctl.d/99-vps-init-network.conf"
+  printf '%s\n' 'net.ipv6.conf.all.disable_ipv6 = 1' >"$d/usr/lib/sysctl.d/50-masked.conf"
+  printf '%s\n' 'net.ipv4.ip_forward = 0' >"$d/etc/sysctl.d/50-masked.conf"
+  printf '%s\n' 'net.ipv6.conf.all.disable_ipv6 = 1' >"$d/usr/lib/sysctl.d/60-vendor.conf"
+  local f
+  for f in etc/sysctl.conf etc/sysctl.d/99-disable-ipv6.conf etc/sysctl.d/99-disable-ping-ipv6.conf etc/sysctl.d/99-vps-init-network.conf etc/sysctl.d/50-masked.conf usr/lib/sysctl.d/50-masked.conf usr/lib/sysctl.d/60-vendor.conf; do
+    mkdir -p "$d/orig/${f%/*}"
+    cp -- "$d/$f" "$d/orig/$f"
+  done
+}
+unchanged() { cmp -s "$d/orig/$1" "$d/$1" || fail "$1 was modified"; }
+count_marker() { cat "$d"/etc/sysctl.conf "$d"/etc/sysctl.d/*.conf "$d"/usr/lib/sysctl.d/*.conf | grep -c '^# Disabled by vps-init.sh: ' || true; }
+
+NETWORK_REQUEST=auto
+NETWORK_REQUEST_SET=false
+BASE_ONLY=false
+STRAY_IPV6_ACTION=''
+STRAY_IPV6_CHANGED_FILES=()
+tty_available() { return 0; }
+read_tty() { printf -v "$2" '%s' "$answer"; asked=$((asked + 1)); }
+
+# Detection: masked, managed, commented and =0 entries are ignored; every other scope is found.
+fixtures
+scan_stray_ipv6_disable
+expected=$(printf '%s\n' \
+  "$d/etc/sysctl.d/99-disable-ipv6.conf:2: net.ipv6.conf.all.disable_ipv6 = 1" \
+  "$d/etc/sysctl.d/99-disable-ipv6.conf:3: net.ipv6.conf.default.disable_ipv6=1" \
+  "$d/etc/sysctl.d/99-disable-ipv6.conf:4:   net.ipv6.conf.lo.disable_ipv6 = 1" \
+  "$d/etc/sysctl.d/99-disable-ping-ipv6.conf:2: net/ipv6/conf/eth0/disable_ipv6 = 1" \
+  "$d/usr/lib/sysctl.d/60-vendor.conf:1: net.ipv6.conf.all.disable_ipv6 = 1")
+eq "$expected" "$(printf '%s\n' "${STRAY_IPV6_LINES[@]}")" 'detected lines'
+eq 3 "${#STRAY_IPV6_FILES[@]}" 'detected files'
+# The legacy file written by this script's older versions is migrated by Auto, not reported.
+printf '%s\n' '# Managed by vps-init.sh' 'net.ipv6.conf.all.disable_ipv6 = 1' >"$d/etc/sysctl.d/99-disable-ipv6.conf"
+scan_stray_ipv6_disable
+eq 2 "${#STRAY_IPV6_FILES[@]}" 'script-managed legacy file reported'
+
+# Prompt and defaults: [1] comment, [2] keep, Enter keeps; invalid answers re-ask.
+fixtures
+for answer in 1 2 ''; do
+  asked=0
+  collect_stray_ipv6_policy
+  eq 1 "$asked" "prompt count for [$answer]"
+  case "$answer" in 1) eq comment "$STRAY_IPV6_ACTION" 'choice 1' ;; *) eq keep "$STRAY_IPV6_ACTION" "choice [$answer]" ;; esac
+done
+asked=0
+answers=(9 1)
+read_tty() { printf -v "$2" '%s' "${answers[asked]}"; asked=$((asked + 1)); }
+collect_stray_ipv6_policy
+eq comment "$STRAY_IPV6_ACTION" 'invalid answer re-asks'
+eq 2 "$asked" 'invalid answer prompt count'
+read_tty() { fail "unexpected prompt: $1"; }
+# No terminal, explicit --network-stack, other modes and base-only never prompt.
+tty_available() { return 1; }
+collect_stray_ipv6_policy
+eq keep "$STRAY_IPV6_ACTION" 'no terminal default'
+grep -Fq '默认保留' "$d/warn.log" || fail 'missing default warning'
+tty_available() { return 0; }
+NETWORK_REQUEST_SET=true
+collect_stray_ipv6_policy
+eq keep "$STRAY_IPV6_ACTION" 'argument mode default'
+NETWORK_REQUEST_SET=false
+for request in dual ipv4; do
+  NETWORK_REQUEST=$request
+  collect_stray_ipv6_policy
+  eq '' "$STRAY_IPV6_ACTION" "$request must not scan"
+done
+NETWORK_REQUEST=auto
+BASE_ONLY=true
+collect_stray_ipv6_policy
+eq '' "$STRAY_IPV6_ACTION" 'base-only must not scan'
+BASE_ONLY=false
+
+# [1] with a dual result: comment only the offending lines after a full-file backup.
+fixtures
+asked=0
+answer=1
+read_tty() { printf -v "$2" '%s' "$answer"; asked=$((asked + 1)); }
+collect_stray_ipv6_policy
+NETWORK_STACK=dual
+apply_stray_ipv6_policy
+eq dual "$NETWORK_STACK" 'comment keeps dual'
+eq $'# legacy\n# Disabled by vps-init.sh: net.ipv6.conf.all.disable_ipv6 = 1\n# Disabled by vps-init.sh: net.ipv6.conf.default.disable_ipv6=1\n# Disabled by vps-init.sh:   net.ipv6.conf.lo.disable_ipv6 = 1\nnet.ipv6.conf.all.accept_ra = 2' \
+  "$(cat "$d/etc/sysctl.d/99-disable-ipv6.conf")" 'commented legacy file'
+eq $'net.ipv6.icmp.echo_ignore_all = 1\n# Disabled by vps-init.sh: net/ipv6/conf/eth0/disable_ipv6 = 1' \
+  "$(cat "$d/etc/sysctl.d/99-disable-ping-ipv6.conf")" 'commented ping file'
+for f in etc/sysctl.d/99-disable-ipv6.conf etc/sysctl.d/99-disable-ping-ipv6.conf usr/lib/sysctl.d/60-vendor.conf; do
+  cmp -s "$d/orig/$f" "$BACKUP_DIR/files$d/$f" || fail "missing full backup of $f"
+done
+for f in etc/sysctl.conf etc/sysctl.d/99-vps-init-network.conf etc/sysctl.d/50-masked.conf usr/lib/sysctl.d/50-masked.conf; do unchanged "$f"; done
+eq 5 "$(count_marker)" 'commented line count'
+scan_stray_ipv6_disable
+eq 0 "${#STRAY_IPV6_LINES[@]}" 'strays remain after commenting'
+# Re-running (fresh scan, then a stale list) neither duplicates nor re-comments anything.
+snapshot=$(cat "$d"/etc/sysctl.d/*.conf "$d"/usr/lib/sysctl.d/*.conf)
+collect_stray_ipv6_policy
+eq '' "$STRAY_IPV6_ACTION" 'second run finds nothing'
+STRAY_IPV6_FILES=("$d/etc/sysctl.d/99-disable-ipv6.conf" "$d/etc/sysctl.d/99-disable-ping-ipv6.conf" "$d/usr/lib/sysctl.d/60-vendor.conf")
+comment_stray_ipv6_files
+eq "$snapshot" "$(cat "$d"/etc/sysctl.d/*.conf "$d"/usr/lib/sysctl.d/*.conf)" 'rerun changed files'
+eq 5 "$(count_marker)" 'rerun duplicated comments'
+# Rollback restores the original bytes.
+STRAY_IPV6_CHANGED_FILES=("$d/etc/sysctl.d/99-disable-ipv6.conf" "$d/etc/sysctl.d/99-disable-ping-ipv6.conf" "$d/usr/lib/sysctl.d/60-vendor.conf")
+restore_stray_ipv6_files
+for f in etc/sysctl.d/99-disable-ipv6.conf etc/sysctl.d/99-disable-ping-ipv6.conf usr/lib/sysctl.d/60-vendor.conf; do unchanged "$f"; done
+
+# [2] with a dual probe: nothing is edited and the stack reflects the post-reboot state.
+fixtures
+answer=2
+collect_stray_ipv6_policy
+NETWORK_STACK=dual
+apply_stray_ipv6_policy
+eq ipv4 "$NETWORK_STACK" 'keep must follow post-reboot ipv4'
+grep -Fq '按 ipv4 处理' "$d/warn.log" || fail 'missing keep warning'
+for f in etc/sysctl.d/99-disable-ipv6.conf etc/sysctl.d/99-disable-ping-ipv6.conf usr/lib/sysctl.d/60-vendor.conf; do unchanged "$f"; done
+eq 0 "$(count_marker)" 'keep edited files'
+
+# An ipv4 probe result needs no change under either choice.
+for answer in 1 2; do
+  fixtures
+  collect_stray_ipv6_policy
+  NETWORK_STACK=ipv4
+  apply_stray_ipv6_policy
+  eq ipv4 "$NETWORK_STACK" 'ipv4 stays ipv4'
+  eq 0 "$(count_marker)" "ipv4 result edited files with choice $answer"
+done
+
+# A stray file that appears after confirmation is never edited silently; the stack falls back to ipv4.
+fixtures
+answer=1
+collect_stray_ipv6_policy
+printf '%s\n' 'net.ipv6.conf.all.disable_ipv6 = 1' >"$d/etc/sysctl.d/98-late.conf"
+NETWORK_STACK=dual
+apply_stray_ipv6_policy
+eq ipv4 "$NETWORK_STACK" 'late stray'
+eq 'net.ipv6.conf.all.disable_ipv6 = 1' "$(cat "$d/etc/sysctl.d/98-late.conf")" 'late stray edited'
+TEST
+
+# resolv.conf, SmartDNS rerun and the independence from host IPv6.
+dns_dir=$(mktemp -d "$TEST_TMP/dns.XXXXXX")
+dns_dir=$(cd -- "$dns_dir" && pwd -P)
+sed -e "s|/etc/resolv\.conf|$dns_dir/resolv.conf|g" \
+  -e "s|^readonly SMARTDNS_CONF=.*|readonly SMARTDNS_CONF='$dns_dir/smartdns.conf'|" \
+  "$REPO_ROOT/debian-init.sh" >"$dns_dir/installer.sh"
+bash -s "$dns_dir" <<'TEST'
+set -Eeuo pipefail
+d=$1
+# shellcheck disable=SC1091
+source "$d/installer.sh"
+trap - EXIT ERR HUP INT TERM
+IFS=$' \t\n'
+fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
+eq() { [[ "$1" == "$2" ]] || fail "$3: expected [$1], got [$2]"; }
+log() { :; }
+warn() { :; }
+BACKUP_DIR="$d/backup"
+TMP_DIR="$d/tmp"
+mkdir -p "$BACKUP_DIR" "$TMP_DIR"
+lsattr() { :; }
+chattr() { :; }
+mountpoint() { return 1; }
+getent() { return 0; }
+sleep() { :; }
+# SmartDNS config generation must never look at host IPv6 state.
+ip() { fail 'SmartDNS or DNS setup probed host IPv6'; }
+install() {
+  case "$1" in
+    -d) [[ "${*: -1}" == "$d"/* ]] && mkdir -p -- "${*: -1}"; return 0 ;;
+    *) cp -- "${@: -2:1}" "${@: -1}" ;;
+  esac
+}
+
+# resolv.conf: SmartDNS first, fixed fallback second, no duplicates after repeated runs.
+printf 'nameserver 9.9.9.9\nsearch example.invalid\n' >"$d/resolv.conf"
+eq 1.1.1.1 "$FALLBACK_DNS" 'fallback constant'
+expected=$(printf 'nameserver 127.0.0.1\nnameserver %s\noptions timeout:2 attempts:2' "$FALLBACK_DNS")
+for _ in 1 2 3; do
+  DNS_TX=true
+  configure_system_dns
+  eq "$expected" "$(cat "$d/resolv.conf")" 'resolv.conf content'
+  eq 2 "$(grep -c '^nameserver' "$d/resolv.conf")" 'nameserver lines'
+  eq 1 "$(grep -c '^options' "$d/resolv.conf")" 'options lines'
+done
+eq 'nameserver 9.9.9.9' "$(sed -n 1p "$BACKUP_DIR/files$d/resolv.conf")" 'original resolv.conf backup'
+getent() { return 2; }
+if (configure_system_dns) >/dev/null 2>&1; then fail 'unresolvable system DNS accepted'; fi
+getent() { return 0; }
+
+# SmartDNS: an old [::1] listener is removed on rerun; start-up and health never depend on ::1.
+systemctl() {
+  printf '%s\n' "$*" >>"$d/systemctl.log"
+  [[ "$*" != 'restart smartdns.service' || "${restart_fail:-false}" != true ]]
+}
+dig() {
+  printf '%s\n' "$*" >>"$d/dig.log"
+  case " $* " in
+    *' TXT '*) echo 'status: NXDOMAIN,' ;;
+    *' AAAA '*) echo 2001:db8::1 ;;
+    *) echo 192.0.2.1 ;;
+  esac
+}
+for request in auto dual ipv4; do
+  NETWORK_REQUEST=$request
+  for transport in h2 dns53; do
+    : >"$d/systemctl.log"
+    : >"$d/dig.log"
+    printf 'bind 127.0.0.1:53\nbind [::1]:53\nbind-tcp [::1]:53\n' >"$SMARTDNS_CONF"
+    if [[ "$request" == ipv4 ]]; then
+      dig() {
+        printf '%s\n' "$*" >>"$d/dig.log"
+        case " $* " in
+          *' TXT '*) echo 'status: NXDOMAIN,' ;;
+          *' AAAA '*) : ;;
+          *) echo 192.0.2.1 ;;
+        esac
+      }
+    fi
+    smartdns_try_transport "$transport" "$TMP_DIR/staged.conf" || fail "$request $transport rejected a healthy resolver"
+    if grep -Fq '::1' "$SMARTDNS_CONF"; then fail "$request $transport kept an old ::1 listener"; fi
+    eq 2 "$(grep -c '^bind' "$SMARTDNS_CONF")" "$request $transport listeners"
+    eq 1 "$(grep -c '^restart smartdns.service$' "$d/systemctl.log")" "$request $transport restart count"
+    # Health probes query the local SmartDNS directly, never the resolv.conf fallback.
+    awk '$1 != "@127.0.0.1" { bad=1 } END { exit bad || NR == 0 }' "$d/dig.log" || fail "$request $transport health probe bypassed 127.0.0.1"
+  done
+done
+# A failed start is final: no IPv4-only retry path exists, and the config still has no ::1.
+NETWORK_REQUEST=auto
+: >"$d/systemctl.log"
+restart_fail=true
+if smartdns_try_transport h2 "$TMP_DIR/staged.conf"; then fail 'failed SmartDNS start accepted'; fi
+eq 1 "$(grep -c '^restart smartdns.service$' "$d/systemctl.log")" 'failed start must not retry'
+if grep -Fq '::1' "$SMARTDNS_CONF"; then fail 'failed start left ::1 in config'; fi
+restart_fail=false
+# A dead SmartDNS fails the health gate even though system DNS would still resolve via the fallback.
+dig() { printf '%s\n' "$*" >>"$d/dig.log"; return 1; }
+if smartdns_try_transport h2 "$TMP_DIR/staged.conf"; then fail 'fallback DNS masked a dead SmartDNS'; fi
+
+# Full and SmartDNS-only installs share install_and_configure_smartdns; both end up IPv4-only.
+dig() {
+  case " $* " in
+    *' TXT '*) echo 'status: NXDOMAIN,' ;;
+    *' AAAA '*) echo 2001:db8::1 ;;
+    *) echo 192.0.2.1 ;;
+  esac
+}
+smartdns_pkg_values() { :; }
+install_smartdns_package() { :; }
+configure_smartdns_apt_policy() { :; }
+smartdns() { echo 'smartdns test'; }
+journalctl() { :; }
+id() { echo root; }
+for mode in quick smartdns; do
+  INSTALL_MODE=$mode
+  NETWORK_REQUEST=auto
+  printf 'bind [::1]:53\n' >"$SMARTDNS_CONF"
+  install_and_configure_smartdns
+  if grep -Fq '::1' "$SMARTDNS_CONF"; then fail "$mode install kept ::1"; fi
+  grep -Fxq 'bind-tcp 127.0.0.1:53' "$SMARTDNS_CONF" || fail "$mode install lacks the IPv4 TCP listener"
+done
+TEST
 
 # The Debian entry point can display help without running initialization.
 help_output=$(bash "$REPO_ROOT/debian-init.sh" --help)
