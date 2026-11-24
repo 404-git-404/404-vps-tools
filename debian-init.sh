@@ -1349,6 +1349,8 @@ restore_ipv6_runtime() {
 }
 
 write_ipv6_restore_policy() {
+  # Debian 13 ships its sysctl defaults under /usr/lib; /etc/sysctl.d may not exist yet.
+  [[ -d "${NETWORK_SYSCTL%/*}" ]] || install -d -m 0755 "${NETWORK_SYSCTL%/*}"
   cat >"$NETWORK_SYSCTL" <<EOF
 # Managed by vps-init.sh
 $AUTO_RESTORE_MARK

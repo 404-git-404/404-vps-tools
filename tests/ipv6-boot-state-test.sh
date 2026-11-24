@@ -96,6 +96,8 @@ put() {
 # The fixed network file: take the backup, then register the restore, then allow writes.
 protect_network_sysctl() {
   network_backup=$(mktemp)
+  # Debian 13 may not have /etc/sysctl.d at all: remember to remove it if we end up creating it.
+  [[ -d "${NETWORK_SYSCTL%/*}" ]] || created_dirs+=("${NETWORK_SYSCTL%/*}")
   if [[ -e "$NETWORK_SYSCTL" ]]; then
     network_existed=true
     cat "$NETWORK_SYSCTL" >"$network_backup"
@@ -150,6 +152,7 @@ selftest_term
 [[ ! -e "$NETWORK_SYSCTL" ]] || fail 'termination left the network file behind'
 # A file that already existed keeps its exact content, whatever happens in between.
 fixture=$'# an administrator wrote this\nnet.ipv6.conf.all.accept_ra = 2'
+mkdir -p -- "${NETWORK_SYSCTL%/*}"
 printf '%s\n' "$fixture" >"$NETWORK_SYSCTL"
 selftest_failure
 eq "$fixture" "$(cat "$NETWORK_SYSCTL")" 'failure midway changed the pre-existing network file'

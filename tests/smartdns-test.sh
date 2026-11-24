@@ -904,6 +904,15 @@ eq 仍禁用 "$IPV6_BOOT_RESULT" 'pre-existing file result'
 eq true "$IPV6_FORCE_IPV4" 'pre-existing file forces ipv4'
 for key in all default lo ens18; do eq 1 "$(rt "$key")" "pre-existing file runtime $key"; done
 [[ -f "$BACKUP_DIR/dns/network-sysctl.before-restore" ]] || fail 'no copy of the pre-existing file'
+# Debian 13 has no /etc/sysctl.d until something creates it: the override must still be written.
+reset
+rm -rf "$d/etc"
+answer=1
+auto_flow
+[[ -f "$NETWORK_SYSCTL" ]] || fail 'override not written when the sysctl directory is missing'
+eq "$expected_file" "$(cat "$NETWORK_SYSCTL")" 'override content in a freshly created directory'
+eq 已恢复 "$IPV6_BOOT_RESULT" 'missing directory result'
+
 # Written but not verifiable: never reported as restored.
 reset
 printf 'unknown\n' >"$d/state.fixed"
