@@ -20,7 +20,7 @@ SSH 菜单选项 4（或 `--preserve-ssh`）保留原有 SSH 监听配置、认�
 
 初始化开始前收集 SSH、网络、公钥、监听风险与 Swap 选择，显示摘要并一次确认，之后自动执行。缺少公钥验证工具时仅提前安装 openssh-client。自定义安装提前选择完成基础工具后退出或继续。正式执行仍重新检查端口、公钥、监听和 Swap 状态；状态变化时安全停止或跳过 Swap。
 
-Auto 探测当前 IPv6 连通性，只得出 IPv4 或 Dual，永远不主动禁用 IPv6，保留服务商的 IPv6 配置与 SmartDNS 的 AAAA 应答，并备份迁移本脚本旧版 IPv6 禁用策略。确认前还会扫描 `/etc/sysctl.conf` 与 `sysctl.d` 目录中非脚本管理、重启后仍会关闭 IPv6 的 `disable_ipv6 = 1`，列出文件和行：选 1 备份整个文件后仅注释对应行并按 Dual 处理（`/usr/lib`、`/usr/local/lib`、`/run` 下的文件不改原件，改在 `/etc/sysctl.d` 写同名副本并注释，包升级不会覆盖），选 2 保留并按 IPv4 处理。无交互终端或指定 `--network-stack` 时默认选 2 并警告。显式 IPv4-only 才持久关闭 IPv6，Dual-Stack 则显式启用。SmartDNS 只监听 `127.0.0.1:53`（UDP+TCP），不依赖 `::1`，重跑时清除旧的 IPv6 监听。`/etc/resolv.conf` 写入 `127.0.0.1` 与备用 `1.1.1.1`，SmartDNS 异常时系统仍可解析；SmartDNS 健康检查始终直连 `127.0.0.1`。
+Auto 探测当前 IPv6 连通性，只得出 IPv4 或 Dual，永远不主动禁用 IPv6，保留服务商的 IPv6 配置与 SmartDNS 的 AAAA 应答，并备份迁移本脚本旧版 IPv6 禁用策略。确认前用 `systemd-sysctl` 在临时网络命名空间里计算重启后 `all`/`default` 的 `disable_ipv6`，宿主机不受影响。被关闭时列出相关文件和行：选 1 写入脚本自己的 `/etc/sysctl.d/99-vps-init-network.conf` 覆盖并再次验证，不修改任何原有文件；仍被更靠后的配置关闭则撤销并按 IPv4 处理。选 2 保留并按 IPv4 处理。无交互终端或指定 `--network-stack` 时默认选 2 并警告；缺少 `unshare`/`systemd-sysctl` 或运行受限时无法判断，只警告。已知限制：具体网卡名的 `disable_ipv6` 无法判断。报告分别显示“重启后 IPv6”和“当前探测”。显式 IPv4-only 才持久关闭 IPv6，Dual-Stack 则显式启用。SmartDNS 只监听 `127.0.0.1:53`（UDP+TCP），不依赖 `::1`，重跑时清除旧的 IPv6 监听。`/etc/resolv.conf` 写入 `127.0.0.1` 与备用 `1.1.1.1`，SmartDNS 异常时系统仍可解析；SmartDNS 健康检查始终直连 `127.0.0.1`。
 
 Dual-Stack（含 Auto 检测为双栈）补充通用 IPv4 UFW 规则的 IPv6 对应项，保留动作、方向、TCP/UDP、端口范围及注释；跳过已有项，保留冲突的 IPv6 策略并警告。地址/CIDR、源端口、接口、应用、路由和 LIMIT 等复杂规则跳过并记录原因。IPv4-only 先加载并精准清理 IPv6 规则，再设 `IPV6=no` 并 reload；Auto 探测失败保留现有 IPv6 规则及开关。保留 SSH 模式不修改 UFW。
 
