@@ -4,7 +4,12 @@ set -Eeuo pipefail
 repo=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 work=$(mktemp -d)
 # Redirect menu presentation only; test doubles supply all terminal replies.
-sed "s|/dev/tty|$work/tty|g" "$repo/debian-init.sh" >"$work/installer"
+# Also keep sysctl scanning and edits inside the work directory.
+sed -e "s|/dev/tty|$work/tty|g" \
+  -e "s|^readonly -a SYSCTL_SCAN_DIRS=.*|readonly -a SYSCTL_SCAN_DIRS=('$work/sysctl.d')|" \
+  -e "s|^readonly SYSCTL_CONF=.*|readonly SYSCTL_CONF='$work/sysctl.conf'|" \
+  "$repo/debian-init.sh" >"$work/installer"
+mkdir -p "$work/sysctl.d"
 # shellcheck disable=SC1091
 source "$work/installer"
 trap - ERR HUP INT TERM
@@ -65,7 +70,7 @@ for scenario in port22 default custom-port preserve reuse missing-keygen existin
       esac
     }
     # Hermetic by default; the stray-* scenarios expose one unmanaged disable_ipv6 file.
-    stray_file="$work/stray-$scenario.conf"
+    stray_file="$work/sysctl.d/stray-$scenario.conf"
     printf '# vendor
 net.ipv6.conf.all.disable_ipv6 = 1
 net.ipv6.conf.all.accept_ra = 2

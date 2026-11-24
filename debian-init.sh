@@ -133,6 +133,7 @@ declare -a IPV6_PROBE_CHANGED=()
 declare -a STRAY_IPV6_LINES=()
 declare -a STRAY_IPV6_FILES=()
 declare -a STRAY_IPV6_CHANGED_FILES=()
+declare -a STRAY_IPV6_CREATED_FILES=()
 declare -a FAIL2BAN_MANAGED_FILES=(
   jail.d/00-vps-init-defaults.local
   jail.d/vps-init-sshd.local
@@ -1202,6 +1203,7 @@ detect_network_stack() {
 
 sysctl_policy_files() {
   # Files that can re-apply disable_ipv6 at boot and are not owned by this script.
+  # Prints the path as systemd-sysctl sees it, not the resolved target.
   local dir path real
   local -A seen_names=() seen_real=()
   for dir in "${SYSCTL_SCAN_DIRS[@]}"; do
@@ -1216,11 +1218,11 @@ sysctl_policy_files() {
       seen_real[$real]=1
       if managed_ipv6_policy "$real"; then continue; fi
       if [[ "$path" == "$LEGACY_IPV6_SYSCTL" ]] && legacy_ipv6_sysctl_managed; then continue; fi
-      printf '%s\n' "$real"
+      printf '%s\n' "$path"
     done
   done
   real=$(readlink -f -- "$SYSCTL_CONF" 2>/dev/null) || return 0
-  if [[ -f "$real" && -z "${seen_real[$real]+x}" ]]; then printf '%s\n' "$real"; fi
+  if [[ -f "$real" && -z "${seen_real[$real]+x}" ]]; then printf '%s\n' "$SYSCTL_CONF"; fi
 }
 
 stray_ipv6_disable_line_numbers() {
@@ -1261,7 +1263,7 @@ collect_stray_ipv6_policy() {
   for line in "${STRAY_IPV6_LINES[@]}"; do printf '  %s\n' "$line" >&2; done
   if [[ "$NETWORK_REQUEST_SET" == false ]] && tty_available; then
     while true; do
-      read_tty $'\n1. 备份整个文件后仅注释上述行，按 Dual-Stack 处理（仅当 Auto 判定为 dual 时修改）\n2. 保留，Auto 按 IPv4 处理（默认）\n请选择 [1-2]: ' choice
+      read_tty $'\n1. 备份整个文件后仅注释上述行（/etc 之外的文件改为在 /etc/sysctl.d 写同名副本），按 Dual-Stack 处理（仅当 Auto 判定为 dual 时修改）\n2. 保留，Auto 按 IPv4 处理（默认）\n请选择 [1-2]: ' choice
       case "${choice:-2}" in
         1) STRAY_IPV6_ACTION=comment; break ;;
         2) STRAY_IPV6_ACTION=keep; break ;;
@@ -1274,29 +1276,55 @@ collect_stray_ipv6_policy() {
   fi
 }
 
+# Only /etc is ours to edit. Anything from a vendor or runtime directory is
+# overridden by a same-named copy in /etc/sysctl.d, which systemd-sysctl prefers
+# and package upgrades leave alone.
 comment_stray_ipv6_files() {
-  local file number backup
+  local file target real number backup
   local -a numbers=() sed_args=()
   [[ -n "$BACKUP_DIR" && -n "$TMP_DIR" ]] || die '备份或临时目录未初始化，拒绝修改 sysctl 配置。'
   for file in "${STRAY_IPV6_FILES[@]}"; do
-    [[ -f "$file" && ! -L "$file" ]] || continue
+    [[ -f "$file" ]] || continue
     mapfile -t numbers < <(stray_ipv6_disable_line_numbers "$file")
     (( ${#numbers[@]} )) || continue
-    # make_mutable keeps a full copy of the file before the first change.
-    make_mutable "$file"
-    backup="$BACKUP_DIR/files$file"
-    [[ -f "$backup" ]] || die "无法备份 $file。"
-    STRAY_IPV6_CHANGED_FILES+=("$file")
     sed_args=()
     for number in "${numbers[@]}"; do sed_args+=(-e "${number}s/^/# Disabled by vps-init.sh: /"); done
-    sed "${sed_args[@]}" "$file" >"$TMP_DIR/sysctl-stray" || die "无法处理 $file。"
-    cat "$TMP_DIR/sysctl-stray" >"$file"
-    log "已注释 $file 中 ${#numbers[@]} 行 disable_ipv6=1；完整备份=$backup"
+    if [[ "$file" == "$SYSCTL_CONF" || "${file%/*}" == "${SYSCTL_SCAN_DIRS[0]}" ]]; then
+      # A link out of /etc would let us edit a package file in place; leave it to the final check.
+      real=$(readlink -f -- "$file") || continue
+      if [[ -L "$file" && "$real" != "$(readlink -f -- "$SYSCTL_CONF")" && "${real%/*}" != "$(readlink -f -- "${SYSCTL_SCAN_DIRS[0]}")" ]]; then
+        warn "$file 是指向 /etc 之外的链接，不直接修改。"
+        continue
+      fi
+      # make_mutable keeps a full copy of the file before the first change.
+      make_mutable "$real"
+      backup="$BACKUP_DIR/files$real"
+      [[ -f "$backup" ]] || die "无法备份 $real。"
+      STRAY_IPV6_CHANGED_FILES+=("$real")
+      sed "${sed_args[@]}" "$real" >"$TMP_DIR/sysctl-stray" || die "无法处理 $real。"
+      cat "$TMP_DIR/sysctl-stray" >"$real"
+      log "已注释 $real 中 ${#numbers[@]} 行 disable_ipv6=1；完整备份=$backup"
+    else
+      target="${SYSCTL_SCAN_DIRS[0]}/${file##*/}"
+      if [[ -e "$target" || -L "$target" ]]; then
+        warn "$target 已存在，不覆盖；$file 需手动处理。"
+        continue
+      fi
+      install -d -m 0755 "${SYSCTL_SCAN_DIRS[0]}"
+      sed "${sed_args[@]}" "$file" >"$TMP_DIR/sysctl-stray" || die "无法处理 $file。"
+      STRAY_IPV6_CREATED_FILES+=("$target")
+      install -m 0644 "$TMP_DIR/sysctl-stray" "$target"
+      log "已在 $target 写入 $file 的副本并注释 ${#numbers[@]} 行 disable_ipv6=1（同名屏蔽，原文件未改）"
+    fi
   done
 }
 
 restore_stray_ipv6_files() {
   local file
+  for file in "${STRAY_IPV6_CREATED_FILES[@]}"; do
+    rm -f -- "$file" || warn "无法删除 $file"
+  done
+  STRAY_IPV6_CREATED_FILES=()
   for file in "${STRAY_IPV6_CHANGED_FILES[@]}"; do
     if [[ -f "$BACKUP_DIR/files$file" ]]; then
       cat "$BACKUP_DIR/files$file" >"$file" || warn "无法恢复 $file"

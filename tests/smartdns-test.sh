@@ -636,7 +636,12 @@ warn() { printf '%s\n' "$*" >>"$d/warn.log"; }
 # Keep the test independent of host attribute tools and chmod behavior.
 lsattr() { :; }
 chattr() { :; }
-install() { [[ "$1" == -d ]] && mkdir -p -- "${@: -1}"; }
+install() {
+  case "$1" in
+    -d) mkdir -p -- "${@: -1}" ;;
+    *) cp -- "${@: -2:1}" "${@: -1}" ;;
+  esac
+}
 
 fixtures() {
   rm -rf "$d/etc" "$d/usr" "$d/run" "$d/backup" "$d/tmp" "$d/orig" "$d/warn.log"
@@ -644,27 +649,35 @@ fixtures() {
   BACKUP_DIR="$d/backup"
   TMP_DIR="$d/tmp"
   : >"$d/warn.log"
+  STRAY_IPV6_CHANGED_FILES=()
+  STRAY_IPV6_CREATED_FILES=()
   printf '%s\n' '# legacy' 'net.ipv6.conf.all.disable_ipv6 = 1' 'net.ipv6.conf.default.disable_ipv6=1' '  net.ipv6.conf.lo.disable_ipv6 = 1' 'net.ipv6.conf.all.accept_ra = 2' >"$d/etc/sysctl.d/99-disable-ipv6.conf"
   printf '%s\n' 'net.ipv6.icmp.echo_ignore_all = 1' 'net/ipv6/conf/eth0/disable_ipv6 = 1' >"$d/etc/sysctl.d/99-disable-ping-ipv6.conf"
   printf '%s\n' '#net.ipv6.conf.all.disable_ipv6 = 1' 'net.ipv6.conf.all.disable_ipv6 = 0' 'net.ipv4.ip_forward = 0' >"$d/etc/sysctl.conf"
   printf '%s\n' '# Managed by vps-init.sh' 'net.ipv6.conf.all.disable_ipv6 = 1' >"$d/etc/sysctl.d/99-vps-init-network.conf"
   printf '%s\n' 'net.ipv6.conf.all.disable_ipv6 = 1' >"$d/usr/lib/sysctl.d/50-masked.conf"
   printf '%s\n' 'net.ipv4.ip_forward = 0' >"$d/etc/sysctl.d/50-masked.conf"
-  printf '%s\n' 'net.ipv6.conf.all.disable_ipv6 = 1' >"$d/usr/lib/sysctl.d/60-vendor.conf"
+  printf '%s\n' '# vendor defaults' 'net.ipv6.conf.all.disable_ipv6 = 1' 'net.ipv6.conf.all.accept_ra = 2' >"$d/usr/lib/sysctl.d/60-vendor.conf"
+  printf '%s\n' 'net.ipv6.conf.default.disable_ipv6 = 1' >"$d/run/sysctl.d/70-run.conf"
+  printf '%s\n' 'net.ipv4.ip_forward = 0' 'net.ipv6.conf.lo.disable_ipv6=1' >"$d/usr/local/lib/sysctl.d/71-local.conf"
   local f
-  for f in etc/sysctl.conf etc/sysctl.d/99-disable-ipv6.conf etc/sysctl.d/99-disable-ping-ipv6.conf etc/sysctl.d/99-vps-init-network.conf etc/sysctl.d/50-masked.conf usr/lib/sysctl.d/50-masked.conf usr/lib/sysctl.d/60-vendor.conf; do
+  for f in $VENDOR_FILES etc/sysctl.conf etc/sysctl.d/99-disable-ipv6.conf etc/sysctl.d/99-disable-ping-ipv6.conf etc/sysctl.d/99-vps-init-network.conf etc/sysctl.d/50-masked.conf usr/lib/sysctl.d/50-masked.conf; do
     mkdir -p "$d/orig/${f%/*}"
     cp -- "$d/$f" "$d/orig/$f"
   done
 }
+VENDOR_FILES='usr/lib/sysctl.d/60-vendor.conf run/sysctl.d/70-run.conf usr/local/lib/sysctl.d/71-local.conf'
 unchanged() { cmp -s "$d/orig/$1" "$d/$1" || fail "$1 was modified"; }
-count_marker() { cat "$d"/etc/sysctl.conf "$d"/etc/sysctl.d/*.conf "$d"/usr/lib/sysctl.d/*.conf | grep -c '^# Disabled by vps-init.sh: ' || true; }
+# Markers are only ever written under /etc; vendor and runtime files must stay at zero.
+count_marker() { cat "$d"/etc/sysctl.conf "$d"/etc/sysctl.d/*.conf | grep -c '^# Disabled by vps-init.sh: ' || true; }
+count_vendor_marker() { cat "$d"/usr/lib/sysctl.d/*.conf "$d"/run/sysctl.d/*.conf "$d"/usr/local/lib/sysctl.d/*.conf | grep -c '^# Disabled by vps-init.sh: ' || true; }
 
 NETWORK_REQUEST=auto
 NETWORK_REQUEST_SET=false
 BASE_ONLY=false
 STRAY_IPV6_ACTION=''
 STRAY_IPV6_CHANGED_FILES=()
+STRAY_IPV6_CREATED_FILES=()
 tty_available() { return 0; }
 read_tty() { printf -v "$2" '%s' "$answer"; asked=$((asked + 1)); }
 
@@ -676,13 +689,15 @@ expected=$(printf '%s\n' \
   "$d/etc/sysctl.d/99-disable-ipv6.conf:3: net.ipv6.conf.default.disable_ipv6=1" \
   "$d/etc/sysctl.d/99-disable-ipv6.conf:4:   net.ipv6.conf.lo.disable_ipv6 = 1" \
   "$d/etc/sysctl.d/99-disable-ping-ipv6.conf:2: net/ipv6/conf/eth0/disable_ipv6 = 1" \
-  "$d/usr/lib/sysctl.d/60-vendor.conf:1: net.ipv6.conf.all.disable_ipv6 = 1")
+  "$d/run/sysctl.d/70-run.conf:1: net.ipv6.conf.default.disable_ipv6 = 1" \
+  "$d/usr/local/lib/sysctl.d/71-local.conf:2: net.ipv6.conf.lo.disable_ipv6=1" \
+  "$d/usr/lib/sysctl.d/60-vendor.conf:2: net.ipv6.conf.all.disable_ipv6 = 1")
 eq "$expected" "$(printf '%s\n' "${STRAY_IPV6_LINES[@]}")" 'detected lines'
-eq 3 "${#STRAY_IPV6_FILES[@]}" 'detected files'
+eq 5 "${#STRAY_IPV6_FILES[@]}" 'detected files'
 # The legacy file written by this script's older versions is migrated by Auto, not reported.
 printf '%s\n' '# Managed by vps-init.sh' 'net.ipv6.conf.all.disable_ipv6 = 1' >"$d/etc/sysctl.d/99-disable-ipv6.conf"
 scan_stray_ipv6_disable
-eq 2 "${#STRAY_IPV6_FILES[@]}" 'script-managed legacy file reported'
+eq 4 "${#STRAY_IPV6_FILES[@]}" 'script-managed legacy file reported'
 
 # Prompt and defaults: [1] comment, [2] keep, Enter keeps; invalid answers re-ask.
 fixtures
@@ -733,25 +748,45 @@ eq $'# legacy\n# Disabled by vps-init.sh: net.ipv6.conf.all.disable_ipv6 = 1\n# 
   "$(cat "$d/etc/sysctl.d/99-disable-ipv6.conf")" 'commented legacy file'
 eq $'net.ipv6.icmp.echo_ignore_all = 1\n# Disabled by vps-init.sh: net/ipv6/conf/eth0/disable_ipv6 = 1' \
   "$(cat "$d/etc/sysctl.d/99-disable-ping-ipv6.conf")" 'commented ping file'
-for f in etc/sysctl.d/99-disable-ipv6.conf etc/sysctl.d/99-disable-ping-ipv6.conf usr/lib/sysctl.d/60-vendor.conf; do
+for f in etc/sysctl.d/99-disable-ipv6.conf etc/sysctl.d/99-disable-ping-ipv6.conf; do
   cmp -s "$d/orig/$f" "$BACKUP_DIR/files$d/$f" || fail "missing full backup of $f"
 done
-for f in etc/sysctl.conf etc/sysctl.d/99-vps-init-network.conf etc/sysctl.d/50-masked.conf usr/lib/sysctl.d/50-masked.conf; do unchanged "$f"; done
-eq 5 "$(count_marker)" 'commented line count'
+# Files outside /etc are never edited; a commented same-named copy in /etc/sysctl.d masks them.
+for f in $VENDOR_FILES etc/sysctl.conf etc/sysctl.d/99-vps-init-network.conf etc/sysctl.d/50-masked.conf usr/lib/sysctl.d/50-masked.conf; do unchanged "$f"; done
+eq 0 "$(count_vendor_marker)" 'vendor files were edited'
+eq $'# vendor defaults\n# Disabled by vps-init.sh: net.ipv6.conf.all.disable_ipv6 = 1\nnet.ipv6.conf.all.accept_ra = 2' \
+  "$(cat "$d/etc/sysctl.d/60-vendor.conf")" 'vendor override copy'
+eq '# Disabled by vps-init.sh: net.ipv6.conf.default.disable_ipv6 = 1' "$(cat "$d/etc/sysctl.d/70-run.conf")" 'run override copy'
+eq $'net.ipv4.ip_forward = 0\n# Disabled by vps-init.sh: net.ipv6.conf.lo.disable_ipv6=1' "$(cat "$d/etc/sysctl.d/71-local.conf")" 'local override copy'
+eq 3 "${#STRAY_IPV6_CREATED_FILES[@]}" 'created override count'
+eq 2 "${#STRAY_IPV6_CHANGED_FILES[@]}" 'edited /etc file count'
+eq 7 "$(count_marker)" 'commented line count'
 scan_stray_ipv6_disable
 eq 0 "${#STRAY_IPV6_LINES[@]}" 'strays remain after commenting'
 # Re-running (fresh scan, then a stale list) neither duplicates nor re-comments anything.
-snapshot=$(cat "$d"/etc/sysctl.d/*.conf "$d"/usr/lib/sysctl.d/*.conf)
+snapshot=$(cat "$d"/etc/sysctl.d/*.conf)
+file_count=$(find "$d/etc/sysctl.d" -type f | wc -l)
 collect_stray_ipv6_policy
 eq '' "$STRAY_IPV6_ACTION" 'second run finds nothing'
-STRAY_IPV6_FILES=("$d/etc/sysctl.d/99-disable-ipv6.conf" "$d/etc/sysctl.d/99-disable-ping-ipv6.conf" "$d/usr/lib/sysctl.d/60-vendor.conf")
+STRAY_IPV6_FILES=("$d/etc/sysctl.d/99-disable-ipv6.conf" "$d/etc/sysctl.d/99-disable-ping-ipv6.conf" "$d/usr/lib/sysctl.d/60-vendor.conf" "$d/run/sysctl.d/70-run.conf" "$d/usr/local/lib/sysctl.d/71-local.conf")
 comment_stray_ipv6_files
-eq "$snapshot" "$(cat "$d"/etc/sysctl.d/*.conf "$d"/usr/lib/sysctl.d/*.conf)" 'rerun changed files'
-eq 5 "$(count_marker)" 'rerun duplicated comments'
-# Rollback restores the original bytes.
-STRAY_IPV6_CHANGED_FILES=("$d/etc/sysctl.d/99-disable-ipv6.conf" "$d/etc/sysctl.d/99-disable-ping-ipv6.conf" "$d/usr/lib/sysctl.d/60-vendor.conf")
+eq "$snapshot" "$(cat "$d"/etc/sysctl.d/*.conf)" 'rerun changed files'
+eq 7 "$(count_marker)" 'rerun duplicated comments'
+eq "$file_count" "$(find "$d/etc/sysctl.d" -type f | wc -l)" 'rerun created extra files'
+eq 3 "${#STRAY_IPV6_CREATED_FILES[@]}" 'rerun recorded extra overrides'
+# Rollback removes the new overrides and restores the original bytes of edited /etc files.
 restore_stray_ipv6_files
-for f in etc/sysctl.d/99-disable-ipv6.conf etc/sysctl.d/99-disable-ping-ipv6.conf usr/lib/sysctl.d/60-vendor.conf; do unchanged "$f"; done
+for f in $VENDOR_FILES etc/sysctl.d/99-disable-ipv6.conf etc/sysctl.d/99-disable-ping-ipv6.conf; do unchanged "$f"; done
+for f in 60-vendor 70-run 71-local; do [[ ! -e "$d/etc/sysctl.d/$f.conf" ]] || fail "rollback kept override $f"; done
+eq 00 "${#STRAY_IPV6_CREATED_FILES[@]}${#STRAY_IPV6_CHANGED_FILES[@]}" 'rollback state not cleared'
+# An existing same-named file in /etc is never overwritten.
+fixtures
+collect_stray_ipv6_policy
+printf '%s\n' 'custom = 1' >"$d/etc/sysctl.d/70-run.conf"
+NETWORK_STACK=dual
+apply_stray_ipv6_policy
+eq 'custom = 1' "$(cat "$d/etc/sysctl.d/70-run.conf")" 'existing same-named file overwritten'
+unchanged run/sysctl.d/70-run.conf
 
 # [2] with a dual probe: nothing is edited and the stack reflects the post-reboot state.
 fixtures
@@ -761,8 +796,9 @@ NETWORK_STACK=dual
 apply_stray_ipv6_policy
 eq ipv4 "$NETWORK_STACK" 'keep must follow post-reboot ipv4'
 grep -Fq '按 ipv4 处理' "$d/warn.log" || fail 'missing keep warning'
-for f in etc/sysctl.d/99-disable-ipv6.conf etc/sysctl.d/99-disable-ping-ipv6.conf usr/lib/sysctl.d/60-vendor.conf; do unchanged "$f"; done
+for f in $VENDOR_FILES etc/sysctl.d/99-disable-ipv6.conf etc/sysctl.d/99-disable-ping-ipv6.conf; do unchanged "$f"; done
 eq 0 "$(count_marker)" 'keep edited files'
+eq 0 "${#STRAY_IPV6_CREATED_FILES[@]}" 'keep created overrides'
 
 # An ipv4 probe result needs no change under either choice.
 for answer in 1 2; do
