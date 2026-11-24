@@ -630,6 +630,8 @@ state_is 'all=1 default=0' 0 off
 state_is 'all=0 default=1' 0 off
 state_is 'all=1 default=1' 0 off
 state_is 'all=0 default=0' 3 unknown
+# systemd-sysctl itself failing inside the namespace (the script exits 4) is never read as on.
+state_is 'all=0 default=0' 4 unknown
 state_is 'nonsense' 0 unknown
 state_is '' 0 unknown
 eq unknown "$(MOCK_NO_UNSHARE=true ipv6_boot_state)" 'missing unshare'
@@ -888,6 +890,59 @@ eq 已恢复 "$IPV6_BOOT_RESULT" 'configuration stays restored'
 eq ipv4 "$IPV6_PROBE_RESULT" 'probe reported separately'
 grep -Fq '网络服务重新初始化' "$d/warn.log" || fail 'missing late-address hint'
 [[ -f "$NETWORK_SYSCTL" ]] || fail 'failed probe removed the configuration fix'
+
+# A failed attempt restores a pre-existing override file instead of deleting it.
+reset
+existing=$'# Managed by vps-init.sh\n# IPv6 restored by Auto: overrides unmanaged disable_ipv6 settings\n# from an earlier run\nnet.ipv6.conf.all.disable_ipv6 = 0\nnet.ipv6.conf.default.disable_ipv6 = 0'
+printf '%s\n' "$existing" >"$NETWORK_SYSCTL"
+printf 'off\n' >"$d/state.fixed"
+IPV6_RESTORE_CHOICE=restore
+apply_network_stack
+apply_ipv6_boot_policy
+eq "$existing" "$(cat "$NETWORK_SYSCTL")" 'pre-existing override file was changed or removed by a failed attempt'
+eq 仍禁用 "$IPV6_BOOT_RESULT" 'pre-existing file result'
+eq true "$IPV6_FORCE_IPV4" 'pre-existing file forces ipv4'
+for key in all default lo ens18; do eq 1 "$(rt "$key")" "pre-existing file runtime $key"; done
+[[ -f "$BACKUP_DIR/dns/network-sysctl.before-restore" ]] || fail 'no copy of the pre-existing file'
+# Written but not verifiable: never reported as restored.
+reset
+printf 'unknown\n' >"$d/state.fixed"
+IPV6_RESTORE_CHOICE=restore
+apply_ipv6_boot_policy
+eq "$expected_file" "$(cat "$NETWORK_SYSCTL")" 'unverified override file is kept'
+eq '已写入、未验证' "$IPV6_BOOT_RESULT" 'unverified result'
+eq false "$IPV6_RESTORED" 'unverified must not count as restored'
+eq false "$IPV6_FORCE_IPV4" 'unverified does not force ipv4'
+grep -Fq '不能确认 IPv6 已恢复' "$d/warn.log" || fail 'missing unverified warning'
+IPV6_BOOT_LINES=("$d/etc/99-user-ipv6.conf: net.ipv6.conf.all.disable_ipv6 = 1")
+NETWORK_STACK=dual
+finalize_ipv6_stack
+eq dual "$NETWORK_STACK" 'unverified with a working probe'
+report=$(ipv6_report_lines)
+[[ "$report" != *'已恢复'* ]] || fail "unverified report says restored: $report"
+[[ "$report" != *'已被脚本配置覆盖'* ]] || fail "unverified report claims an override: $report"
+grep -Fq '已写入、未验证' <<<"$report" || fail "report lacks the unverified state: $report"
+NETWORK_STACK=ipv4
+: >"$d/warn.log"
+finalize_ipv6_stack
+grep -Fq '覆盖文件已写入但未验证' "$d/warn.log" || fail 'missing unverified probe hint'
+if grep -Fq 'IPv6 已恢复' "$d/warn.log"; then fail 'unverified probe hint says restored'; fi
+eq ipv4 "$NETWORK_STACK" 'unverified with a failed probe'
+
+# The listing is a list of related configuration, not of effective values.
+reset
+answer=1
+auto_flow
+report=$(ipv6_report_lines)
+grep -Fq '相关配置（不一定都是最终生效值）' <<<"$report" || fail "report wording: $report"
+reset
+collect_ipv6_boot_policy
+grep -Fq '相关配置（不一定都是最终生效值）' "$d/warn.log" || fail 'collection wording'
+reset
+printf 'off\n' >"$d/state.fixed"
+IPV6_RESTORE_CHOICE=restore
+apply_ipv6_boot_policy
+grep -Fq '相关配置（不一定都是最终生效值）' "$d/warn.log" || fail 'revert wording'
 TEST
 
 # resolv.conf, SmartDNS rerun and the independence from host IPv6.
@@ -908,7 +963,7 @@ IFS=$' \t\n'
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
 eq() { [[ "$1" == "$2" ]] || fail "$3: expected [$1], got [$2]"; }
 log() { :; }
-warn() { :; }
+warn() { printf '%s\n' "$*" >>"$d/warn.log"; }
 BACKUP_DIR="$d/backup"
 TMP_DIR="$d/tmp"
 mkdir -p "$BACKUP_DIR" "$TMP_DIR" "$d/smartdns-etc"
@@ -1044,6 +1099,50 @@ dns_failure() {
 }
 dns_failure existing
 dns_failure missing
+
+# "resolv.conf did not exist" only licenses removing what this run wrote, unchanged.
+fresh_backup() {
+  rm -rf "$BACKUP_DIR"
+  mkdir -p "$BACKUP_DIR"
+  rm -f -- "$d/resolv.conf"
+  : >"$d/warn.log"
+}
+# (a) written by this run and untouched: removed.
+fresh_backup
+(
+  RESOLV_WRITTEN_SHA=''
+  backup_dns_state
+  DNS_TX=true
+  configure_system_dns
+  DNS_TX=true
+  rollback_dns
+) >/dev/null 2>&1
+[[ ! -e "$d/resolv.conf" ]] || fail 'our own resolv.conf was not removed'
+# (b) the run failed before writing; a file created meanwhile by a user or service stays.
+fresh_backup
+(
+  RESOLV_WRITTEN_SHA=''
+  backup_dns_state
+  printf 'nameserver 8.8.4.4\n' >"$d/resolv.conf"
+  DNS_TX=true
+  rollback_dns
+) >/dev/null 2>&1
+eq 'nameserver 8.8.4.4' "$(cat "$d/resolv.conf")" 'foreign resolv.conf created before our write was removed'
+grep -Fq '已保留' "$d/warn.log" || fail 'missing keep warning (before write)'
+# (c) written by this run, then replaced by someone else: stays.
+fresh_backup
+(
+  RESOLV_WRITTEN_SHA=''
+  backup_dns_state
+  DNS_TX=true
+  configure_system_dns
+  printf 'nameserver 9.9.9.9\n' >"$d/resolv.conf"
+  DNS_TX=true
+  rollback_dns
+) >/dev/null 2>&1
+eq 'nameserver 9.9.9.9' "$(cat "$d/resolv.conf")" 'replaced resolv.conf was removed'
+grep -Fq '已保留' "$d/warn.log" || fail 'missing keep warning (after replacement)'
+rm -f -- "$d/resolv.conf"
 
 # Transport order: DoH first, UDP/TCP 53 next, and a complete failure rolls back.
 TRACE="$d/transport.trace"

@@ -84,6 +84,7 @@ IPV6_BOOT_STATE='unknown'
 IPV6_RESTORE_CHOICE=''
 IPV6_BOOT_RESULT=''
 IPV6_RESTORED=false
+IPV6_WRITTEN_UNVERIFIED=false
 IPV6_FORCE_IPV4=false
 IPV6_PROBE_RESULT=''
 IPV6_OLD_ALL=''
@@ -121,6 +122,7 @@ SWAP_RECOMMENDED_MIB=0
 SWAP_REUSE_FILE=false
 SWAPFILE_SNAPSHOT=''
 PERSIST_RESOLV_IMMUTABLE=false
+RESOLV_WRITTEN_SHA=''
 IPV6_OLD_DEFAULT=''
 declare -A IPV6_OLD_INTERFACES=()
 NETWORK_POLICY_CHANGED=false
@@ -323,8 +325,14 @@ rollback_dns() {
     rm -f /etc/resolv.conf
     ln -s "$(readlink "$BACKUP_DIR/dns/resolv.conf.symlink")" /etc/resolv.conf 2>/dev/null || true
   elif [[ -e "$BACKUP_DIR/dns/no-resolv-conf" ]]; then
-    # resolv.conf did not exist before this run; do not leave ours behind.
-    rm -f -- /etc/resolv.conf
+    # resolv.conf did not exist before this run. Remove only what this run wrote and that
+    # is still byte-identical; anything a user or another service created since stays.
+    if [[ -n "$RESOLV_WRITTEN_SHA" && -f /etc/resolv.conf && ! -L /etc/resolv.conf ]] &&
+      [[ "$(sha256sum /etc/resolv.conf | awk '{print $1}')" == "$RESOLV_WRITTEN_SHA" ]]; then
+      rm -f -- /etc/resolv.conf
+    elif [[ -e /etc/resolv.conf || -L /etc/resolv.conf ]]; then
+      warn '/etc/resolv.conf 原本不存在，但现在的内容不是本脚本写入的，已保留。'
+    fi
   elif [[ -e "$BACKUP_DIR/dns/resolv.conf" ]]; then
     if mountpoint -q /etc/resolv.conf 2>/dev/null; then
       cat "$BACKUP_DIR/dns/resolv.conf" >/etc/resolv.conf || true
@@ -1235,7 +1243,7 @@ for k in all default; do
   echo 0 >"$base/$k/disable_ipv6" || exit 3
   [ "$(cat "$base/$k/disable_ipv6")" = 0 ] || exit 3
 done
-"$1" --prefix=net.ipv6.conf >/dev/null 2>&1 || :
+"$1" --prefix=net.ipv6.conf >/dev/null 2>&1 || exit 4
 printf "all=%s default=%s\n" "$(cat "$base/all/disable_ipv6")" "$(cat "$base/default/disable_ipv6")"
 '
   if ! ipv6_kernel_present; then printf 'kernel-off\n'; return 0; fi
@@ -1299,7 +1307,7 @@ collect_ipv6_boot_policy() {
       warn '内核层面已禁用 IPv6（/proc/sys/net/ipv6 不存在）；按 ipv4 处理。'
       return 0 ;;
   esac
-  warn '重启后 IPv6 会被现有 sysctl 配置关闭（只判断 all/default；具体网卡名的设置无法判断）：'
+  warn '重启后 IPv6 会被现有 sysctl 配置关闭（只判断 all/default；具体网卡名的设置无法判断）。相关配置（不一定都是最终生效值）：'
   while IFS= read -r line; do
     IPV6_BOOT_LINES+=("$line")
     printf '  %s\n' "$line" >&2
@@ -1353,7 +1361,7 @@ EOF
 
 # Writes the script's own override and proves with systemd-sysctl that it wins.
 restore_ipv6_boot_policy() {
-  local scope out state line
+  local scope out state line before=''
   if [[ -e "$NETWORK_SYSCTL" || -L "$NETWORK_SYSCTL" ]] && ! managed_ipv6_policy "$NETWORK_SYSCTL"; then
     warn "$NETWORK_SYSCTL 已变为非脚本管理的文件，不覆盖；保留，按 ipv4 处理。"
     IPV6_BOOT_RESULT='仍禁用'
@@ -1362,6 +1370,12 @@ restore_ipv6_boot_policy() {
   fi
   if [[ "$NETWORK_POLICY_CHANGED" != true ]]; then backup_network_policy; fi
   IPV6_OLD_ALL=$(sysctl -n net.ipv6.conf.all.disable_ipv6 2>/dev/null || true)
+  # A file left by an earlier run must survive a failed attempt: keep a copy before writing.
+  if [[ -f "$NETWORK_SYSCTL" ]]; then
+    before="$BACKUP_DIR/dns/network-sysctl.before-restore"
+    install -d -m 0700 "$BACKUP_DIR/dns"
+    cp -a -- "$NETWORK_SYSCTL" "$before"
+  fi
   make_mutable "$NETWORK_SYSCTL"
   write_ipv6_restore_policy
   for scope in all default lo; do
@@ -1377,16 +1391,21 @@ restore_ipv6_boot_policy() {
       IPV6_RESTORED=true
       log "已写入 $NETWORK_SYSCTL；重启后 IPv6 不再被关闭，原有文件未修改。" ;;
     unknown)
-      IPV6_BOOT_RESULT='无法判断'
-      IPV6_RESTORED=true
-      warn "已写入 $NETWORK_SYSCTL，但无法用 systemd-sysctl 验证效果。" ;;
+      IPV6_BOOT_RESULT='已写入、未验证'
+      IPV6_WRITTEN_UNVERIFIED=true
+      warn "已写入 $NETWORK_SYSCTL，但无法用 systemd-sysctl 验证效果；不能确认 IPv6 已恢复，重启后请核对。" ;;
     *)
       # A later file still wins: undo our change and fall back to ipv4.
-      rm -f -- "$NETWORK_SYSCTL"
+      # Restore what was there before; only a file created by this attempt is removed.
+      if [[ -n "$before" ]]; then
+        cat "$before" >"$NETWORK_SYSCTL"
+      else
+        rm -f -- "$NETWORK_SYSCTL"
+      fi
       restore_ipv6_runtime
       IPV6_BOOT_RESULT='仍禁用'
       IPV6_FORCE_IPV4=true
-      warn '脚本的覆盖文件没有生效（有排序更靠后的配置覆盖了它），已撤销；这些设置未被修改：'
+      warn '脚本的覆盖文件没有生效（有排序更靠后的配置覆盖了它），已撤销；相关配置（不一定都是最终生效值），均未被修改：'
       while IFS= read -r line; do printf '  %s\n' "$line" >&2; done < <(ipv6_boot_disable_lines)
       warn '保留，按 ipv4 处理。' ;;
   esac
@@ -1398,6 +1417,7 @@ apply_ipv6_boot_policy() {
   local state
   IPV6_FORCE_IPV4=false
   IPV6_RESTORED=false
+  IPV6_WRITTEN_UNVERIFIED=false
   IPV6_BOOT_RESULT=''
   [[ "$NETWORK_REQUEST" == auto ]] || return 0
   if [[ "$IPV6_RESTORE_CHOICE" == restore ]]; then
@@ -1424,6 +1444,8 @@ finalize_ipv6_stack() {
   IPV6_PROBE_RESULT=$NETWORK_STACK
   if [[ "$IPV6_RESTORED" == true && "$NETWORK_STACK" == ipv4 ]]; then
     warn 'IPv6 已恢复但当前探测未通过：本次按 ipv4 处理；IPv6 地址可能要等网络服务重新初始化或重启后才出现。'
+  elif [[ "$IPV6_WRITTEN_UNVERIFIED" == true && "$NETWORK_STACK" == ipv4 ]]; then
+    warn 'IPv6 覆盖文件已写入但未验证，且当前探测未通过：本次按 ipv4 处理；重启后请核对 IPv6 状态。'
   fi
   if [[ "$IPV6_FORCE_IPV4" == true && "$NETWORK_STACK" == dual ]]; then
     NETWORK_STACK=ipv4
@@ -1435,8 +1457,11 @@ ipv6_report_lines() {
   local line
   [[ -n "$IPV6_BOOT_RESULT" ]] || return 0
   printf '重启后 IPv6 : %s\n当前探测     : %s\n' "$IPV6_BOOT_RESULT" "${IPV6_PROBE_RESULT:-未探测}"
+  if [[ "$IPV6_WRITTEN_UNVERIFIED" == true ]]; then
+    printf '覆盖文件     : 已写入 %s，效果未验证\n' "$NETWORK_SYSCTL"
+  fi
   if [[ "$IPV6_RESTORED" == true && ${#IPV6_BOOT_LINES[@]} -gt 0 ]]; then
-    printf '已被脚本配置覆盖（%s），原文件未修改：\n' "$NETWORK_SYSCTL"
+    printf '已被脚本配置覆盖（%s）。相关配置（不一定都是最终生效值），原文件未修改：\n' "$NETWORK_SYSCTL"
     for line in "${IPV6_BOOT_LINES[@]}"; do printf '  %s\n' "$line"; done
   fi
 }
@@ -2234,6 +2259,7 @@ configure_system_dns() {
   else
     rm -f /etc/resolv.conf
     install -m 0644 "$staged" /etc/resolv.conf
+    RESOLV_WRITTEN_SHA=$(sha256sum "$staged" | awk '{print $1}')
     if command -v chattr >/dev/null 2>&1; then
       if chattr +i /etc/resolv.conf 2>/dev/null; then
         PERSIST_RESOLV_IMMUTABLE=true
