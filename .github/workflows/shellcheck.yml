@@ -36,6 +36,7 @@ jobs:
             tests/ufw-sync-test.sh
             tests/system-update-test.sh
             tests/init-flow-test.sh
+            tests/ipv6-boot-state-test.sh
             tests/qemu-guest-agent-test.sh
             tests/ci-workflow-test.sh
             .github/scripts/ci-fetch.sh
@@ -61,6 +62,7 @@ jobs:
             tests/ufw-sync-test.sh \
             tests/system-update-test.sh \
             tests/init-flow-test.sh \
+            tests/ipv6-boot-state-test.sh \
             tests/qemu-guest-agent-test.sh \
             tests/ci-workflow-test.sh; do
             test -x "$executable_script"
@@ -150,6 +152,21 @@ jobs:
       - name: Verify real Swap activation on the runner VM
         run: sudo bash tests/swap-test.sh --kernel
 
+      - name: Verify boot-time IPv6 state with the real systemd-sysctl
+        run: sudo bash tests/ipv6-boot-state-test.sh --require
+
+      - name: Verify boot-time IPv6 state on Debian 12 and 13 (systemd 252 and 257)
+        run: |
+          for debian_version in 12 13; do
+            docker run --rm --privileged --volume "$PWD:/repo:ro" "debian:$debian_version" \
+              bash -Eeuo pipefail -c '
+                export DEBIAN_FRONTEND=noninteractive
+                apt-get update -qq
+                apt-get install -y -qq --no-install-recommends systemd util-linux >/dev/null
+                /usr/lib/systemd/systemd-sysctl --version | head -1
+                bash /repo/tests/ipv6-boot-state-test.sh --require'
+          done
+
       - name: Run Debian and Alpine containers
         run: |
           bash tests/gg-status-container-test.sh
@@ -177,6 +194,7 @@ jobs:
             tests/ufw-sync-test.sh \
             tests/system-update-test.sh \
             tests/init-flow-test.sh \
+            tests/ipv6-boot-state-test.sh \
             tests/qemu-guest-agent-test.sh \
             tests/ci-workflow-test.sh \
             .github/scripts/ci-fetch.sh \

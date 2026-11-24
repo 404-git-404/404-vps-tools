@@ -50,6 +50,9 @@ readonly MIN_ROOT_FREE_KIB=$((2 * 1024 * 1024))
 readonly LEGACY_NETWORK_UNIT='/etc/systemd/system/404-network-stack.service'
 readonly LEGACY_NETWORK_HELPER='/usr/local/libexec/404-network-stack'
 readonly LEGACY_IPV6_SYSCTL='/etc/sysctl.d/99-disable-ipv6.conf'
+readonly FALLBACK_DNS='1.1.1.1'
+# Second line of the network sysctl file written when the user chooses to restore IPv6.
+readonly AUTO_RESTORE_MARK='# IPv6 restored by Auto: overrides unmanaged disable_ipv6 settings'
 
 CURRENT_STEP='启动'
 TMP_DIR=''
@@ -77,6 +80,14 @@ SINGBOX_RUNTIME_MASK=false
 NETWORK_REQUEST='auto'
 NETWORK_REQUEST_SET=false
 NETWORK_STACK='unknown'
+IPV6_BOOT_STATE='unknown'
+IPV6_RESTORE_CHOICE=''
+IPV6_BOOT_RESULT=''
+IPV6_RESTORED=false
+IPV6_WRITTEN_UNVERIFIED=false
+IPV6_FORCE_IPV4=false
+IPV6_PROBE_RESULT=''
+IPV6_OLD_ALL=''
 SING_BOX_VERSION=''
 PUBKEY_ARGUMENT=''
 PUBKEY_FILE=''
@@ -111,6 +122,7 @@ SWAP_RECOMMENDED_MIB=0
 SWAP_REUSE_FILE=false
 SWAPFILE_SNAPSHOT=''
 PERSIST_RESOLV_IMMUTABLE=false
+RESOLV_WRITTEN_SHA=''
 IPV6_OLD_DEFAULT=''
 declare -A IPV6_OLD_INTERFACES=()
 NETWORK_POLICY_CHANGED=false
@@ -124,6 +136,7 @@ LEGACY_NETWORK_WAS_ENABLED=false
 # Files whose i/a attributes were temporarily cleared. Values are original lsattr flags.
 declare -A ORIGINAL_ATTRS=()
 declare -a IPV6_PROBE_CHANGED=()
+declare -a IPV6_BOOT_LINES=()
 declare -a FAIL2BAN_MANAGED_FILES=(
   jail.d/00-vps-init-defaults.local
   jail.d/vps-init-sshd.local
@@ -150,9 +163,11 @@ usage() {
   - SSH 公钥提示可直接回车，查看指纹并确认复用已有公钥
   - 低内存且无合适 Swap 时才询问是否创建推荐 Swap
   - 快速安装默认只监听 SSH 53651，可改选 22 或自定义单端口
-  - Auto 探测当前 IPv6 连通性，失败时仍保留 IPv6 和 DNS AAAA 能力
+  - Auto 探测当前 IPv6 连通性，只得出 ipv4 或 dual，永远不主动禁用 IPv6
+  - Auto 在确认前用 systemd-sysctl 计算重启后 IPv6 是否被关闭；可写入脚本自己的覆盖文件恢复，或保留并按 ipv4 处理
   - 仅显式选择 ipv4 才持久禁用 IPv6，dual 则显式启用
-  - SmartDNS 自动选择 IPv4-only 或 IPv4+IPv6；优先 DoH（H2），失败自动回退 UDP/TCP 53
+  - SmartDNS 仅监听 127.0.0.1:53（UDP+TCP）；优先 DoH（H2），失败自动回退 UDP/TCP 53
+  - /etc/resolv.conf 使用 127.0.0.1，备用 1.1.1.1，SmartDNS 异常时系统仍可解析
   - 443/tcp + 443/udp 默认开放
   - Cloudflare 8443 默认不启用，使用 --cloudflare-8443 显式启用
 
@@ -309,6 +324,15 @@ rollback_dns() {
   if [[ -L "$BACKUP_DIR/dns/resolv.conf.symlink" ]]; then
     rm -f /etc/resolv.conf
     ln -s "$(readlink "$BACKUP_DIR/dns/resolv.conf.symlink")" /etc/resolv.conf 2>/dev/null || true
+  elif [[ -e "$BACKUP_DIR/dns/no-resolv-conf" ]]; then
+    # resolv.conf did not exist before this run. Remove only what this run wrote and that
+    # is still byte-identical; anything a user or another service created since stays.
+    if [[ -n "$RESOLV_WRITTEN_SHA" && -f /etc/resolv.conf && ! -L /etc/resolv.conf ]] &&
+      [[ "$(sha256sum /etc/resolv.conf | awk '{print $1}')" == "$RESOLV_WRITTEN_SHA" ]]; then
+      rm -f -- /etc/resolv.conf
+    elif [[ -e /etc/resolv.conf || -L /etc/resolv.conf ]]; then
+      warn '/etc/resolv.conf 原本不存在，但现在的内容不是本脚本写入的，已保留。'
+    fi
   elif [[ -e "$BACKUP_DIR/dns/resolv.conf" ]]; then
     if mountpoint -q /etc/resolv.conf 2>/dev/null; then
       cat "$BACKUP_DIR/dns/resolv.conf" >/etc/resolv.conf || true
@@ -1188,6 +1212,262 @@ detect_network_stack() {
   log "网络模式：$NETWORK_STACK（请求：$NETWORK_REQUEST）"
 }
 
+tty_available() {
+  [[ -r /dev/tty && -w /dev/tty ]]
+}
+
+systemd_sysctl_path() {
+  local path
+  for path in /usr/lib/systemd/systemd-sysctl /lib/systemd/systemd-sysctl; do
+    if [[ -x "$path" ]]; then printf '%s\n' "$path"; return 0; fi
+  done
+  return 1
+}
+
+ipv6_kernel_present() {
+  [[ -d /proc/sys/net/ipv6 ]]
+}
+
+# What would a reboot leave in net.ipv6.conf.{all,default}.disable_ipv6?
+# systemd-sysctl itself evaluates the real configuration (all search paths,
+# masking, wildcards, ordering) inside a throw-away network namespace, so the
+# host is never touched. Prints on, off, kernel-off or unknown.
+# Interface-specific keys have no device in the namespace and cannot be judged;
+# lo is irrelevant because nothing here depends on ::1.
+ipv6_boot_state() {
+  local tool out inner
+  # shellcheck disable=SC2016 # Evaluated by sh inside the namespace, not here.
+  inner='
+base=/proc/sys/net/ipv6/conf
+for k in all default; do
+  echo 0 >"$base/$k/disable_ipv6" || exit 3
+  [ "$(cat "$base/$k/disable_ipv6")" = 0 ] || exit 3
+done
+"$1" --prefix=net.ipv6.conf >/dev/null 2>&1 || exit 4
+printf "all=%s default=%s\n" "$(cat "$base/all/disable_ipv6")" "$(cat "$base/default/disable_ipv6")"
+'
+  if ! ipv6_kernel_present; then printf 'kernel-off\n'; return 0; fi
+  if ! command -v unshare >/dev/null 2>&1 || ! tool=$(systemd_sysctl_path); then printf 'unknown\n'; return 0; fi
+  if ! out=$(unshare --net -- sh -c "$inner" _ "$tool" 2>/dev/null); then printf 'unknown\n'; return 0; fi
+  if [[ "$out" =~ ^all=([01])\ default=([01])$ ]]; then
+    if [[ "${BASH_REMATCH[1]}${BASH_REMATCH[2]}" == 00 ]]; then printf 'on\n'; else printf 'off\n'; fi
+  else
+    printf 'unknown\n'
+  fi
+}
+
+# Display only: the settings systemd-sysctl would apply, as "file: line". Never used for decisions.
+ipv6_boot_disable_lines() {
+  local tool
+  tool=$(systemd_sysctl_path) || return 0
+  "$tool" --cat-config 2>/dev/null | awk '
+    /^# \// { file = substr($0, 3); next }
+    /^[[:space:]]*[#;]/ { next }
+    /disable_ipv6[[:space:]]*=[[:space:]]*1/ { printf "%s: %s\n", file, $0 }
+  ' || true
+}
+
+auto_restore_policy_file() {
+  managed_ipv6_policy "$1" && grep -Fxq "$AUTO_RESTORE_MARK" "$1"
+}
+
+# Policy files that Auto removes while migrating this script's older versions.
+# The file written for "restore IPv6" must survive later Auto runs.
+migratable_ipv6_policy() {
+  managed_ipv6_policy "$1" || return 1
+  if [[ "$NETWORK_REQUEST" == auto ]] && auto_restore_policy_file "$1"; then return 1; fi
+  return 0
+}
+
+# Older managed settings that Auto removes later also show up in the boot state,
+# so a check made before that migration cannot be trusted.
+auto_will_migrate_ipv6_policy() {
+  if migratable_ipv6_policy "$NETWORK_SYSCTL" && grep -Eq 'disable_ipv6[[:space:]]*=[[:space:]]*1' "$NETWORK_SYSCTL"; then return 0; fi
+  legacy_ipv6_sysctl_managed
+}
+
+# Runs while choices are collected so the answer is part of the single confirmation.
+collect_ipv6_boot_policy() {
+  local line choice=''
+  IPV6_BOOT_STATE='unknown'
+  IPV6_RESTORE_CHOICE=''
+  IPV6_BOOT_LINES=()
+  [[ "$NETWORK_REQUEST" == auto && "$BASE_ONLY" == false ]] || return 0
+  if auto_will_migrate_ipv6_policy; then
+    IPV6_BOOT_STATE='pending'
+    return 0
+  fi
+  IPV6_BOOT_STATE=$(ipv6_boot_state)
+  case "$IPV6_BOOT_STATE" in
+    on) return 0 ;;
+    unknown)
+      warn '无法判断重启后的 IPv6 状态（缺少 unshare/systemd-sysctl 或运行受限）；按探测结果继续。'
+      return 0 ;;
+    kernel-off)
+      warn '内核层面已禁用 IPv6（/proc/sys/net/ipv6 不存在）；按 ipv4 处理。'
+      return 0 ;;
+  esac
+  warn '重启后 IPv6 会被现有 sysctl 配置关闭（只判断 all/default；具体网卡名的设置无法判断）。相关配置（不一定都是最终生效值）：'
+  while IFS= read -r line; do
+    IPV6_BOOT_LINES+=("$line")
+    printf '  %s\n' "$line" >&2
+  done < <(ipv6_boot_disable_lines)
+  if [[ -e "$NETWORK_SYSCTL" || -L "$NETWORK_SYSCTL" ]] && ! managed_ipv6_policy "$NETWORK_SYSCTL"; then
+    IPV6_RESTORE_CHOICE=keep
+    warn "$NETWORK_SYSCTL 不是脚本管理的文件，无法用脚本覆盖；保留，Auto 按 IPv4 处理。"
+    return 0
+  fi
+  if [[ "$NETWORK_REQUEST_SET" == false ]] && tty_available; then
+    while true; do
+      read_tty $'\n1. 恢复 IPv6：写入脚本管理的 /etc/sysctl.d/99-vps-init-network.conf 覆盖上述设置（不修改原有文件）\n2. 保留，Auto 按 IPv4 处理（默认）\n请选择 [1-2]: ' choice
+      case "${choice:-2}" in
+        1) IPV6_RESTORE_CHOICE=restore; break ;;
+        2) IPV6_RESTORE_CHOICE=keep; break ;;
+        *) warn '无效选择。' ;;
+      esac
+    done
+  else
+    IPV6_RESTORE_CHOICE=keep
+    warn '无交互选择：默认保留这些设置，Auto 按 IPv4 处理。'
+  fi
+}
+
+restore_ipv6_runtime() {
+  local key value
+  if [[ "$IPV6_OLD_ALL" =~ ^[01]$ ]]; then
+    sysctl -q -w "net.ipv6.conf.all.disable_ipv6=$IPV6_OLD_ALL" >/dev/null 2>&1 || warn '无法恢复 net.ipv6.conf.all.disable_ipv6'
+  fi
+  if [[ "$IPV6_OLD_DEFAULT" =~ ^[01]$ ]]; then
+    sysctl -q -w "net.ipv6.conf.default.disable_ipv6=$IPV6_OLD_DEFAULT" >/dev/null 2>&1 || true
+  fi
+  for key in "${!IPV6_OLD_INTERFACES[@]}"; do
+    value=${IPV6_OLD_INTERFACES[$key]}
+    if [[ "$(sysctl -n "$key" 2>/dev/null)" != "$value" ]]; then
+      sysctl -q -w "$key=$value" >/dev/null 2>&1 || warn "无法恢复 $key"
+    fi
+  done
+}
+
+write_ipv6_restore_policy() {
+  # Debian 13 ships its sysctl defaults under /usr/lib; /etc/sysctl.d may not exist yet.
+  [[ -d "${NETWORK_SYSCTL%/*}" ]] || install -d -m 0755 "${NETWORK_SYSCTL%/*}"
+  cat >"$NETWORK_SYSCTL" <<EOF
+# Managed by vps-init.sh
+$AUTO_RESTORE_MARK
+net.ipv6.conf.all.disable_ipv6 = 0
+net.ipv6.conf.default.disable_ipv6 = 0
+net.ipv6.conf.lo.disable_ipv6 = 0
+EOF
+  chmod 0644 "$NETWORK_SYSCTL"
+}
+
+# Writes the script's own override and proves with systemd-sysctl that it wins.
+restore_ipv6_boot_policy() {
+  local scope out state line before=''
+  if [[ -e "$NETWORK_SYSCTL" || -L "$NETWORK_SYSCTL" ]] && ! managed_ipv6_policy "$NETWORK_SYSCTL"; then
+    warn "$NETWORK_SYSCTL 已变为非脚本管理的文件，不覆盖；保留，按 ipv4 处理。"
+    IPV6_BOOT_RESULT='仍禁用'
+    IPV6_FORCE_IPV4=true
+    return 0
+  fi
+  if [[ "$NETWORK_POLICY_CHANGED" != true ]]; then backup_network_policy; fi
+  IPV6_OLD_ALL=$(sysctl -n net.ipv6.conf.all.disable_ipv6 2>/dev/null || true)
+  # A file left by an earlier run must survive a failed attempt: keep a copy before writing.
+  if [[ -f "$NETWORK_SYSCTL" ]]; then
+    before="$BACKUP_DIR/dns/network-sysctl.before-restore"
+    install -d -m 0700 "$BACKUP_DIR/dns"
+    cp -a -- "$NETWORK_SYSCTL" "$before"
+  fi
+  make_mutable "$NETWORK_SYSCTL"
+  write_ipv6_restore_policy
+  for scope in all default lo; do
+    if ! out=$(sysctl -w "net.ipv6.conf.$scope.disable_ipv6=0" 2>&1); then
+      warn "恢复 IPv6 运行时开关失败（$scope）：$out"
+    fi
+  done
+  sleep 3
+  state=$(ipv6_boot_state)
+  case "$state" in
+    on)
+      IPV6_BOOT_RESULT='已恢复'
+      IPV6_RESTORED=true
+      log "已写入 $NETWORK_SYSCTL；重启后 IPv6 不再被关闭，原有文件未修改。" ;;
+    unknown)
+      IPV6_BOOT_RESULT='已写入、未验证'
+      IPV6_WRITTEN_UNVERIFIED=true
+      warn "已写入 $NETWORK_SYSCTL，但无法用 systemd-sysctl 验证效果；不能确认 IPv6 已恢复，重启后请核对。" ;;
+    *)
+      # A later file still wins: undo our change and fall back to ipv4.
+      # Restore what was there before; only a file created by this attempt is removed.
+      if [[ -n "$before" ]]; then
+        cat "$before" >"$NETWORK_SYSCTL"
+      else
+        rm -f -- "$NETWORK_SYSCTL"
+      fi
+      restore_ipv6_runtime
+      IPV6_BOOT_RESULT='仍禁用'
+      IPV6_FORCE_IPV4=true
+      warn '脚本的覆盖文件没有生效（有排序更靠后的配置覆盖了它），已撤销；相关配置（不一定都是最终生效值），均未被修改：'
+      while IFS= read -r line; do printf '  %s\n' "$line" >&2; done < <(ipv6_boot_disable_lines)
+      warn '保留，按 ipv4 处理。' ;;
+  esac
+}
+
+# After migrating this script's older policy files: look again, never change files silently.
+apply_ipv6_boot_policy() {
+  CURRENT_STEP='复查重启后 IPv6'
+  local state
+  IPV6_FORCE_IPV4=false
+  IPV6_RESTORED=false
+  IPV6_WRITTEN_UNVERIFIED=false
+  IPV6_BOOT_RESULT=''
+  [[ "$NETWORK_REQUEST" == auto ]] || return 0
+  if [[ "$IPV6_RESTORE_CHOICE" == restore ]]; then
+    restore_ipv6_boot_policy
+    return 0
+  fi
+  state=$(ipv6_boot_state)
+  case "$state" in
+    on) IPV6_BOOT_RESULT='无需处理' ;;
+    unknown) IPV6_BOOT_RESULT='无法判断' ;;
+    kernel-off)
+      IPV6_BOOT_RESULT='仍禁用（内核已禁用）'
+      IPV6_FORCE_IPV4=true ;;
+    *)
+      IPV6_BOOT_RESULT='仍禁用'
+      IPV6_FORCE_IPV4=true
+      warn '重启后 IPv6 会被现有 sysctl 配置关闭；未选择恢复，不改动任何文件，按 ipv4 处理。' ;;
+  esac
+}
+
+# After the connectivity probe: configuration and probing are reported separately.
+finalize_ipv6_stack() {
+  [[ "$NETWORK_REQUEST" == auto ]] || return 0
+  IPV6_PROBE_RESULT=$NETWORK_STACK
+  if [[ "$IPV6_RESTORED" == true && "$NETWORK_STACK" == ipv4 ]]; then
+    warn 'IPv6 已恢复但当前探测未通过：本次按 ipv4 处理；IPv6 地址可能要等网络服务重新初始化或重启后才出现。'
+  elif [[ "$IPV6_WRITTEN_UNVERIFIED" == true && "$NETWORK_STACK" == ipv4 ]]; then
+    warn 'IPv6 覆盖文件已写入但未验证，且当前探测未通过：本次按 ipv4 处理；重启后请核对 IPv6 状态。'
+  fi
+  if [[ "$IPV6_FORCE_IPV4" == true && "$NETWORK_STACK" == dual ]]; then
+    NETWORK_STACK=ipv4
+    warn '重启后 IPv6 仍会被关闭，网络栈按 ipv4 处理。'
+  fi
+}
+
+ipv6_report_lines() {
+  local line
+  [[ -n "$IPV6_BOOT_RESULT" ]] || return 0
+  printf '重启后 IPv6 : %s\n当前探测     : %s\n' "$IPV6_BOOT_RESULT" "${IPV6_PROBE_RESULT:-未探测}"
+  if [[ "$IPV6_WRITTEN_UNVERIFIED" == true ]]; then
+    printf '覆盖文件     : 已写入 %s，效果未验证\n' "$NETWORK_SYSCTL"
+  fi
+  if [[ "$IPV6_RESTORED" == true && ${#IPV6_BOOT_LINES[@]} -gt 0 ]]; then
+    printf '已被脚本配置覆盖（%s）。相关配置（不一定都是最终生效值），原文件未修改：\n' "$NETWORK_SYSCTL"
+    for line in "${IPV6_BOOT_LINES[@]}"; do printf '  %s\n' "$line"; done
+  fi
+}
+
 managed_ipv6_policy() {
   [[ -f "$1" && ! -L "$1" ]] || return 1
   awk '
@@ -1377,7 +1657,7 @@ backup_network_policy() {
 }
 
 rollback_network_policy() {
-  local key value path saved reload=false
+  local path saved reload=false
   if managed_ipv4_policy_file "$IPV4_POLICY_TIMER"; then
     systemctl disable --now "${IPV4_POLICY_TIMER##*/}" || warn "无法停止 $IPV4_POLICY_TIMER"
     systemctl stop "${IPV4_POLICY_SERVICE##*/}" || warn "无法停止 $IPV4_POLICY_SERVICE"
@@ -1399,15 +1679,7 @@ rollback_network_policy() {
   else
     rm -f -- "$NETWORK_SYSCTL" || warn "无法移除 $NETWORK_SYSCTL"
   fi
-  if [[ "$IPV6_OLD_DEFAULT" =~ ^[01]$ ]]; then
-    sysctl -q -w "net.ipv6.conf.default.disable_ipv6=$IPV6_OLD_DEFAULT" >/dev/null 2>&1 || true
-  fi
-  for key in "${!IPV6_OLD_INTERFACES[@]}"; do
-    value=${IPV6_OLD_INTERFACES[$key]}
-    if [[ "$(sysctl -n "$key" 2>/dev/null)" != "$value" ]]; then
-      sysctl -q -w "$key=$value" >/dev/null 2>&1 || warn "无法恢复 $key"
-    fi
-  done
+  restore_ipv6_runtime
   if [[ "$reload" == true ]]; then
     systemctl daemon-reload || warn '无法重载 systemd 配置。'
     if [[ "$IPV4_TIMER_WAS_ENABLED" == true ]]; then systemctl enable "${IPV4_POLICY_TIMER##*/}" || warn "无法启用 $IPV4_POLICY_TIMER"; fi
@@ -1434,7 +1706,7 @@ apply_network_stack() {
     warn "保留非脚本管理的 $NETWORK_SYSCTL"
   fi
   if [[ "$NETWORK_REQUEST" == auto ]]; then
-    [[ "$had_policy" == true ]] || managed_ipv6_policy "$NETWORK_SYSCTL" ||
+    [[ "$had_policy" == true ]] || migratable_ipv6_policy "$NETWORK_SYSCTL" ||
       legacy_ipv6_unit_managed || legacy_ipv6_sysctl_managed || return 0
   fi
   backup_network_policy
@@ -1447,7 +1719,7 @@ apply_network_stack() {
   if managed_ipv4_policy_file "$IPV4_POLICY_SERVICE"; then
     systemctl stop "${IPV4_POLICY_SERVICE##*/}"
   fi
-  if managed_ipv6_policy "$NETWORK_SYSCTL"; then
+  if migratable_ipv6_policy "$NETWORK_SYSCTL"; then
     if grep -Eq 'disable_ipv6[[:space:]]*=[[:space:]]*1[[:space:]]*$' "$NETWORK_SYSCTL"; then restore_runtime=true; fi
     make_mutable "$NETWORK_SYSCTL"
     rm -f -- "$NETWORK_SYSCTL"
@@ -1733,6 +2005,8 @@ backup_dns_state() {
     ln -s "$(readlink /etc/resolv.conf)" "$BACKUP_DIR/dns/resolv.conf.symlink"
   elif [[ -e /etc/resolv.conf ]]; then
     cp -a /etc/resolv.conf "$BACKUP_DIR/dns/resolv.conf"
+  else
+    touch "$BACKUP_DIR/dns/no-resolv-conf"
   fi
   systemctl is-active --quiet smartdns.service 2>/dev/null && SMARTDNS_OLD_ACTIVE=true || SMARTDNS_OLD_ACTIVE=false
   systemctl is-enabled --quiet smartdns.service 2>/dev/null && SMARTDNS_OLD_ENABLED=true || SMARTDNS_OLD_ENABLED=false
@@ -1741,18 +2015,13 @@ backup_dns_state() {
 }
 
 write_smartdns_config() {
-  local out=$1 transport=${2:-h2} listeners=${3:-auto} aaaa_soa=no
+  local out=$1 transport=${2:-h2} aaaa_soa=no
+  # Listen on IPv4 loopback only: it exists regardless of any later disable_ipv6 policy.
+  if [[ "$NETWORK_REQUEST" == ipv4 ]]; then aaaa_soa=yes; fi
   {
-    cat <<'EOF'
+    cat <<EOF
 bind 127.0.0.1:53
 bind-tcp 127.0.0.1:53
-EOF
-    if [[ "$NETWORK_REQUEST" == ipv4 ]]; then
-      aaaa_soa=yes
-    elif [[ "$listeners" == auto ]] && ipv6_loopback_available; then
-      printf '%s\n' 'bind [::1]:53' 'bind-tcp [::1]:53'
-    fi
-    cat <<EOF
 
 cache-persist yes
 cache-file /var/cache/smartdns/smartdns.cache
@@ -1805,11 +2074,6 @@ EOF
   esac
 }
 
-ipv6_loopback_available() {
-  ip -6 addr show dev lo up 2>/dev/null |
-    awk '$1 == "inet6" && $2 == "::1/128" && !/ (tentative|dadfailed)( |$)/ { found=1 } END { exit !found }'
-}
-
 smartdns_health_check() {
   local a='' aaaa='' tcp_a='' upstream=''
   # Use a fresh name so persistent or expired cache entries cannot pass the upstream check.
@@ -1835,13 +2099,7 @@ smartdns_try_transport() {
   make_mutable "$SMARTDNS_CONF"
   install -m 0644 "$staged" "$SMARTDNS_CONF" || return 1
 
-  if ! systemctl restart smartdns.service >/dev/null 2>&1; then
-    grep -Fxq 'bind [::1]:53' "$staged" || return 1
-    warn 'SmartDNS 双监听启动失败，保留 A/AAAA 并重试 IPv4 监听。'
-    write_smartdns_config "$staged" "$transport" ipv4-listener || return 1
-    install -m 0644 "$staged" "$SMARTDNS_CONF" || return 1
-    systemctl restart smartdns.service >/dev/null 2>&1 || return 1
-  fi
+  systemctl restart smartdns.service >/dev/null 2>&1 || return 1
   sleep 2
   systemctl is-active --quiet smartdns.service || return 1
   smartdns_health_check
@@ -1991,10 +2249,8 @@ rollback_legacy_network_stack() {
 configure_system_dns() {
   CURRENT_STEP='固定系统 DNS'
   local staged="$TMP_DIR/resolv.conf"
-  cat >"$staged" <<'EOF'
-nameserver 127.0.0.1
-options timeout:2 attempts:2
-EOF
+  # SmartDNS first; the fallback keeps the host resolvable if SmartDNS stops.
+  printf 'nameserver 127.0.0.1\nnameserver %s\noptions timeout:2 attempts:2\n' "$FALLBACK_DNS" >"$staged"
   make_mutable /etc/resolv.conf
   if mountpoint -q /etc/resolv.conf 2>/dev/null; then
     if cp "$staged" /etc/resolv.conf 2>/dev/null; then
@@ -2005,6 +2261,7 @@ EOF
   else
     rm -f /etc/resolv.conf
     install -m 0644 "$staged" /etc/resolv.conf
+    RESOLV_WRITTEN_SHA=$(sha256sum "$staged" | awk '{print $1}')
     if command -v chattr >/dev/null 2>&1; then
       if chattr +i /etc/resolv.conf 2>/dev/null; then
         PERSIST_RESOLV_IMMUTABLE=true
@@ -2829,6 +3086,9 @@ SSH 实际监听  : ${ssh_listeners:-未检测到}$(if [[ "$PRESERVE_SSH" == tru
 UFW           : $(ufw status 2>/dev/null | sed -n '1p' || echo unavailable)
 SmartDNS      : $(smartdns -v 2>/dev/null | head -1 || echo unavailable)
 SmartDNS 模式 : $([[ "$NETWORK_REQUEST" == ipv4 ]] && echo 'A only' || echo 'A + AAAA') / $SMARTDNS_TRANSPORT
+SmartDNS 监听 : 127.0.0.1:53（UDP+TCP）
+备用 DNS      : $FALLBACK_DNS（resolv.conf 第二个 nameserver）
+$(ipv6_report_lines)
 sing-box      : $(sing-box version 2>/dev/null | head -1 || echo unavailable)
 Fail2ban      : $fail2ban_status
 TCP / qdisc   : $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo unavailable) / $(sysctl -n net.core.default_qdisc 2>/dev/null || echo unavailable)
@@ -2922,6 +3182,7 @@ collect_initialization_config() {
       check_ssh_change_prerequisites
       confirm_ssh_listener_change
     fi
+    collect_ipv6_boot_policy
   fi
   collect_swap_choice
   print_initialization_summary
@@ -2943,6 +3204,17 @@ print_initialization_summary() {
   if [[ "$INSTALL_MODE" == quick || "$INSTALL_MODE" == custom ]]; then
     if [[ "$REMOVE_QEMU_GUEST_AGENT" == true ]]; then qemu_guest_agent='已安装则卸载'; fi
     printf 'QEMU Guest Agent：%s\n' "$qemu_guest_agent"
+  fi
+  if [[ "$NETWORK_REQUEST" == auto && "$BASE_ONLY" == false ]]; then
+    case "$IPV6_BOOT_STATE:$IPV6_RESTORE_CHOICE" in
+      off:restore) printf '重启后 IPv6：将被现有配置关闭；选择恢复，写入 %s 覆盖，不改原文件\n' "$NETWORK_SYSCTL" ;;
+      off:keep) printf '重启后 IPv6：将被现有配置关闭；保留，Auto 按 ipv4 处理\n' ;;
+      kernel-off:*) printf '重启后 IPv6：内核已禁用，按 ipv4 处理\n' ;;
+      pending:*) printf '重启后 IPv6：迁移脚本旧策略后复查\n' ;;
+    esac
+  fi
+  if [[ "$BASE_ONLY" == false ]]; then
+    printf 'DNS：SmartDNS 仅监听 127.0.0.1:53；resolv.conf 备用 %s\n' "$FALLBACK_DNS"
   fi
 }
 
@@ -3384,7 +3656,9 @@ main() {
   DNS_TX=true
   apply_network_stack
   cleanup_legacy_network_stack
+  apply_ipv6_boot_policy
   detect_network_stack
+  finalize_ipv6_stack
   install_and_configure_smartdns
   configure_system_dns
   configure_ssh

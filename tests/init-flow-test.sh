@@ -4,14 +4,23 @@ set -Eeuo pipefail
 repo=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 work=$(mktemp -d)
 # Redirect menu presentation only; test doubles supply all terminal replies.
-sed "s|/dev/tty|$work/tty|g" "$repo/debian-init.sh" >"$work/installer"
+# Policy files the flow may read or write stay inside the work directory.
+sed -e "s|/dev/tty|$work/tty|g" \
+  -e "s|^readonly NETWORK_SYSCTL=.*|readonly NETWORK_SYSCTL='$work/network.conf'|" \
+  -e "s|^readonly LEGACY_IPV6_SYSCTL=.*|readonly LEGACY_IPV6_SYSCTL='$work/legacy.conf'|" \
+  -e "s|^readonly LEGACY_NETWORK_UNIT=.*|readonly LEGACY_NETWORK_UNIT='$work/legacy.service'|" \
+  -e "s|^readonly IPV4_POLICY_HELPER=.*|readonly IPV4_POLICY_HELPER='$work/ipv4-helper'|" \
+  -e "s|^readonly IPV4_POLICY_SERVICE=.*|readonly IPV4_POLICY_SERVICE='$work/ipv4.service'|" \
+  -e "s|^readonly IPV4_POLICY_TIMER=.*|readonly IPV4_POLICY_TIMER='$work/ipv4.timer'|" \
+  -e "s|^readonly IPV4_POLICY_IFUP=.*|readonly IPV4_POLICY_IFUP='$work/ipv4-ifup'|" \
+  "$repo/debian-init.sh" >"$work/installer"
 # shellcheck disable=SC1091
 source "$work/installer"
 trap - ERR HUP INT TERM
 trap 'rm -rf -- "$work"' EXIT
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
-for scenario in port22 default custom-port preserve reuse missing-keygen existing-swap no-swap low-memory multi multi-cancel ipv6-guard cancel custom-full custom-base custom-remove cli base; do
+for scenario in port22 default custom-port preserve reuse missing-keygen existing-swap no-swap low-memory multi multi-cancel ipv6-guard cancel custom-full custom-base custom-remove cli base ipv6-restore ipv6-keep; do
   trace="$work/$scenario.trace"
   : >"$trace"
   set +e
@@ -45,6 +54,7 @@ for scenario in port22 default custom-port preserve reuse missing-keygen existin
           case "$scenario" in port22) printf -v "$2" 1;; custom-port) printf -v "$2" 3;; preserve|ipv6-guard) printf -v "$2" 4;; *) printf -v "$2" 2;; esac ;;
         '输入 SSH 端口: '|'SSH 端口 '*) printf -v "$2" 43210 ;;
         '保留 SSH 22/tcp'*) printf -v "$2" n ;;
+        *'恢复 IPv6'*) if [[ "$scenario" == ipv6-restore ]]; then printf -v "$2" 1; else printf -v "$2" ''; fi ;;
         *'请选择网络模式'*)
           case "$scenario" in ipv6-guard) printf -v "$2" 2;; custom-port) printf -v "$2" 3;; *) printf -v "$2" 1;; esac ;;
         'SSH key') printf -v "$2" fixture-key ;;
@@ -63,6 +73,28 @@ for scenario in port22 default custom-port preserve reuse missing-keygen existin
         *) fail "unexpected question: $1" ;;
       esac
     }
+    # Hermetic by default. The ipv6-* scenarios model a boot-time disable_ipv6=1 that the
+    # script's own override file (all = 0) beats, as systemd-sysctl would decide.
+    ipv6_boot_state() {
+      if [[ "$scenario" == ipv6-* ]]; then
+        if [[ -f "$NETWORK_SYSCTL" ]] && grep -Fxq 'net.ipv6.conf.all.disable_ipv6 = 0' "$NETWORK_SYSCTL"; then echo on; else echo off; fi
+      else
+        echo on
+      fi
+    }
+    ipv6_boot_disable_lines() { echo '/usr/lib/sysctl.d/50-fixture.conf: net.ipv6.conf.all.disable_ipv6 = 1'; }
+    rm -f -- "$NETWORK_SYSCTL"
+    ipv6_probe_keys() { :; }
+    sysctl() { :; }
+    sleep() { :; }
+    tty_available() { return 0; }
+    # Directory creation only (make_mutable backups); avoids host-specific chmod behavior.
+    install() { [[ "$1" == -d ]] && mkdir -p -- "${@: -1}"; }
+    lsattr() { :; }
+    chattr() { :; }
+    BACKUP_DIR="$work/backup-$scenario"
+    TMP_DIR="$work/tmp-$scenario"
+    mkdir -p "$BACKUP_DIR" "$TMP_DIR"
     ssh_port_available() { :; }
     check_ssh_change_prerequisites() { echo safety-check >>"$trace"; }
     ssh_listener_addresses() {
@@ -101,7 +133,7 @@ for scenario in port22 default custom-port preserve reuse missing-keygen existin
     backup_dns_state() { execute backup-dns; }
     apply_network_stack() { execute network; }
     cleanup_legacy_network_stack() { :; }
-    detect_network_stack() { NETWORK_STACK=ipv4; }
+    detect_network_stack() { NETWORK_STACK=ipv4; if [[ "$scenario" == ipv6-* ]]; then NETWORK_STACK=dual; fi; }
     install_and_configure_smartdns() { execute smartdns; }
     configure_system_dns() { execute dns; DNS_TX=false; }
     configure_ssh() { if [[ "$PRESERVE_SSH" == false ]]; then execute ssh; fi; }
@@ -123,6 +155,15 @@ for scenario in port22 default custom-port preserve reuse missing-keygen existin
       preserve) [[ "$PRESERVE_SSH" == true ]]; if grep -Eq 'key-validated|execute (ssh|ufw|key|fail2ban)$' "$trace"; then fail 'preserve mode changed access'; fi ;;
       reuse) [[ "$REUSE_PUBLIC_KEY" == true ]] ;;
       low-memory) grep -Fxq 'execute swap' "$trace" ;;
+      ipv6-restore)
+        [[ "$NETWORK_STACK" == dual ]]
+        grep -Fxq 'net.ipv6.conf.all.disable_ipv6 = 0' "$NETWORK_SYSCTL"
+        grep -Fxq 'net.ipv6.conf.default.disable_ipv6 = 0' "$NETWORK_SYSCTL"
+        [[ "$IPV6_BOOT_RESULT" == 已恢复 && "$IPV6_PROBE_RESULT" == dual ]] ;;
+      ipv6-keep)
+        [[ "$NETWORK_STACK" == ipv4 ]]
+        [[ ! -e "$NETWORK_SYSCTL" ]]
+        [[ "$IPV6_BOOT_RESULT" == 仍禁用 && "$IPV6_PROBE_RESULT" == dual ]] ;;
     esac
   ) >"$work/$scenario.output" 2>&1
   result=$?
@@ -160,6 +201,13 @@ for scenario in port22 default custom-port preserve reuse missing-keygen existin
   esac
 done
 grep -Fxq 'QEMU Guest Agent：保留' "$work/custom-full.output"
+for scenario in ipv6-restore ipv6-keep; do
+  grep -Fq '重启后 IPv6：将被现有配置关闭' "$work/$scenario.output" || fail "$scenario summary lacks the reboot-state line"
+  grep -Fq '50-fixture.conf: net.ipv6.conf.all.disable_ipv6 = 1' "$work/$scenario.output" || fail "$scenario did not list the offending line"
+  # The choice is asked after the network menu and before the single confirmation.
+  awk '/请选择网络模式/ {n=NR} /恢复 IPv6/ {s=NR} /确认以上配置/ {c=NR} END {exit !(n && s && c && n < s && s < c)}' "$work/$scenario.trace" ||
+    fail "$scenario prompt order"
+done
 grep -Fxq minimal-keygen "$work/missing-keygen.trace"
 if (
   check_ssh_change_prerequisites() { :; }
