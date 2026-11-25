@@ -35,6 +35,7 @@ AUTO_SECURITY=true
 BOOT_REPORT='未检查'
 declare -a AUDIT_FINDINGS=()
 HARDENING_KEY_DELETED=false
+HARDENING_MAIL_PURGED=false
 AUDIT_SESSION_KEY=''
 AUDIT_APT_SOURCES=''
 readonly SMARTDNS_CONF='/etc/smartdns/smartdns.conf'
@@ -3386,11 +3387,37 @@ audit_add() {
   AUDIT_FINDINGS+=("$1"$'\t'"$2"$'\t'"$target"$'\t'"$detail")
 }
 
+# Owner package of a path. Debian 12 dpkg does not resolve the merged-/usr aliases, so a
+# package that registered /usr/lib/... is not found through /lib/... (and vice versa);
+# try the alias before concluding that nothing owns the path.
 audit_package_owner() {
-  local record
-  record=$(dpkg-query -S -- "$1" 2>/dev/null | head -1) || return 1
-  [[ "$record" == *': '* ]] || return 1
-  printf '%s\n' "${record%%: *}"
+  local candidate record package
+  local -a candidates=("$1")
+  case "$1" in
+    /lib/*|/bin/*|/sbin/*) candidates+=("/usr$1") ;;
+    /usr/lib/*|/usr/bin/*|/usr/sbin/*) candidates+=("${1#/usr}") ;;
+  esac
+  for candidate in "${candidates[@]}"; do
+    record=$(dpkg-query -S -- "$candidate" 2>/dev/null | head -1) || continue
+    [[ "$record" == *': '* ]] || continue
+    package=${record%%: *}
+    printf '%s\n' "${package%%,*}"
+    return 0
+  done
+  return 1
+}
+
+# FragmentPath of a unit. systemd cannot show template units such as getty@.service, so
+# fall back to the standard unit directories.
+audit_unit_fragment() {
+  local unit=$1 path dir
+  path=$(systemctl show -p FragmentPath --value "$unit" 2>/dev/null || true)
+  if [[ -z "$path" ]]; then
+    for dir in /etc/systemd/system /usr/lib/systemd/system /lib/systemd/system; do
+      if [[ -f "$AUDIT_ROOT$dir/$unit" ]]; then path="$dir/$unit"; break; fi
+    done
+  fi
+  printf '%s\n' "$path"
 }
 
 audit_debian_package() {
@@ -3596,20 +3623,27 @@ audit_agent_comm_prefix() {
 audit_agents() {
   local pid comm exe name unit frag exec prefix path kind package status owner seen=$'\n' key
   local -a evidence=() units=()
-  while read -r pid comm; do
+  while IFS=' ' read -r pid comm; do
     [[ "$pid" =~ ^[0-9]+$ ]] || continue
     exe=$(readlink -f "$AUDIT_ROOT/proc/$pid/exe" 2>/dev/null || true)
     name=$(audit_agent_name_for "$comm" || audit_agent_comm_prefix "$comm" || audit_agent_name_for "$exe" || true)
     [[ -z "$name" ]] || evidence+=("$name"$'\t'process$'\t'"${exe:-$comm}")
   done < <(ps -eo pid=,comm= 2>/dev/null || true)
-  mapfile -t units < <(systemctl list-unit-files --type=service --no-legend --no-pager 2>/dev/null | awk 'NF {print $1}' || true)
+  # systemctl show rejects template units (getty@.service) and then prints nothing for the
+  # whole call, so templates are matched by name only.
+  mapfile -t units < <(systemctl list-unit-files --type=service --no-legend --no-pager 2>/dev/null | awk 'NF && $1 !~ /@\.service$/ {print $1}' || true)
+  while IFS= read -r unit; do
+    name=$(audit_agent_name_for "${unit%.service}" || true)
+    [[ -z "$name" ]] || evidence+=("$name"$'	'service$'	'"$(audit_unit_fragment "$unit")")
+  done < <(systemctl list-unit-files --type=service --no-legend --no-pager 2>/dev/null | awk 'NF && $1 ~ /@\.service$/ {print $1}' || true)
   if (( ${#units[@]} > 0 )); then
     while IFS=$'\t' read -r unit frag exec; do
       name=$(audit_agent_name_for "${unit%.service}" || audit_agent_name_for "$frag" || audit_agent_name_for "$exec" || true)
       [[ -z "$name" ]] || evidence+=("$name"$'\t'service$'\t'"${frag:-$unit}")
     done < <(systemctl show -p Id,FragmentPath,ExecStart --no-pager -- "${units[@]}" 2>/dev/null | awk '
       function flush() { if (id != "") printf "%s\t%s\t%s\n", id, frag, ex; id = frag = ex = "" }
-      /^Id=/ { flush(); id = substr($0, 4) }
+      /^$/ { flush() }
+      /^Id=/ { id = substr($0, 4) }
       /^FragmentPath=/ { frag = substr($0, 14) }
       /^ExecStart=/ { if (match($0, /path=[^ ;]+/)) ex = substr($0, RSTART + 5, RLENGTH - 5) }
       END { flush() }' || true)
@@ -3672,10 +3706,12 @@ collect_security_audit() {
   fi
   while IFS=' ' read -r unit _; do
     [[ -n "$unit" ]] || continue
-    path=$(systemctl show -p FragmentPath --value "$unit" 2>/dev/null || true)
-    if [[ -z "$path" ]] || ! audit_package_owner "$path" >/dev/null; then audit_add B service "$unit" "已启用但服务文件不属于软件包：$path"; fi
-    # Drop-ins can change an otherwise official service's executable.
-    for path in $(systemctl show -p DropInPaths --value "$unit" 2>/dev/null | tr ' ' '\n'); do
+    path=$(audit_unit_fragment "$unit")
+    if [[ -z "$path" ]] || ! audit_package_owner "$path" >/dev/null; then audit_add B service "$unit" "已启用但服务文件不属于软件包：${path:-找不到服务文件}"; fi
+    # Drop-ins can change an otherwise official service's executable. The sing-box start
+    # condition written by this installer is its own file and expected.
+    for path in $(systemctl show -p DropInPaths --value "$unit" 2>/dev/null | tr ' ' '\n' || true); do
+      if [[ "$unit" == sing-box.service && "$path" == "$SINGBOX_DROPIN" ]]; then continue; fi
       if ! audit_package_owner "$path" >/dev/null; then audit_add B service "$unit" "额外的服务覆盖文件：$path"; fi
     done
   done < <(systemctl list-unit-files --state=enabled --type=service --no-legend --no-pager 2>/dev/null || true)
@@ -3705,7 +3741,7 @@ collect_security_audit() {
     [[ "$command" == none ]] || audit_add C ssh AuthorizedKeysCommand "公钥通过额外命令获取：$command；只报告，不改 sshd，建议官方重装"
     # Defaults are .ssh/authorized_keys (+ .ssh/authorized_keys2 on older OpenSSH); the
     # installer itself pins .ssh/authorized_keys. Anything else is reported.
-    read -ra key_paths <<<"$keys"
+    IFS=' ' read -ra key_paths <<<"$keys"
     for key_path in "${key_paths[@]}"; do
       case "$key_path" in .ssh/authorized_keys|.ssh/authorized_keys2) ;; *) key_ok=false ;; esac
     done
@@ -3864,6 +3900,7 @@ hardening_purge_plan() {
 }
 
 hardening_purge_exim4() {
+  HARDENING_MAIL_PURGED=false
   local plan planned current versions observed_versions package status path rc found=false
   local -a packages=() extra=()
   CURRENT_STEP='模拟卸载 exim4 邮件服务'
@@ -3924,6 +3961,7 @@ hardening_purge_exim4() {
       (( rc == 1 )) || { warn "无法验证 $package 的卸载状态。"; return 1; }
     fi
   done
+  HARDENING_MAIL_PURGED=true
   log 'exim4 及已额外确认的软件包已清除；cron 输出邮件将无法投递。'
 }
 
@@ -4017,8 +4055,9 @@ run_security_hardening() {
           HARDENING_ACTIONS+=("已 purge 商家 agent 软件包 $target；配置备份：$BACKUP_DIR/files；需要时从商家渠道重新安装")
         fi ;;
       mail)
+        HARDENING_MAIL_PURGED=false
         hardening_purge_exim4 || warn 'exim4 未完成卸载，已跳过；系统状态以 dpkg 为准。'
-        if [[ $(dpkg-query -W -f='${db:Status-Status}' -- exim4 2>/dev/null || true) != installed ]]; then
+        if [[ "$HARDENING_MAIL_PURGED" == true ]]; then
           HARDENING_ACTIONS+=("已 purge exim4 邮件服务；cron 输出邮件将无法投递；恢复：apt-get install exim4；配置备份：$BACKUP_DIR/files/etc/exim4")
         fi ;;
     esac

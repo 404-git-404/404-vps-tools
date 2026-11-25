@@ -62,7 +62,8 @@ sed -e "s|^readonly AUDIT_ROOT=.*|readonly AUDIT_ROOT='$root'|" \
   -e "s|/dev/tty|$work/tty|g" "$repo/debian-init.sh" >"$work/installer"
 # shellcheck disable=SC1091
 source "$work/installer"
-IFS=$' \t\n'
+# Keep the installer's own IFS (newline and tab only): word-splitting bugs must show up
+# here and not only on servers. Mocks that join "$@" set a local IFS themselves.
 trap - ERR HUP INT TERM
 trap 'rm -rf -- "$work"' EXIT
 TMP_DIR="$work/tmp" BACKUP_DIR="$work/backup"
@@ -99,11 +100,12 @@ export APT_CONFIG="$work/apt.conf"
 trace="$work/trace"
 : >"$trace"
 apt_get() {
+  local IFS=' '
   [[ "$*" == 'install -y unattended-upgrades' ]] || fail 'security APT command'
   grep -Fq '#clear Unattended-Upgrade::Allowed-Origins;' "$SECURITY_APT_CONF" || fail 'policy was not written before installation'
   echo install >>"$trace"
 }
-systemctl() { printf '%s\n' "$*" >>"$trace"; }
+systemctl() { local IFS=' '; printf '%s\n' "$*" >>"$trace"; }
 configure_security_updates
 config=$(apt-config dump)
 grep -Fq 'origin=Debian,codename=${distro_codename}-security,label=Debian-Security' <<<"$config"
@@ -138,6 +140,7 @@ chmod 600 "$file"
 # Exercise journal correlation before replacing the function with a fixture.
 SSH_CONNECTION='192.0.2.10 1234 192.0.2.20 22'
 ps() {
+  local IFS=' '
   case "$*" in
     '-o comm='*) echo sshd ;;
     '-o lstart='*) echo 'Wed Nov 25 01:00:00 2026' ;;
@@ -146,15 +149,16 @@ ps() {
   esac
 }
 journalctl() {
+  local IFS=' '
   [[ "$*" == *'--since 2026-11-25 01:00:00'* && "$*" == *'_PID='* ]] || fail 'unbound journal query'
   printf 'Accepted publickey for root from 192.0.2.10 port 1234 ssh2: ED25519 %s\n' "$current_fp"
   printf 'Accepted publickey for root from 192.0.2.99 port 1234 ssh2: ED25519 %s\n' "$other_fp"
   printf 'Accepted publickey for root from 192.0.2.10 port 7777 ssh2: ED25519 %s\n' "$other_fp"
 }
 [[ $(audit_session_key) == "$current_fp" ]] || fail 'session correlation'
-journalctl() { printf 'Accepted password for root from 192.0.2.10 port 1234 ssh2\n'; }
+journalctl() { local IFS=' '; printf 'Accepted password for root from 192.0.2.10 port 1234 ssh2\n'; }
 if audit_session_key; then fail 'password session treated as publickey'; fi
-journalctl() { printf 'Accepted publickey for root from 192.0.2.10 port 1234 ssh2: ED25519 %s\n' "$current_fp" "$other_fp"; }
+journalctl() { local IFS=' '; printf 'Accepted publickey for root from 192.0.2.10 port 1234 ssh2: ED25519 %s\n' "$current_fp" "$other_fp"; }
 if audit_session_key; then fail 'ambiguous session allowed'; fi
 unset -f ps journalctl
 audit_session_key() { [[ -n "${session_key:-}" ]] && printf '%s\n' "$session_key"; }
@@ -292,7 +296,8 @@ SSH_CONNECTION='192.0.2.10 1234 192.0.2.20 22'
 
 # Full audit positive and negative fixtures, including each A/B/C detector.
 audit_mode=positive
-mkdir -p "$root/etc/cron.d" "$root/etc/sudoers.d" "$root/proc/321" "$root/usr/local/aegis"
+mkdir -p "$root/etc/cron.d" "$root/etc/sudoers.d" "$root/proc/321" "$root/usr/local/aegis" "$root/usr/lib/systemd/system"
+touch "$root/usr/lib/systemd/system/getty@.service"
 printf 'root:x:0:0::/root:/bin/bash\nextra:x:0:0::/home/extra:/bin/bash\n' >"$root/etc/passwd"
 echo preload >"$root/etc/ld.so.preload"
 echo cron >"$root/etc/cron.d/unowned"
@@ -300,11 +305,17 @@ echo sudo >"$root/etc/sudoers.d/extra"
 ln -s /opt/agent "$root/proc/321/exe"
 qemu_guest_agent_status() { if [[ "$audit_mode" == positive ]]; then echo installed; else echo not-installed; fi; }
 dpkg-query() {
+  local IFS=' '
   case "$1" in
     -S)
       case "$*" in
         *barad_agent.service*) echo 'vendor-barad: /etc/systemd/system/barad_agent.service' ;;
         *walinuxagent.service*) echo 'walinuxagent: /lib/systemd/system/walinuxagent.service' ;;
+        # Debian 12 dpkg: only the registered spelling of a merged-/usr path is found.
+        *'/usr/lib/systemd/system/aliased.service') echo 'pkg-aliased: /usr/lib/systemd/system/aliased.service' ;;
+        *'-S -- /lib/systemd/system/aliased.service'*) return 1 ;;
+        *'/system/sing-box.service') echo 'sing-box: /usr/lib/systemd/system/sing-box.service' ;;
+        *getty@.service*) echo 'systemd: /usr/lib/systemd/system/getty@.service' ;;
         *) if [[ "$audit_mode" == negative || "$*" == *'/usr/bin/official'* ]]; then echo 'official: /usr/bin/official'; else return 1; fi ;;
       esac ;;
     -W)
@@ -315,6 +326,7 @@ dpkg-query() {
   esac
 }
 apt-cache() {
+  local IFS=' '
   if [[ "$*" == policy ]]; then
     printf ' 500 https://deb.debian.org/debian stable/main amd64 Packages\n     release o=Debian,a=stable\n'
   elif [[ "$*" == *'external'* || "$*" == *'vendor-barad'* ]]; then
@@ -324,23 +336,37 @@ apt-cache() {
   fi
 }
 systemctl() {
+  local IFS=' '
   case "$*" in
-    'list-unit-files --state=enabled'*) [[ "$audit_mode" != positive ]] || echo 'custom.service enabled' ;;
-    'list-unit-files --type=service'*) [[ "$audit_mode" != positive ]] || printf 'barad_agent.service enabled\nwalinuxagent.service enabled\nnothing.service enabled\n' ;;
+    'list-unit-files --state=enabled'*) [[ "$audit_mode" != positive ]] || printf 'custom.service enabled\naliased.service enabled\ngetty@.service enabled\nsing-box.service enabled\n' ;;
+    'list-unit-files --type=service'*) [[ "$audit_mode" != positive ]] || printf 'autovt@.service enabled\nbarad_agent.service enabled\nwalinuxagent.service enabled\nnothing.service enabled\n' ;;
     'show -p Id,FragmentPath,ExecStart'*)
       [[ "$audit_mode" == positive ]] || return 0
-      printf 'Id=barad_agent.service\nFragmentPath=/etc/systemd/system/barad_agent.service\nExecStart={ path=/usr/local/qcloud/monitor/barad/admin/barad_agent ; argv[]=x ; ignore_errors=no }\n\n'
-      printf 'Id=walinuxagent.service\nFragmentPath=/lib/systemd/system/walinuxagent.service\nExecStart={ path=/usr/sbin/waagent ; argv[]=/usr/sbin/waagent }\n\n'
-      printf 'Id=nothing.service\nFragmentPath=/lib/systemd/system/nothing.service\nExecStart={ path=/bin/true ; argv[]=true }\n' ;;
-    'show -p FragmentPath'*) echo /etc/systemd/system/custom.service ;;
-    'show -p DropInPaths'*) : ;;
+      # Real systemctl refuses template units and then prints nothing at all.
+      if [[ "$*" == *'@.'* ]]; then echo 'Failed to get properties: Unit name is not valid.' >&2; return 1; fi
+      printf 'ExecStart={ path=/usr/local/qcloud/monitor/barad/admin/barad_agent ; argv[]=x ; ignore_errors=no }\nId=barad_agent.service\nFragmentPath=/etc/systemd/system/barad_agent.service\n\n'
+      printf 'ExecStart={ path=/usr/sbin/waagent ; argv[]=/usr/sbin/waagent }\nId=walinuxagent.service\nFragmentPath=/lib/systemd/system/walinuxagent.service\n\n'
+      printf 'ExecStart={ path=/bin/true ; argv[]=true }\nId=nothing.service\nFragmentPath=/lib/systemd/system/nothing.service\n' ;; # real systemd prints ExecStart before Id
+    'show -p FragmentPath'*)
+      case "$*" in
+        *aliased.service*) echo /lib/systemd/system/aliased.service ;;
+        *getty@.service*) return 1 ;; # systemd cannot show template units
+        *sing-box.service*) echo /usr/lib/systemd/system/sing-box.service ;;
+        *) echo /etc/systemd/system/custom.service ;;
+      esac ;;
+    'show -p DropInPaths'*)
+      case "$*" in
+        *getty@.service*) return 1 ;;
+        *sing-box.service*) echo "$SINGBOX_DROPIN" ;;
+      esac ;;
     'is-enabled --quiet networking.service') return 0 ;;
     *) return 1 ;;
   esac
 }
 ps() {
+  local IFS=' '
   [[ "$*" == '-eo pid=,comm=' ]] || fail "unexpected ps $*"
-  if [[ "$audit_mode" == positive ]]; then printf '  1 systemd\n321 AliYunDun\n'; fi
+  if [[ "$audit_mode" == positive ]]; then printf '%7s %s\n' 1 systemd 321 AliYunDun; fi # real ps right-aligns the pid
 }
 ss() { if [[ "$audit_mode" == positive ]]; then echo 'tcp LISTEN 0 128 0.0.0.0:9999 0.0.0.0:* users:(("agent",pid=321,fd=3))'; fi; }
 sshd() {
@@ -359,6 +385,15 @@ for detector in key cloud qga agent mail package service cron sudo port preload 
 done
 grep -Fq '没有归属记录' "$work/positive"
 has_finding() { printf '%s\n' "${AUDIT_FINDINGS[@]}" | grep -Eq "$1"; }
+# Services: the unowned custom unit is B; merged-/usr aliases, template units and the
+# installer's own sing-box start condition are not; no ERR trap noise from template units.
+has_finding $'^B\tservice\tcustom.service\t' || fail 'unowned service not B'
+for ok_unit in aliased.service getty@.service sing-box.service; do
+  if has_finding $'^B\tservice\t'"$ok_unit"$'\t'; then fail "$ok_unit wrongly reported as unowned"; fi
+done
+: >"$work/err-trap"
+(trap 'echo "ERR line $LINENO" >>"$work/err-trap"' ERR; set -E; collect_security_audit)
+[[ ! -s "$work/err-trap" ]] || fail "audit raised an ERR trap: $(cat "$work/err-trap")"
 # R5: a non-official package that owns a vendor service is A; same-name Debian packages are
 # excluded; unowned processes and install paths are B with a manual-removal hint.
 has_finding $'^A\tagent\tvendor-barad\t' || fail 'vendor package not A'
@@ -387,7 +422,7 @@ printf 'auto eth0\niface eth0 inet dhcp\n' >"$root/etc/network/interfaces"
 PUBLIC_KEY=$current REUSE_PUBLIC_KEY=false
 record_trusted_keys
 # Root ownership check is mocked only for this fixture on non-root CI runners.
-stat() { if [[ "$*" == "-c %u $TRUSTED_KEYS_STATE" ]]; then echo 0; else command stat "$@"; fi; }
+stat() { local IFS=' '; if [[ "$*" == "-c %u $TRUSTED_KEYS_STATE" ]]; then echo 0; else command stat "$@"; fi; }
 collect_security_audit
 print_security_audit full >"$work/recorded"
 grep -Fq '不是你提供的' "$work/recorded"
@@ -492,7 +527,7 @@ eval "real_$(declare -f collect_security_audit)"
     if [[ "$1" == '关闭 cloud-init？' ]]; then printf 'auto lo\niface lo inet loopback\n' >"$root/etc/network/interfaces"; fi
     return 0
   }
-  hardening_purge_exim4() { echo mail-ran >>"$work/flow-mail"; }
+  hardening_purge_exim4() { echo mail-ran >>"$work/flow-mail"; HARDENING_MAIL_PURGED=true; }
   : >"$work/flow-mail"
   run_security_hardening >"$work/flow-skip" 2>&1
 )
@@ -500,6 +535,18 @@ eval "real_$(declare -f collect_security_audit)"
 await_text "$work/flow-skip" '加固报告' || fail 'no final report after skip'
 grep -Fq '跳过 cloud-init' "$work/flow-skip" || fail 'skip not reported'
 grep -Fxq mail-ran "$work/flow-mail" || fail 'cloud-init skip stopped the remaining items'
+grep -Fq '已 purge exim4' "$work/flow-skip" || fail 'executed mail purge not in the report'
+# A declined / failed purge is not reported as done and leaves no backup directory behind.
+rm -rf "$BACKUP_ROOT"
+(
+  collect_security_audit() { AUDIT_FINDINGS=(); audit_add A mail exim4 'x'; }
+  ask_yes_no() { return 0; }
+  hardening_purge_exim4() { echo mail-declined >>"$work/flow-mail"; return 0; }
+  run_security_hardening >"$work/flow-nothing" 2>&1
+)
+await_text "$work/flow-nothing" '没有执行任何修改' || fail 'declined purge treated as an action'
+if grep -Fq '已 purge exim4' "$work/flow-nothing"; then fail 'declined purge reported as done'; fi
+[[ $(find "$BACKUP_ROOT" -mindepth 1 -maxdepth 1 2>/dev/null | wc -l) == 0 ]] || fail 'unused backup directory kept'
 unset -f real_collect_security_audit
 printf 'auto eth0\niface eth0 inet dhcp\n' >"$root/etc/network/interfaces"
 unset -f hardening_backup
@@ -525,6 +572,7 @@ for scenario in family multiarch collateral collateral-cancel cancel absent malf
       else printf -v "$2" y; fi
     }
     apt_get() {
+      local IFS=' '
       local IFS=' ' calls
       [[ "$*" == '-s -o APT::Get::AutomaticRemove=false purge -- exim4*' ]] || fail 'Exim wildcard not passed literally to APT'
       calls=$(cat "$exim_dir/count"); calls=$((calls + 1)); echo "$calls" >"$exim_dir/count"
@@ -545,6 +593,7 @@ for scenario in family multiarch collateral collateral-cancel cancel absent malf
       esac
     }
     dpkg-query() {
+      local IFS=' '
       local IFS=' '
       if [[ "$*" == *'${db:Status-Status}'* ]]; then
         [[ -f "$exim_dir/purged" ]] || fail 'unexpected verification before purge'
@@ -602,6 +651,7 @@ mkdir -p "${CF_TIMER%/*}"
 touch "$CF_TIMER"
 make_mutable() { :; }
 systemctl() {
+  local IFS=' '
   printf '%s\n' "$*" >>"$trace"
   case "$1" in
     is-enabled)
@@ -651,7 +701,7 @@ ufw() { echo 'Status: active'; }
 SINGBOX_WAS_INSTALLED=false
 systemctl_base=$(declare -f systemctl)
 eval "${systemctl_base/systemctl ()/boot_systemctl ()}"
-systemctl() { if [[ "$1" == stop ]]; then echo "$*" >>"$trace"; else boot_systemctl "$@"; fi; }
+systemctl() { local IFS=' '; if [[ "$1" == stop ]]; then echo "$*" >>"$trace"; else boot_systemctl "$@"; fi; }
 restore_singbox_state
 grep -Fxq 'enable sing-box.service' "$trace"
 if grep -Eq '^(start|restart)' "$trace"; then fail 'sing-box was started'; fi
