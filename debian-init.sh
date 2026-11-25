@@ -34,8 +34,8 @@ readonly SECURITY_APT_CONF='/etc/apt/apt.conf.d/zzzz-404-security'
 AUTO_SECURITY=true
 BOOT_REPORT='未检查'
 declare -a AUDIT_FINDINGS=()
+HARDENING_KEY_DELETED=false
 AUDIT_SESSION_KEY=''
-AUDIT_NETWORK_SAFE=false
 AUDIT_APT_SOURCES=''
 readonly SMARTDNS_CONF='/etc/smartdns/smartdns.conf'
 readonly SMARTDNS_CACHE='/var/cache/smartdns/smartdns.cache'
@@ -3349,7 +3349,7 @@ check_boot_services() {
   local unit result enabled active extra before
   local -a units=(ssh.service ufw.service smartdns.service fail2ban.service chrony.service cron.service vnstat.service sing-box.service)
   [[ ! -f "$CF_TIMER" ]] || units+=(vps-init-cloudflare-8443.timer)
-  if [[ "$AUTO_SECURITY" == true ]] || command -v unattended-upgrade >/dev/null; then units+=(apt-daily.timer apt-daily-upgrade.timer); fi
+  units+=(apt-daily.timer apt-daily-upgrade.timer)
   BOOT_REPORT=''
   for unit in "${units[@]}"; do
     before=$(systemctl is-enabled "$unit" 2>/dev/null || true)
@@ -3370,7 +3370,10 @@ check_boot_services() {
     fi
     active=$(systemctl is-active "$unit" 2>/dev/null || true)
     extra=''
-    if [[ "$unit" == ufw.service ]]; then extra="；$(ufw status 2>/dev/null | head -1 || true)"; fi
+    if [[ "$unit" == ufw.service ]]; then
+      extra="；$(ufw status 2>/dev/null | head -1 || true)"
+      if [[ "$PRESERVE_SSH" == false && "$extra" != *'Status: active'* ]]; then result="${result}；ufw 状态不是 active，请检查"; fi
+    fi
     if [[ "$unit" == sing-box.service && "$enabled" == enabled && ! -e "$SINGBOX_CONFIG" ]]; then extra='；已启用，等待配置'; fi
     BOOT_REPORT+="$unit: ${enabled:-未知} / ${active:-未知}${extra} ${result}"$'\n'
   done
@@ -3466,108 +3469,196 @@ audit_keys() {
   done
 }
 
-audit_network_persistent() {
-  # A deliberately small allowlist. Do not interpret arbitrary YAML, globbed Match rules,
-  # cloud-generated files, interfaces hooks, or NetworkManager profiles as proof.
-  local iface file text found=false route interface_files='' network_count=0
-  route=$(ip -o route show default 2>/dev/null) || return 1
-  # This allowlist proves IPv4 DHCP only. Never risk an IPv6 management session.
-  [[ "${SSH_CONNECTION:-}" != *:* ]] || return 1
-  local -a interfaces=()
-  mapfile -t interfaces < <(awk '{for(i=1;i<NF;i++) if($i=="dev") print $(i+1)}' <<<"$route" | sort -u)
-  (( ${#interfaces[@]} > 0 )) || return 1
-  for iface in "${interfaces[@]}"; do
-    [[ "$iface" =~ ^[a-zA-Z0-9_.:-]+$ ]] || return 1
-    # Require live evidence of DHCP, not merely a dormant config file.
-    ip -o -4 addr show dev "$iface" scope global 2>/dev/null | grep -qw dynamic || return 1
-    awk -v iface="$iface" '{dev=""; dhcp=0; for(i=1;i<NF;i++) {if($i=="dev") dev=$(i+1); if($i=="proto" && $(i+1)=="dhcp") dhcp=1} if(dev==iface && dhcp) ok=1} END {exit !ok}' <<<"$route" || return 1
-    found=false
-    for file in "$AUDIT_ROOT"/etc/network/interfaces "$AUDIT_ROOT"/etc/network/interfaces.d/*; do
-      [[ -f "$file" && ! -L "$file" ]] || continue
-      text=$(cat -- "$file")
-      # Only interfaces.d inclusion is supported. Arbitrary sources/hooks are unknown.
-      if grep -Eiq 'cloud[- ]init|generated|metadata|169\.254|(^|[[:space:]])(pre-up|post-up|pre-down|post-down|up|down)[[:space:]]' <<<"$text"; then return 1; fi
-      # Accept only standalone DHCP/loopback stanzas and the known include path.
-      if ! awk '/^[[:space:]]*(#|$)/ {next}
-        $1 ~ /^(auto|allow-hotplug)$/ {next}
-        $1=="iface" && $3=="inet" && $4 ~ /^(dhcp|loopback)$/ && NF==4 {next}
-        $1 ~ /^source(-directory)?$/ && $2 ~ /^\/etc\/network\/interfaces.d\/(\*)?$/ && NF==2 {next}
-        {bad=1} END {exit bad}' <<<"$text"; then return 1; fi
-      if [[ "$file" != */interfaces ]] && ! grep -Eq '^source(-directory)?[[:space:]]+/etc/network/interfaces.d/\*?[[:space:]]*$' "$AUDIT_ROOT/etc/network/interfaces" 2>/dev/null; then continue; fi
-      interface_files+=$'\n'"$text"
-    done
-    if systemctl is-enabled --quiet networking.service 2>/dev/null && ifquery --state "$iface" >/dev/null 2>&1 &&
-      awk -v iface="$iface" '$1 ~ /^(auto|allow-hotplug)$/ {for(i=2;i<=NF;i++) if($i==iface) boot=1}
-        $1=="iface" && $2==iface && $3=="inet" && $4=="dhcp" {dhcp=1}
-        END {exit !(boot && dhcp)}' <<<"$interface_files"; then found=true; fi
-    # Exact Name= and DHCP=yes/ipv4 are accepted only with networkd enabled and no
-    # other matching/dynamic directives. Static/bridged/routed setups need manual review.
-    for file in "$AUDIT_ROOT"/etc/systemd/network/*.network; do
-      [[ -f "$file" && ! -L "$file" ]] || continue
-      text=$(cat -- "$file")
-      if grep -Eiq 'cloud[- ]init|generated|metadata|169\.254' <<<"$text"; then return 1; fi
-      if systemctl is-enabled --quiet systemd-networkd.service 2>/dev/null &&
-        networkctl status --no-pager "$iface" 2>/dev/null | grep -Fq "Network File: ${file#"$AUDIT_ROOT"}" &&
-        awk -v iface="$iface" '
-          /^[[:space:]]*([#;]|$)/ {next}
-          /^\[Match\]$/ {section="match"; next} /^\[Network\]$/ {section="network"; next}
-          section=="match" && $0=="Name=" iface {name=1; next}
-          section=="network" && /^DHCP=(yes|ipv4)$/ {dhcp=1; next}
-          {bad=1} END {exit !(name && dhcp && !bad)}' <<<"$text"; then found=true; fi
-    done
-    [[ "$found" == true ]] || return 1
+readonly CLOUD_DISABLED_FLAG='/etc/cloud/cloud-init.disabled'
+readonly CLOUD_STATIC_HINT='如果商家迁移机器、更换 IP，需要用 VNC 修改网络配置，或删除 /etc/cloud/cloud-init.disabled 重新启用 cloud-init。'
+CLOUD_NET_KIND=''
+CLOUD_NET_STATIC=false
+CLOUD_NET_REASON=''
+
+# True when any cloud-init configuration lists the plain "boot" event under
+# updates: network: when: (network is regenerated on every boot). Block lists, inline
+# lists and one-line flow mappings are understood; boot-new-instance is not "boot".
+audit_cloud_boot_regenerates() {
+  local file
+  for file in "$AUDIT_ROOT"/etc/cloud/cloud.cfg "$AUDIT_ROOT"/etc/cloud/cloud.cfg.d/*.cfg; do
+    [[ -f "$file" ]] || continue
+    if awk '
+      function indent(s) { match(s, /^ */); return RLENGTH }
+      function scan(s,    n, t, k) {
+        n = split(s, t, /[^A-Za-z0-9_-]+/)
+        for (k = 1; k <= n; k++) if (t[k] == "boot") bad = 1
+      }
+      { sub(/\r$/, "") }
+      /^[[:space:]]*(#|$)/ { next }
+      { i = indent($0) }
+      inupd && i <= ui { inupd = 0; innet = 0; inwhen = 0 }
+      innet && i <= ni { innet = 0; inwhen = 0 }
+      inwhen && i <= wi && $0 !~ /^[[:space:]]*-/ { inwhen = 0 }
+      /^[[:space:]]*updates:[[:space:]]*(#.*)?$/ { inupd = 1; ui = i; next }
+      /^[[:space:]]*updates:.*when:/ { r = $0; sub(/.*when:/, "", r); scan(r); next }
+      inupd && /^[[:space:]]*network:[[:space:]]*(#.*)?$/ { innet = 1; ni = i; next }
+      inupd && /^[[:space:]]*network:.*when:/ { r = $0; sub(/.*when:/, "", r); scan(r); next }
+      innet && /^[[:space:]]*when:/ { inwhen = 1; wi = i; r = $0; sub(/^[^:]*:/, "", r); scan(r); next }
+      inwhen { scan($0) }
+      END { exit !bad }' "$file"; then return 0; fi
   done
-  # Netplan and runtime generators can supersede the above. Never guess precedence.
-  for file in "$AUDIT_ROOT"/etc/netplan/*.yaml "$AUDIT_ROOT"/run/systemd/network/*; do
-    [[ ! -e "$file" ]] || return 1
-  done
-  if systemctl is-enabled --quiet systemd-networkd.service 2>/dev/null; then
-    for file in "$AUDIT_ROOT"/etc/systemd/network/*.network "$AUDIT_ROOT"/usr/lib/systemd/network/*.network "$AUDIT_ROOT"/lib/systemd/network/*.network "$AUDIT_ROOT"/etc/systemd/network/*.network.d/*; do
-      [[ ! -e "$file" ]] || network_count=$((network_count + 1))
-    done
-    (( network_count == 1 )) || return 1
+  return 1
+}
+
+audit_network_regular_file() {
+  [[ -f "$1" && ! -L "$1" && -s "$1" ]]
+}
+
+# R4: cloud-init may be switched off only when the network configuration already lives in
+# regular files under /etc (ifupdown, netplan or systemd-networkd) and cloud-init is not
+# told to regenerate it on every boot. DHCP, SLAAC and static addresses are all fine.
+# Returns 0 when safe; always sets CLOUD_NET_KIND / CLOUD_NET_STATIC / CLOUD_NET_REASON.
+audit_cloud_network_classify() {
+  local file kinds='' static=false methods
+  CLOUD_NET_KIND='' CLOUD_NET_STATIC=false CLOUD_NET_REASON=''
+  if audit_cloud_boot_regenerates; then
+    CLOUD_NET_REASON='cloud-init 配置了每次开机重新生成网络（updates: network: when 含 boot）'
+    return 1
   fi
+  local -a ifupdown_files=("$AUDIT_ROOT/etc/network/interfaces")
+  if grep -Eqs '^[[:space:]]*source(-directory)?[[:space:]]+/etc/network/interfaces\.d(/\*)?[[:space:]]*$' "$AUDIT_ROOT/etc/network/interfaces"; then
+    ifupdown_files+=("$AUDIT_ROOT"/etc/network/interfaces.d/*)
+  fi
+  for file in "${ifupdown_files[@]}"; do
+    audit_network_regular_file "$file" || continue
+    methods=$(awk '/^[[:space:]]*#/ {next}
+      $1 == "iface" && $2 != "lo" && $3 ~ /^inet6?$/ && $4 ~ /^(dhcp|static|auto)$/ {print $4}' "$file")
+    [[ -n "$methods" ]] || continue
+    kinds+=' ifupdown'
+    if grep -Fxq static <<<"$methods"; then static=true; fi
+  done
+  for file in "$AUDIT_ROOT"/etc/netplan/*.yaml; do
+    audit_network_regular_file "$file" || continue
+    grep -Eq '^[[:space:]]*(ethernets|bonds|bridges|vlans|wifis):' "$file" || continue
+    kinds+=' netplan'
+    # nameservers: addresses: are DNS servers, not interface addresses.
+    if awk '
+      function indent(s) { match(s, /^ */); return RLENGTH }
+      /^[[:space:]]*(#|$)/ { next }
+      { i = indent($0); if (ns && i <= nsi) ns = 0 }
+      /^[[:space:]]*nameservers:/ { ns = 1; nsi = i; next }
+      !ns && /^[[:space:]]*(addresses|gateway4|gateway6):/ { found = 1 }
+      END { exit !found }' "$file"; then static=true; fi
+  done
+  for file in "$AUDIT_ROOT"/etc/systemd/network/*.network; do
+    audit_network_regular_file "$file" || continue
+    grep -Eq '^[[:space:]]*(DHCP|Address|Gateway|IPv6AcceptRA)=' "$file" || continue
+    kinds+=' systemd-networkd'
+    if grep -Eq '^[[:space:]]*(Address|Gateway)=' "$file"; then static=true; fi
+  done
+  if [[ -z "$kinds" ]]; then
+    CLOUD_NET_REASON='/etc 下没有 ifupdown、netplan 或 systemd-networkd 的普通网络配置文件，网络配置可能只存在于 /run'
+    return 1
+  fi
+  CLOUD_NET_KIND=${kinds# }
+  CLOUD_NET_STATIC=$static
   return 0
 }
 
+audit_cloud_init_present() {
+  [[ "$(dpkg-query -W -f='${db:Status-Status}' -- cloud-init 2>/dev/null || true)" == installed || -f "$AUDIT_ROOT/etc/cloud/cloud.cfg" ]]
+}
+
+# R5 vendor agent names, matched case-insensitively against process names, service
+# names and install paths (any path component).
+readonly -a VENDOR_AGENT_NAMES=(
+  aliyun-service assist_daemon AliYunDun AliYunDunUpdate aegis argusagent cloudmonitor
+  YDService YDLive barad_agent sgagent tat_agent
+  hostguard uniagent telescope
+  amazon-ssm-agent google-guest-agent walinuxagent waagent oracle-cloud-agent
+)
+
+audit_agent_name_for() {
+  local text=${1,,} name lname
+  [[ -n "$text" ]] || return 1
+  for name in "${VENDOR_AGENT_NAMES[@]}"; do
+    lname=${name,,}
+    if [[ "$text" == "$lname" || "/$text/" == *"/$lname/"* ]]; then printf '%s\n' "$name"; return 0; fi
+  done
+  return 1
+}
+
+# ps truncates process names to 15 characters.
+audit_agent_comm_prefix() {
+  local comm=${1,,} name
+  (( ${#comm} == 15 )) || return 1
+  for name in "${VENDOR_AGENT_NAMES[@]}"; do
+    if [[ "${name,,}" == "$comm"* ]]; then printf '%s\n' "$name"; return 0; fi
+  done
+  return 1
+}
+
 audit_agents() {
-  local package status path unit
-  # Explicit names only: Alibaba, Tencent, Huawei and common provider guest agents.
-  for package in aliyun-assist aliyun-assist-client aegis aliyun-service \
-    tat-agent qcloud-assist stargate barad-agent hostguard uniagent; do
-    status=$(dpkg-query -W -f='${db:Status-Status}' -- "$package" 2>/dev/null || true)
-    # Debian also ships packages with generic names (for example aegis). A name
-    # match is insufficient when this version is available from an official source.
-    if [[ "$status" == installed ]] && ! audit_debian_package "$package"; then
-      audit_add A agent "$package" '名称匹配商家 agent，来源未经 Debian 官方缓存确认；核实后可预览 purge'
+  local pid comm exe name unit frag exec prefix path kind package status owner seen=$'\n' key
+  local -a evidence=() units=()
+  while read -r pid comm; do
+    [[ "$pid" =~ ^[0-9]+$ ]] || continue
+    exe=$(readlink -f "$AUDIT_ROOT/proc/$pid/exe" 2>/dev/null || true)
+    name=$(audit_agent_name_for "$comm" || audit_agent_comm_prefix "$comm" || audit_agent_name_for "$exe" || true)
+    [[ -z "$name" ]] || evidence+=("$name"$'\t'process$'\t'"${exe:-$comm}")
+  done < <(ps -eo pid=,comm= 2>/dev/null || true)
+  mapfile -t units < <(systemctl list-unit-files --type=service --no-legend --no-pager 2>/dev/null | awk 'NF {print $1}' || true)
+  if (( ${#units[@]} > 0 )); then
+    while IFS=$'\t' read -r unit frag exec; do
+      name=$(audit_agent_name_for "${unit%.service}" || audit_agent_name_for "$frag" || audit_agent_name_for "$exec" || true)
+      [[ -z "$name" ]] || evidence+=("$name"$'\t'service$'\t'"${frag:-$unit}")
+    done < <(systemctl show -p Id,FragmentPath,ExecStart --no-pager -- "${units[@]}" 2>/dev/null | awk '
+      function flush() { if (id != "") printf "%s\t%s\t%s\n", id, frag, ex; id = frag = ex = "" }
+      /^Id=/ { flush(); id = substr($0, 4) }
+      /^FragmentPath=/ { frag = substr($0, 14) }
+      /^ExecStart=/ { if (match($0, /path=[^ ;]+/)) ex = substr($0, RSTART + 5, RLENGTH - 5) }
+      END { flush() }' || true)
+  fi
+  while IFS=$'\t' read -r package status; do
+    [[ "$status" == installed ]] || continue
+    name=$(audit_agent_name_for "${package%%:*}" || true)
+    [[ -z "$name" ]] || evidence+=("$name"$'\t'package$'\t'"$package")
+  done < <(dpkg-query -W -f='${binary:Package}\t${db:Status-Status}\n' 2>/dev/null || true)
+  for prefix in /usr/local /usr/local/share /usr/local/qcloud /opt /usr/sbin /usr/bin /usr/local/sbin /usr/local/bin; do
+    for name in "${VENDOR_AGENT_NAMES[@]}"; do
+      for path in "$prefix/$name" "$prefix/${name,,}"; do
+        if [[ -e "$AUDIT_ROOT$path" ]]; then evidence+=("$name"$'\t'path$'\t'"$path"); break; fi
+      done
+    done
+  done
+  for key in "${evidence[@]}"; do
+    IFS=$'\t' read -r name kind path <<<"$key"
+    if [[ "$kind" == package ]]; then owner=${path%%:*}; else owner=$(audit_package_owner "$path" || true); fi
+    if [[ -n "$owner" ]]; then
+      # Same-name packages from the official Debian archive are not vendor agents.
+      if audit_debian_package "$owner"; then continue; fi
+      [[ "$seen" != *$'\n'"pkg:$owner"$'\n'* ]] || continue
+      seen+="pkg:$owner"$'\n'
+      audit_add A agent "$owner" "商家 agent「$name」由软件包 $owner 安装，该包不是 Debian 官方源；可预览 purge 后确认。卸载后该商家的监控、重置密码等面板功能可能失效"
+    else
+      [[ "$seen" != *$'\n'"file:$name"$'\n'* ]] || continue
+      seen+="file:$name"$'\n'
+      audit_add B agent "$name" "商家 agent（$kind：$path）不是软件包安装的，只报告；请按商家文档手动卸载（例如官方卸载脚本），拿不准就联系商家或用官方系统重装"
     fi
   done
-  for path in /usr/local/aegis /usr/local/uniagent /usr/local/hostguard /usr/local/qcloud /usr/local/share/aliyun-assist; do
-    [[ ! -e "$AUDIT_ROOT$path" ]] || audit_add B agent "$path" '检测到商家客户端目录；非包管理文件不自动删除，请向商家核实卸载方法'
-  done
-  while IFS=' ' read -r unit _; do
-    case "$unit" in
-      aliyun*|aegis*|tat-agent*|qcloud*|stargate*|barad*|hostguard*|uniagent*)
-        path=$(systemctl show -p FragmentPath --value "$unit" 2>/dev/null || true)
-        if [[ -n "$path" ]] && ! audit_package_owner "$path" >/dev/null; then
-          audit_add B agent "$unit" '非软件包安装的商家服务，只报告；请按商家文档手动卸载'
-        fi ;;
-    esac
-  done < <(systemctl list-unit-files --type=service --no-legend --no-pager 2>/dev/null || true)
 }
 
 collect_security_audit() {
   AUDIT_FINDINGS=()
-  AUDIT_NETWORK_SAFE=false
   AUDIT_SESSION_KEY=$(audit_session_key) || AUDIT_SESSION_KEY=''
   AUDIT_APT_SOURCES=$(apt-cache policy 2>/dev/null || true)
-  local file package status unit path uid user effective command keys listener pid exe exim4_found=false
+  local file package status unit path uid user effective command keys listener pid exe cloud_detail exim4_found=false key_ok=true key_path
+  local -a key_paths=()
   audit_keys
   [[ -n "$AUDIT_SESSION_KEY" ]] || audit_add B keys session '无法确定当前 SSH 公钥，禁止删除任何公钥'
-  if [[ -d "$AUDIT_ROOT/etc/cloud" && ! -e "$AUDIT_ROOT/etc/cloud/cloud-init.disabled" ]]; then
-    if audit_network_persistent; then AUDIT_NETWORK_SAFE=true
-    else audit_add B network cloud-init '无法可靠判断网络是否依赖 cloud-init，跳过关闭；加固执行停止，请人工检查'; fi
-    audit_add A cloud cloud-init "创建 /etc/cloud/cloud-init.disabled 关闭；网络检查=$AUDIT_NETWORK_SAFE；恢复：删除这个文件"
+  if audit_cloud_init_present && [[ ! -e "$CLOUD_DISABLED_FLAG" ]]; then
+    if audit_cloud_network_classify; then
+      cloud_detail="网络配置已写在 /etc 的普通文件里（$CLOUD_NET_KIND），关闭后网络不受影响；关闭方式：创建 /etc/cloud/cloud-init.disabled；恢复：删除这个文件"
+      [[ "$CLOUD_NET_STATIC" != true ]] || cloud_detail+="；使用静态地址：$CLOUD_STATIC_HINT"
+      audit_add A cloud cloud-init "$cloud_detail"
+    else
+      audit_add B cloud-skip cloud-init "不关闭 cloud-init：$CLOUD_NET_REASON；只跳过这一项，其他项照常进行"
+    fi
   fi
   [[ $(qemu_guest_agent_status) != installed ]] || audit_add A qga qemu-guest-agent '面板通信助手，可复用现有安全卸载流程'
   audit_agents
@@ -3612,25 +3703,77 @@ collect_security_audit() {
     command=$(awk '$1=="authorizedkeyscommand" {$1=""; sub(/^ /, ""); print}' <<<"$effective")
     keys=$(awk '$1=="authorizedkeysfile" {$1=""; sub(/^ /, ""); print}' <<<"$effective")
     [[ "$command" == none ]] || audit_add C ssh AuthorizedKeysCommand "公钥通过额外命令获取：$command；只报告，不改 sshd，建议官方重装"
-    [[ "$keys" == '.ssh/authorized_keys .ssh/authorized_keys2' ]] || audit_add C ssh AuthorizedKeysFile "公钥文件位置不是 Debian 默认值：$keys；只报告，不改 sshd，建议官方重装"
+    # Defaults are .ssh/authorized_keys (+ .ssh/authorized_keys2 on older OpenSSH); the
+    # installer itself pins .ssh/authorized_keys. Anything else is reported.
+    read -ra key_paths <<<"$keys"
+    for key_path in "${key_paths[@]}"; do
+      case "$key_path" in .ssh/authorized_keys|.ssh/authorized_keys2) ;; *) key_ok=false ;; esac
+    done
+    [[ "$keys" == *.ssh/authorized_keys* && "$key_ok" == true ]] || audit_add C ssh AuthorizedKeysFile "公钥文件位置不是 Debian 默认值：$keys；只报告，不改 sshd，建议官方重装"
   else audit_add B ssh sshd 'sshd -T 无法读取有效配置，未能完成 SSH 配置检查'; fi
 }
 
+audit_type_label() {
+  case "$1" in
+    key|keys) printf '登录公钥' ;;
+    cloud) printf 'cloud-init' ;;
+    cloud-skip) printf 'cloud-init（已跳过）' ;;
+    qga) printf 'QEMU Guest Agent' ;;
+    agent) printf '商家 agent' ;;
+    mail) printf '邮件服务 exim4' ;;
+    package) printf '非 Debian 官方源软件包' ;;
+    service) printf '非软件包服务' ;;
+    cron) printf '非软件包计划任务' ;;
+    sudo) printf '额外 sudo 规则' ;;
+    port) printf '监听端口' ;;
+    preload) printf '全局预加载' ;;
+    uid) printf '额外 UID 0 用户' ;;
+    ssh) printf 'SSH 公钥配置' ;;
+    *) printf '%s' "$1" ;;
+  esac
+}
+
+# One plain-language sentence per category, printed once under each level.
+audit_type_help() {
+  case "$1" in
+    key|keys) printf '能用来登录这台服务器的钥匙；不是你提供的钥匙等于别人手里有备用钥匙。' ;;
+    cloud) printf '商家镜像里的开机配置程序，每次开机可能改网络、改密码；网络已固定在 /etc 里时可以关掉。' ;;
+    cloud-skip) printf '这台机器网络可能依赖 cloud-init，关掉有失联风险，所以只跳过它这一项。' ;;
+    qga) printf '商家面板和虚拟机之间的通信助手，面板的重置密码等功能要靠它。' ;;
+    agent) printf '云厂商装的监控、安全或管理客户端，常驻后台。' ;;
+    mail) printf '本机邮件服务，VPS 一般用不上；卸载后 cron 的邮件通知无法投递。' ;;
+    package) printf '不是从 Debian 官方源装的软件，可能是你自己装的，请确认来源。' ;;
+    service) printf '开机自动运行、但不属于任何软件包的服务，请确认是你装的。' ;;
+    cron) printf '定时任务文件不属于任何软件包，请看一眼里面执行什么。' ;;
+    sudo) printf '额外授予的 root 提权规则，请确认谁拥有。' ;;
+    port) printf '由非官方软件监听的网络端口，请确认你知道它是什么。' ;;
+    preload) printf '系统层面强制给所有程序加载的库，正常系统里应该是空的。' ;;
+    uid) printf 'root 之外还有拥有 root 权限的账号。' ;;
+    ssh) printf 'SSH 获取登录公钥的方式被改过，可能存在你看不到的后门入口。' ;;
+  esac
+}
+
 print_security_audit() {
-  local mode=${1:-summary} level title row count type target detail
+  local mode=${1:-summary} level title row count type target detail seen
   for level in A B C; do
     case "$level" in
-      A) title='建议删除：这些是登录钥匙或商家助手；确认不需要再处理，默认保留。' ;;
-      B) title='需要你看一眼：这些有额外权限或后台行为；可能是你装的，只报告。' ;;
-      C) title='严重异常：这些会改变系统或登录信任；只报告，建议用官方系统重装。' ;;
+      A) title='A 建议删除：这些是登录钥匙或商家助手；确认不需要再处理，默认保留。' ;;
+      B) title='B 需要你看一眼：这些有额外权限或后台行为；可能是你装的，只报告。' ;;
+      C) title='C 严重异常：这些会改变系统或登录信任；只报告，建议用官方系统重装。' ;;
     esac
     count=0
     for row in "${AUDIT_FINDINGS[@]}"; do [[ "$row" != "$level"$'\t'* ]] || count=$((count + 1)); done
-    printf '\n[%s] %s（%s 项）\n' "$level" "$title" "$count"
+    printf '\n[%s]（%s 项）\n' "$title" "$count"
     if [[ "$mode" == full ]]; then
+      seen=$'\n'
       for row in "${AUDIT_FINDINGS[@]}"; do
+        [[ "$row" == "$level"$'\t'* ]] || continue
         IFS=$'\t' read -r _ type target detail <<<"$row"
-        [[ "$row" != "$level"$'\t'* ]] || printf '  %s：%s — %s\n' "$type" "$target" "$detail"
+        if [[ "$seen" != *$'\n'"$type"$'\n'* ]]; then
+          seen+="$type"$'\n'
+          printf '  ▸ %s：%s\n' "$(audit_type_label "$type")" "$(audit_type_help "$type")"
+        fi
+        printf '      - %s — %s\n' "$target" "$detail"
       done
     fi
   done
@@ -3638,6 +3781,7 @@ print_security_audit() {
 }
 
 hardening_delete_key() {
+  HARDENING_KEY_DELETED=false
   local file=$1 remove=$2 session before after line fp stage="$TMP_DIR/authorized-keys" original count
   session=$(audit_session_key) || { warn '无法确定当前会话公钥，只报告，禁止删除。'; return 0; }
   [[ "$remove" != "$session" ]] || { warn '不能删除当前 SSH 会话的公钥。'; return 0; }
@@ -3709,6 +3853,7 @@ finally:
     os.close(directory)
 KEY_REPLACE
   then warn '公钥原子替换未完成，已停止删除，请检查备份与文件系统。'; return 0; fi
+  HARDENING_KEY_DELETED=true
   log "已删除 $file 中的 $remove；保留 $(wc -l <<<"$after") 把有效公钥。"
 }
 
@@ -3803,56 +3948,93 @@ hardening_purge_agent() {
   [[ $(dpkg-query -W -f='${db:Status-Status}' -- "$package" 2>/dev/null || true) != installed ]] || return 1
 }
 
+readonly HARDENING_RISK_NOTICE='关闭 cloud-init 和 Guest Agent 后，面板上的重置密码等功能可能失效。请确认你在面板上能看到 root 密码，或者自己知道 root 密码。'
+declare -a HARDENING_ACTIONS=()
+
+# Flow (R3): read-only audit -> three levels -> risk notice and confirmation -> per-item
+# confirmation (default N) -> backup first, then act -> report. Nothing is written (no
+# backup directory either) until the risk notice is confirmed, and an unused backup
+# directory is removed again when no item was executed.
 run_security_hardening() {
+  local row level type target detail fp actionable=0
+  HARDENING_ACTIONS=()
   collect_security_audit
+  print_security_audit full
+  for row in "${AUDIT_FINDINGS[@]}"; do
+    if [[ "$row" == A$'\t'* ]]; then actionable=$((actionable + 1)); fi
+  done
+  if (( actionable == 0 )); then
+    log '没有 A 级建议项：未做任何修改，也没有创建备份。'
+    return 0
+  fi
+  printf '\n%s\n' "$HARDENING_RISK_NOTICE"
+  ask_yes_no '已了解上述风险，并确认知道 root 密码，继续逐项确认？' false || { log '已取消，未做任何修改。'; return 0; }
   install -d -m 0700 "$BACKUP_ROOT"
   BACKUP_DIR=$(mktemp -d "$BACKUP_ROOT/hardening-XXXXXXXX")
-  print_security_audit full >"$BACKUP_DIR/audit-before.txt"
-  print_security_audit summary
-  log "完整体检报告：$BACKUP_DIR/audit-before.txt"
-  local row level type target detail fp
-  for row in "${AUDIT_FINDINGS[@]}"; do
-    if [[ "$row" == B$'\t'network$'\t'* ]]; then
-      warn '无法可靠判断网络配置是否依赖 cloud-init，已停止加固执行；请先人工确认网络持久化。'
-      return 0
-    fi
-  done
-  printf '%s\n' '关闭 cloud-init 和 Guest Agent 后，面板上的重置密码等功能可能失效。请确认你在面板上能看到 root 密码，或者自己知道 root 密码。'
-  ask_yes_no '已了解上述风险，并确认知道 root 密码，继续逐项确认？' false || return 0
   TMP_DIR=$(mktemp -d /root/vps-hardening-XXXXXXXX)
+  print_security_audit full >"$BACKUP_DIR/audit-before.txt"
   for row in "${AUDIT_FINDINGS[@]}"; do
     IFS=$'\t' read -r level type target detail <<<"$row"
     [[ "$level" == A ]] || continue
-    printf '%s：%s\n' "$target" "$detail"
+    printf '\n%s：%s\n' "$target" "$detail"
     case "$type" in
       key)
         fp=${detail%%；*}
         if [[ -z "$AUDIT_SESSION_KEY" || "$fp" == "$AUDIT_SESSION_KEY" ]]; then log '当前会话的钥匙或会话无法确定，禁止删除。'; continue; fi
         if ask_yes_no "保留 $target 的 $fp？" true; then continue; fi
         ask_yes_no "确认删除 $fp（默认不删除）？" false || continue
-        hardening_delete_key "$target" "$fp" ;;
+        HARDENING_KEY_DELETED=false
+        hardening_delete_key "$target" "$fp"
+        if [[ "$HARDENING_KEY_DELETED" == true ]]; then
+          HARDENING_ACTIONS+=("已从 $target 删除公钥 $fp；恢复：用 $BACKUP_DIR/files$target 覆盖回原文件")
+        fi ;;
       cloud)
         ask_yes_no '关闭 cloud-init？' false || continue
-        if ! audit_network_persistent; then warn '网络检查结果变化，已停止加固执行。'; break; fi
-        reject_symlink /etc/cloud
-        hardening_backup /etc/cloud/cloud-init.disabled
-        touch /etc/cloud/cloud-init.disabled
-        [[ -f /etc/cloud/cloud-init.disabled ]] || die 'cloud-init 关闭标记验证失败。'
-        log 'cloud-init 已关闭；恢复：删除 /etc/cloud/cloud-init.disabled' ;;
+        # Re-check right before acting; a skip only affects this item.
+        if ! audit_cloud_network_classify; then warn "网络检查结果变化，跳过 cloud-init：$CLOUD_NET_REASON"; continue; fi
+        reject_symlink "${CLOUD_DISABLED_FLAG%/*}"
+        hardening_backup "${CLOUD_DISABLED_FLAG%/*}"
+        hardening_backup /etc/network/interfaces
+        hardening_backup /etc/network/interfaces.d
+        hardening_backup /etc/netplan
+        hardening_backup /etc/systemd/network
+        install -m 0644 /dev/null "$CLOUD_DISABLED_FLAG"
+        [[ -f "$CLOUD_DISABLED_FLAG" ]] || die 'cloud-init 关闭标记验证失败。'
+        log "cloud-init 已关闭（下次开机生效）；恢复：删除 $CLOUD_DISABLED_FLAG"
+        if [[ "$CLOUD_NET_STATIC" == true ]]; then warn "$CLOUD_STATIC_HINT"; fi
+        HARDENING_ACTIONS+=("已关闭 cloud-init（创建 /etc/cloud/cloud-init.disabled）；恢复：删除这个文件即可重新启用") ;;
       qga)
         ask_yes_no '卸载 QEMU Guest Agent？' false || continue
         hardening_backup /etc/qemu
-        remove_qemu_guest_agent ;;
+        remove_qemu_guest_agent
+        if [[ $(qemu_guest_agent_status || true) != installed ]]; then
+          HARDENING_ACTIONS+=("已卸载 QEMU Guest Agent；恢复：apt-get install qemu-guest-agent；备份：$BACKUP_DIR/files/etc/qemu")
+        fi ;;
       agent)
         ask_yes_no "卸载商家 agent 软件包 $target？" false || continue
-        hardening_purge_agent "$target" ;;
-      mail) hardening_purge_exim4 ;;
+        hardening_purge_agent "$target" || warn "商家 agent $target 未能卸载，已跳过。"
+        if [[ $(dpkg-query -W -f='${db:Status-Status}' -- "$target" 2>/dev/null || true) != installed ]]; then
+          HARDENING_ACTIONS+=("已 purge 商家 agent 软件包 $target；配置备份：$BACKUP_DIR/files；需要时从商家渠道重新安装")
+        fi ;;
+      mail)
+        hardening_purge_exim4 || warn 'exim4 未完成卸载，已跳过；系统状态以 dpkg 为准。'
+        if [[ $(dpkg-query -W -f='${db:Status-Status}' -- exim4 2>/dev/null || true) != installed ]]; then
+          HARDENING_ACTIONS+=("已 purge exim4 邮件服务；cron 输出邮件将无法投递；恢复：apt-get install exim4；配置备份：$BACKUP_DIR/files/etc/exim4")
+        fi ;;
     esac
   done > >(tee "$BACKUP_DIR/actions.txt") 2>&1
+  if (( ${#HARDENING_ACTIONS[@]} == 0 )); then
+    rm -rf -- "$BACKUP_DIR"
+    log '没有执行任何修改，已删除未使用的备份目录。'
+    BACKUP_DIR=''
+    return 0
+  fi
   collect_security_audit
   print_security_audit full >"$BACKUP_DIR/audit-after.txt"
-  print_security_audit summary
-  log "加固报告和备份：$BACKUP_DIR"
+  print_security_audit full
+  printf '\n加固报告：\n'
+  printf '  - %s\n' "${HARDENING_ACTIONS[@]}"
+  log "备份与体检报告：$BACKUP_DIR（audit-before.txt、audit-after.txt、actions.txt）"
 }
 
 print_report() {

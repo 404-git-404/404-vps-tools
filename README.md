@@ -42,6 +42,6 @@ Debian 完整初始化包含系统更新、SSH 公钥与端口、UFW、SmartDNS�
 
 快速初始化默认开启 Debian 安全源自动更新，自定义初始化可选（默认开启）；不自动重启、不发邮件，保留 hold，排除 sing-box/SmartDNS。初始化只为 sing-box 设置开机自启，不启动；启动条件先写好，没有 /etc/sing-box/config.json 时开机跳过。结尾检查各服务自启与 UFW 实际状态，缺少自启则 enable，不额外启动；保留 SSH 模式下 ssh、ufw、fail2ban 只报告。
 
-选项 8 先体检、显示三级摘要，完整报告写入备份目录；确认面板功能风险和 root 密码后逐项确认，删除默认 N。QEMU Guest Agent 只在这里卸载，初始化不再涉及。初始化把用户提供或确认复用的公钥指纹保存在 /var/lib/404-vps-tools/trusted-key-fingerprints；无法关联当前 SSH 会话、公钥只剩一把、当前会话公钥均禁止删除。商家 agent 只自动处理明确名称的软件包，其他文件只报告。exim4 邮件服务可选卸载，先模拟 `apt-get -s purge 'exim4*'`；连带删除非 exim4 包时列出名单并额外确认，默认 N。确认后复核计划并备份，只清除已确认的包；卸载后 cron 任务的输出邮件将无法投递。
+选项 8 先只读体检并分三级显示（A 建议删除、B 需要你看一眼、C 严重异常），A 级有项时先显示风险提示并确认，再逐项确认（默认 N），先备份后执行，结尾给出报告和恢复方式；没有 A 级项时不创建备份。QEMU Guest Agent 只在这里卸载，初始化不再涉及。初始化把用户提供或确认复用的公钥指纹保存在 /var/lib/404-vps-tools/trusted-key-fingerprints；无法确定当前 SSH 会话所用公钥、公钥只剩一把、当前会话公钥，均禁止删除。商家 agent 按进程名、服务名或安装路径识别，仅软件包安装且不在 Debian 官方源的才可 purge，其余只报告并提示手动卸载。exim4 可选卸载，先模拟 `apt-get -s purge 'exim4*'`，连带删除非 exim4 包时列出名单并额外确认，卸载后 cron 邮件将无法投递。
 
-运行 ash debian-init.sh --audit 只读体检，完整报告输出到终端，不创建备份、锁或临时文件。cloud-init 仅在简单、独立的持久 DHCP 配置通过检查时允许关闭；生成配置、静态路由、复杂配置或 netplan 等无法证明安全时跳过并停止执行，请先人工检查。恢复 cloud-init：删除 /etc/cloud/cloud-init.disabled。
+运行 `bash debian-init.sh --audit` 只读体检，完整报告输出到终端，不创建备份、锁或临时文件。cloud-init 仅在网络配置已写在 /etc 的普通文件（ifupdown、netplan、systemd-networkd，DHCP 或静态均可）且未配置每次开机重新生成网络时才可关闭；否则只跳过这一项。关闭方式是创建 /etc/cloud/cloud-init.disabled，恢复时删除该文件。
