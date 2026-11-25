@@ -39,6 +39,8 @@ jobs:
             tests/ipv6-boot-state-test.sh
             tests/qemu-guest-agent-test.sh
             tests/ci-workflow-test.sh
+            tests/dns-precheck-test.sh
+            tests/sysctl-dir-container-test.sh
             .github/scripts/ci-fetch.sh
             .github/scripts/ci-required-checks.sh
           )
@@ -64,6 +66,8 @@ jobs:
             tests/init-flow-test.sh \
             tests/ipv6-boot-state-test.sh \
             tests/qemu-guest-agent-test.sh \
+            tests/dns-precheck-test.sh \
+            tests/sysctl-dir-container-test.sh \
             tests/ci-workflow-test.sh; do
             test -x "$executable_script"
           done
@@ -143,6 +147,7 @@ jobs:
           PATH="$RUNNER_TEMP/mawk-bin:$PATH" bash tests/system-update-test.sh
           PATH="$RUNNER_TEMP/mawk-bin:$PATH" bash tests/init-flow-test.sh
           PATH="$RUNNER_TEMP/mawk-bin:$PATH" bash tests/qemu-guest-agent-test.sh
+          PATH="$RUNNER_TEMP/mawk-bin:$PATH" bash tests/dns-precheck-test.sh
           PATH="$RUNNER_TEMP/mawk-bin:$PATH" bash tests/ci-workflow-test.sh
 
       - name: Validate Actions workflows and inline shell
@@ -178,6 +183,20 @@ jobs:
               bash /repo/tests/qemu-guest-agent-test.sh --package-manager
           done
 
+      - name: Verify TCP tuning and IPv6 override without /etc/sysctl.d on Debian 12 and 13
+        run: |
+          for debian_version in 12 13; do
+            docker run --rm --env VPS_TEST_CONTAINER=1 --volume "$PWD:/repo:ro" "debian:$debian_version" \
+              bash -Eeuo pipefail -c '
+                export DEBIAN_FRONTEND=noninteractive
+                apt-get update -qq
+                apt-get install -y -qq --no-install-recommends procps util-linux >/dev/null
+                # A minimal image: the directories the installer writes into do not exist.
+                rm -rf /etc/sysctl.d /etc/modules-load.d
+                test ! -e /etc/sysctl.d
+                bash /repo/tests/sysctl-dir-container-test.sh'
+          done
+
       - name: Run ShellCheck
         run: |
           shellcheck \
@@ -197,6 +216,8 @@ jobs:
             tests/ipv6-boot-state-test.sh \
             tests/qemu-guest-agent-test.sh \
             tests/ci-workflow-test.sh \
+            tests/dns-precheck-test.sh \
+            tests/sysctl-dir-container-test.sh \
             .github/scripts/ci-fetch.sh \
             .github/scripts/ci-required-checks.sh \
             /tmp/node-wizard.sh \

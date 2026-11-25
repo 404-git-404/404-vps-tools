@@ -143,6 +143,7 @@ for scenario in fresh repeat reality config-error action-error no-backend; do
     install_sing_box() { fail 'sing-box installation was reached'; }
     configure_ssh() { fail 'SSH configuration was reached'; }
     configure_ufw() { fail 'UFW configuration was reached'; }
+    ensure_system_dns() { record dns-precheck; }
     wait_for_package_manager() { record wait-apt; }
     apt_get() {
       record apt "$@"
@@ -248,10 +249,12 @@ for scenario in fresh repeat reality config-error action-error no-backend; do
     esac
     if [[ "$scenario" == fresh ]]; then
       grep -Fxq 'apt install -y --no-install-recommends --no-upgrade fail2ban python3-systemd nftables' "$TRACE"
+      # The system DNS check runs lazily, only when packages must be installed, and before APT.
+      [[ "$(grep -nE '^(dns-precheck|wait-apt|apt update)' "$TRACE" | head -3 | cut -d: -f2 | paste -sd,)" == 'dns-precheck,wait-apt,apt update' ]]
       grep -Fxq 'systemctl mask --runtime fail2ban.service' "$TRACE"
       grep -Fxq 'systemctl unmask --runtime fail2ban.service' "$TRACE"
-    elif grep -q '^apt ' "$TRACE"; then
-      fail 'already-installed packages were sent to APT'
+    elif grep -Eq '^(apt |dns-precheck)' "$TRACE"; then
+      fail 'already-installed packages triggered APT or the DNS precheck'
     fi
     cmp "$TMP_DIR/jail.local" "$FAIL2BAN_DIR/jail.local"
     cmp "$TMP_DIR/local-owner.local" "$FAIL2BAN_DIR/jail.d/local-owner.local"

@@ -51,6 +51,7 @@ readonly LEGACY_NETWORK_UNIT='/etc/systemd/system/404-network-stack.service'
 readonly LEGACY_NETWORK_HELPER='/usr/local/libexec/404-network-stack'
 readonly LEGACY_IPV6_SYSCTL='/etc/sysctl.d/99-disable-ipv6.conf'
 readonly FALLBACK_DNS='1.1.1.1'
+readonly DNS_PROBE_HOST='deb.debian.org'
 # Second line of the network sysctl file written when the user chooses to restore IPv6.
 readonly AUTO_RESTORE_MARK='# IPv6 restored by Auto: overrides unmanaged disable_ipv6 settings'
 
@@ -123,6 +124,8 @@ SWAP_REUSE_FILE=false
 SWAPFILE_SNAPSHOT=''
 PERSIST_RESOLV_IMMUTABLE=false
 RESOLV_WRITTEN_SHA=''
+EARLY_DNS_FIXED=false
+EARLY_DNS_BACKUP=''
 IPV6_OLD_DEFAULT=''
 declare -A IPV6_OLD_INTERFACES=()
 NETWORK_POLICY_CHANGED=false
@@ -239,6 +242,16 @@ restore_attrs() {
 reject_symlink() {
   local path=$1
   [[ ! -L "$path" ]] || die "$path 不能是符号链接。"
+}
+
+# Create a missing directory (and missing parents) as 0755 despite the 077 umask.
+# Existing directories are left exactly as they are.
+ensure_dir() {
+  local dir=$1 parent
+  [[ ! -d "$dir" ]] || return 0
+  parent=${dir%/*}
+  if [[ -n "$parent" && "$parent" != "$dir" ]]; then ensure_dir "$parent"; fi
+  install -d -m 0755 -- "$dir"
 }
 
 make_mutable() {
@@ -510,6 +523,8 @@ preflight() {
   log "地址：$(ip -brief address show scope global 2>/dev/null | tr '\n' '; ' || true)"
   log "默认路由：$({ ip -4 route show default 2>/dev/null; ip -6 route show default 2>/dev/null; } | tr '\n' '; ' || true)"
   log "本轮备份：$BACKUP_DIR"
+  # Fail2ban-only checks lazily: it needs no network when its packages are already installed.
+  if [[ "$INSTALL_MODE" != fail2ban ]]; then ensure_system_dns; fi
 }
 
 apt_get() {
@@ -1083,9 +1098,141 @@ rollback_ssh_keys() {
   fi
 }
 
+ipv4_https_probe() {
+  local provider=$1 host=$2 address=$3 result rc
+  # Fixed IPs keep this probe independent of the system resolver. Disable curlrc and proxies,
+  # keep the hostname in the URL for SNI and certificate checks. Any HTTP response proves the
+  # HTTPS connection, including 400 from a bare DoH request.
+  if result=$(curl --disable -4 --noproxy '*' --resolve "$host:443:$address" \
+    --silent --show-error --output /dev/null --write-out '%{http_code}' \
+    --connect-timeout 4 --max-time 6 "https://$host/dns-query" 2>&1); then
+    if [[ "$result" =~ ^[1-5][0-9][0-9]$ ]]; then
+      log "IPv4 HTTPS $provider: PASS (HTTP $result)"
+      return 0
+    fi
+    warn "IPv4 HTTPS $provider: FAIL (no HTTP response: $result)"
+  else
+    rc=$?
+    warn "IPv4 HTTPS $provider: FAIL (curl $rc: $result)"
+  fi
+  return 1
+}
+
 ipv4_https_works() {
-  curl -4 --fail --silent --show-error --output /dev/null --connect-timeout 5 --max-time 10 https://www.google.com/generate_204 2>/dev/null ||
-    curl -4 --fail --silent --show-error --output /dev/null --connect-timeout 5 --max-time 10 https://icanhazip.com 2>/dev/null
+  ipv4_https_probe Cloudflare cloudflare-dns.com 1.1.1.1 ||
+    ipv4_https_probe Google dns.google 8.8.8.8
+}
+
+# Plain TCP check for a system that does not have curl yet (it cannot be installed without DNS).
+ipv4_tcp_probe() {
+  local provider=$1 address=$2
+  # shellcheck disable=SC2016 # $1 is expanded by the inner bash on purpose.
+  if timeout 6 bash -c 'exec 3<>"/dev/tcp/$1/443"' _ "$address" 2>/dev/null; then
+    log "IPv4 TCP 443 $provider: PASS"
+    return 0
+  fi
+  warn "IPv4 TCP 443 $provider: FAIL"
+  return 1
+}
+
+ipv4_direct_reachable() {
+  if command -v curl >/dev/null 2>&1; then
+    ipv4_https_works
+  else
+    ipv4_tcp_probe Cloudflare 1.1.1.1 || ipv4_tcp_probe Google 8.8.8.8
+  fi
+}
+
+system_dns_works() {
+  if command -v timeout >/dev/null 2>&1; then
+    timeout 20 getent ahostsv4 "$DNS_PROBE_HOST" >/dev/null 2>&1
+  else
+    getent ahostsv4 "$DNS_PROBE_HOST" >/dev/null 2>&1
+  fi
+}
+
+dns_prompt_available() {
+  ( : </dev/tty ) 2>/dev/null && ( : >/dev/tty ) 2>/dev/null
+}
+
+restore_early_dns_original() {
+  local target=/etc/resolv.conf backup=$1 flags=$2
+  if [[ -L "$backup/resolv.conf.symlink" ]]; then
+    rm -f -- "$target"
+    ln -s -- "$(readlink "$backup/resolv.conf.symlink")" "$target" || true
+  elif [[ -e "$backup/resolv.conf" ]]; then
+    if mountpoint -q "$target" 2>/dev/null; then
+      cat "$backup/resolv.conf" >"$target" || true
+    else
+      rm -f -- "$target"
+      cp -a -- "$backup/resolv.conf" "$target" || true
+    fi
+  elif [[ -e "$backup/no-resolv-conf" ]]; then
+    rm -f -- "$target"
+  fi
+  if [[ "$flags" == *i* ]] && command -v chattr >/dev/null 2>&1; then chattr +i -- "$target" 2>/dev/null || true; fi
+}
+
+# Independent early repair: it is deliberately not part of any rollback transaction, so a
+# later failure never puts the broken resolver configuration back. The backup is kept.
+early_repair_system_dns() {
+  local target=/etc/resolv.conf staged="$TMP_DIR/resolv.conf.early" backup="$BACKUP_DIR/dns-precheck"
+  local out='' flags='' saved
+  install -d -m 0700 "$backup"
+  if [[ -L "$target" ]]; then
+    saved="$backup/resolv.conf.symlink"
+    ln -s -- "$(readlink "$target")" "$saved"
+  elif [[ -e "$target" ]]; then
+    saved="$backup/resolv.conf"
+    cp -a -- "$target" "$saved"
+  else
+    saved="$backup/no-resolv-conf"
+    : >"$saved"
+  fi
+  printf 'nameserver 127.0.0.1\nnameserver %s\noptions timeout:2 attempts:2\n' "$FALLBACK_DNS" >"$staged"
+  if [[ -e "$target" && ! -L "$target" ]] && command -v lsattr >/dev/null 2>&1; then
+    out=$(lsattr -d -- "$target" 2>/dev/null || true)
+    flags=${out%% *}
+    if [[ "$flags" == *i* || "$flags" == *a* ]]; then
+      log "临时解除文件属性 i/a：$target"
+      if ! command -v chattr >/dev/null 2>&1 || ! chattr -i -a -- "$target"; then
+        die "无法解除 $target 的 immutable/append-only 属性；原文件备份在 $saved"
+      fi
+    fi
+  fi
+  if mountpoint -q "$target" 2>/dev/null; then
+    cp "$staged" "$target" || die "无法写入挂载点 $target；原文件备份在 $saved"
+  else
+    rm -f -- "$target" || die "无法替换 $target；原文件备份在 $saved"
+    install -m 0644 -- "$staged" "$target"
+  fi
+  if ! system_dns_works; then
+    restore_early_dns_original "$backup" "$flags"
+    die "已写入备用 DNS $FALLBACK_DNS，但仍无法解析 $DNS_PROBE_HOST（可能拦截了 UDP 53）。已恢复原 resolv.conf；备份在 $saved"
+  fi
+  EARLY_DNS_FIXED=true
+  EARLY_DNS_BACKUP=$saved
+  log "已提前修复系统 DNS：写入 127.0.0.1 / $FALLBACK_DNS；原文件备份在 $saved"
+}
+
+# Runs before the first apt or network use. A broken system resolver must not stop the
+# installer, but a dead IPv4 network must be reported as such.
+ensure_system_dns() {
+  CURRENT_STEP='检查系统 DNS'
+  system_dns_works && return 0
+  warn "系统 DNS 无法解析 $DNS_PROBE_HOST，后续 apt 与下载都会失败。"
+  if ! ipv4_direct_reachable; then
+    die 'IPv4 网络不可用：不经过 DNS 直连 1.1.1.1 / 8.8.8.8 的 443 端口也不通。请检查服务器网络、网关和防火墙。'
+  fi
+  warn "IPv4 直连正常，故障在系统 DNS（resolv.conf 的 DNS 不应答，或只剩不可用的 127.0.0.1）。"
+  warn "将先备份 /etc/resolv.conf，再写入 127.0.0.1 / $FALLBACK_DNS / options timeout:2 attempts:2（与初始化最终写入的内容相同），此修复不随后续回滚撤销。"
+  if dns_prompt_available; then
+    ask_yes_no '临时写入备用 DNS 以继续？' true ||
+      die '已取消：系统 DNS 不可用，无法继续。未做任何修改。'
+  else
+    warn '没有可用的交互终端，自动写入备用 DNS 以继续。'
+  fi
+  early_repair_system_dns
 }
 
 ipv6_global_present() {
@@ -1350,7 +1497,7 @@ restore_ipv6_runtime() {
 
 write_ipv6_restore_policy() {
   # Debian 13 ships its sysctl defaults under /usr/lib; /etc/sysctl.d may not exist yet.
-  [[ -d "${NETWORK_SYSCTL%/*}" ]] || install -d -m 0755 "${NETWORK_SYSCTL%/*}"
+  ensure_dir "${NETWORK_SYSCTL%/*}"
   cat >"$NETWORK_SYSCTL" <<EOF
 # Managed by vps-init.sh
 $AUTO_RESTORE_MARK
@@ -1492,7 +1639,7 @@ managed_ipv4_policy_file() {
 install_ipv4_policy() {
   local path staged
   for path in "${IPV4_POLICY_FILES[@]}"; do
-    mkdir -p -- "${path%/*}"
+    ensure_dir "${path%/*}"
     make_mutable "$path"
   done
   staged=$(mktemp -d "$TMP_DIR/ipv4-policy.XXXXXXXX")
@@ -1739,6 +1886,7 @@ apply_network_stack() {
     log "Auto 正在迁移脚本管理的 IPv6 策略；备份=$BACKUP_DIR"
     [[ "$restore_runtime" == true ]] || return 0
   else
+    ensure_dir "${NETWORK_SYSCTL%/*}"
     cat >"$NETWORK_SYSCTL" <<EOF
 # Managed by vps-init.sh
 net.ipv6.conf.all.disable_ipv6 = 0
@@ -1797,6 +1945,8 @@ configure_tcp_tuning() {
   fi
   reject_symlink "$TCP_SYSCTL"
   reject_symlink "$BBR_MODULES"
+  # Minimal Debian 13 installs may not have /etc/sysctl.d yet.
+  ensure_dir "${TCP_SYSCTL%/*}"
   make_mutable "$TCP_SYSCTL"
   make_mutable "$BBR_MODULES"
   available=$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || true)
@@ -1830,6 +1980,7 @@ EOF
       warn "默认 qdisc 无法设为 fq：$out"
     fi
     if out=$(sysctl -w net.ipv4.tcp_congestion_control=bbr 2>&1); then
+      ensure_dir "${BBR_MODULES%/*}"
       printf 'tcp_bbr\n' >"$BBR_MODULES"
       printf 'net.ipv4.tcp_congestion_control = bbr\n' >>"$TCP_SYSCTL"
     else
@@ -1852,7 +2003,8 @@ configure_sagernet_repo() {
   pub_count=$(gpg --batch --homedir "$gh" --with-colons --list-keys | awk -F: '$1=="pub"{c++} END{print c+0}')
   primary=$(gpg --batch --homedir "$gh" --with-colons --list-keys | awk -F: '$1=="pub"{want=1;next} want&&$1=="fpr"{print $10; exit}')
   [[ "$pub_count" -eq 1 && "$primary" == "$SAGER_KEY_FINGERPRINT" ]] || die "SagerNet key 不满足唯一主密钥指纹要求：$primary / count=$pub_count。"
-  install -d -m 0755 /etc/apt/keyrings
+  ensure_dir /etc/apt/keyrings
+  ensure_dir /etc/apt/sources.list.d
   reject_symlink /etc/apt/keyrings/sagernet.gpg
   reject_symlink /etc/apt/sources.list.d/sagernet.sources
   make_mutable /etc/apt/keyrings/sagernet.gpg
@@ -2709,6 +2861,7 @@ write_cf_tool() {
   local path
   for path in "$CF_TOOL" "$CF_SERVICE" "$CF_TIMER"; do
     reject_symlink "$path"
+    ensure_dir "${path%/*}"
     make_mutable "$path"
   done
   cat >"$CF_TOOL" <<'CFEOF'
@@ -3093,6 +3246,7 @@ sing-box      : $(sing-box version 2>/dev/null | head -1 || echo unavailable)
 Fail2ban      : $fail2ban_status
 TCP / qdisc   : $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo unavailable) / $(sysctl -n net.core.default_qdisc 2>/dev/null || echo unavailable)
 Swap          : $(awk '/SwapTotal:/ {printf "%.0f MiB", $2/1024}' /proc/meminfo)
+系统 DNS      : $(if [[ "$EARLY_DNS_FIXED" == true ]]; then printf '已提前修复系统 DNS，原文件备份在 %s' "$EARLY_DNS_BACKUP"; else printf '未提前修复（系统 DNS 原本可用）'; fi)
 备份目录      : $BACKUP_DIR
 需要重启      : $([[ -e /var/run/reboot-required ]] && echo yes || echo no)
 ============================================================
@@ -3241,6 +3395,7 @@ run_smartdns_only() {
   install_and_configure_smartdns
   configure_system_dns
   log "SmartDNS 完成：网络=$NETWORK_STACK（策略 $NETWORK_REQUEST）；上游=$SMARTDNS_TRANSPORT；备份=$BACKUP_DIR"
+  if [[ "$EARLY_DNS_FIXED" == true ]]; then log "已提前修复系统 DNS，原文件备份在 $EARLY_DNS_BACKUP"; fi
 }
 
 run_singbox_only() {
@@ -3263,6 +3418,8 @@ run_fail2ban_only() {
     fi
   done
   if (( ${#missing[@]} )); then
+    ensure_system_dns
+    CURRENT_STEP='安装 Fail2ban 依赖'
     wait_for_package_manager
     if [[ "$fresh" == true ]]; then
       if [[ "$(systemctl is-enabled fail2ban.service 2>/dev/null || true)" == masked* ]]; then
