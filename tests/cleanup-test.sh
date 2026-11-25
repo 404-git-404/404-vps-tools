@@ -83,7 +83,7 @@ for scenario in yes no kernel critical changed; do
       [[ "$1" == --remove && "$2" == -- && "$3" == libfixture && $# == 3 ]] || fail 'unsafe dpkg operation'
       echo removed >>"$trace"
     }
-    ask_yes_no() { [[ "$2" == false ]]; echo prompt >>"$trace"; [[ "$scenario" != no ]]; }
+    ask_yes_no() { [[ "$2" == false ]] || fail 'package removal must default to N'; echo prompt >>"$trace"; [[ "$scenario" != no ]]; }
     cleanup_orphan_packages >"$test_dir/preview"
     grep -Fq "Remv $pkg [1]" "$test_dir/preview"
     case "$scenario" in
@@ -165,6 +165,16 @@ NETWORK_STACK=ipv4
 persist_network_stack
 [[ "$(cat "$NETWORK_STACK_STATE")" == ipv4 && "$(stat -c %a "$NETWORK_STACK_STATE")" == 644 ]]
 [[ "$(cat "$BACKUP_DIR/files$NETWORK_STACK_STATE")" == dual ]]
+# A failed state write only warns (returns 1) and never aborts before the final report.
+NETWORK_STACK=unknown
+if persist_network_stack 2>"$BACKUP_DIR/warn"; then exit 1; fi
+grep -Fq '无法保存网络栈' "$BACKUP_DIR/warn"
+NETWORK_STACK=dual
+rm -f "$NETWORK_STACK_STATE"
+ln -s "$BACKUP_DIR/elsewhere" "$NETWORK_STACK_STATE"
+if persist_network_stack 2>"$BACKUP_DIR/warn"; then exit 1; fi
+grep -Fq '符号链接' "$BACKUP_DIR/warn"
+[[ ! -e "$BACKUP_DIR/elsewhere" ]]
 TEST
 
 if [[ "$(uname -s)" == Linux ]] && command -v script >/dev/null; then

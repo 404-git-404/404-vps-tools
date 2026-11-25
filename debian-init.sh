@@ -3839,15 +3839,19 @@ run_system_cleanup() {
     "$SAFE_CLEANUP_APT" "$SAFE_CLEANUP_JOURNAL" "$SAFE_CLEANUP_TMPFILES" "$orphans" "$kernels"
 }
 
+# Best-effort bookkeeping that runs after every system change: a failure only warns, so the final
+# report (with the new SSH port) is never lost. The sing-box wizard falls back to a local probe.
 persist_network_stack() {
-  case "$NETWORK_STACK" in ipv4|dual) ;; *) die "无法保存网络栈：$NETWORK_STACK" ;; esac
-  reject_symlink "${NETWORK_STACK_STATE%/*}"
-  reject_symlink "$NETWORK_STACK_STATE"
-  ensure_dir "${NETWORK_STACK_STATE%/*}"
-  make_mutable "$NETWORK_STACK_STATE"
-  printf '%s\n' "$NETWORK_STACK" >"$NETWORK_STACK_STATE"
-  chmod 0644 "$NETWORK_STACK_STATE"
-  [[ "$(cat "$NETWORK_STACK_STATE")" == "$NETWORK_STACK" ]] || die '网络栈状态保存验证失败。'
+  local dir=${NETWORK_STACK_STATE%/*}
+  case "$NETWORK_STACK" in ipv4|dual) ;; *) warn "无法保存网络栈：$NETWORK_STACK"; return 1 ;; esac
+  if [[ -L "$dir" || -L "$NETWORK_STACK_STATE" ]]; then warn "$NETWORK_STACK_STATE 或其目录是符号链接，未保存网络栈。"; return 1; fi
+  if ensure_dir "$dir" && make_mutable "$NETWORK_STACK_STATE" &&
+    printf '%s\n' "$NETWORK_STACK" >"$NETWORK_STACK_STATE" && chmod 0644 "$NETWORK_STACK_STATE" &&
+    [[ "$(cat "$NETWORK_STACK_STATE")" == "$NETWORK_STACK" ]]; then
+    return 0
+  fi
+  warn "网络栈状态保存失败：$NETWORK_STACK_STATE"
+  return 1
 }
 
 main() {
@@ -3908,7 +3912,7 @@ main() {
   else
     configure_fail2ban
   fi
-  persist_network_stack
+  persist_network_stack || warn '网络栈状态未保存；sing-box 向导将按本地 IPv6 检测给出默认值。'
   run_safe_cleanup
   print_report
 }

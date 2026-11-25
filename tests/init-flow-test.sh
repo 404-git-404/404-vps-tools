@@ -26,7 +26,7 @@ fail() { echo "FAIL: $*" >&2; exit 1; }
 errexit_probe() { echo 'errexit probe'; false; echo 'unexpected continuation'; }
 expect_bash_failure 'errexit probe' errexit_probe
 
-for scenario in port22 default custom-port preserve reuse missing-keygen existing-swap no-swap low-memory multi multi-cancel ipv6-guard cancel custom-full custom-base custom-remove cli base ipv6-restore ipv6-keep; do
+for scenario in port22 default state-fail custom-port preserve reuse missing-keygen existing-swap no-swap low-memory multi multi-cancel ipv6-guard cancel custom-full custom-base custom-remove cli base ipv6-restore ipv6-keep; do
   trace="$work/$scenario.trace"
   : >"$trace"
   set +e
@@ -147,7 +147,7 @@ for scenario in port22 default custom-port preserve reuse missing-keygen existin
     configure_ufw() { if [[ "$PRESERVE_SSH" == false ]]; then execute ufw; fi; }
     configure_cf8443() { :; }
     configure_fail2ban() { execute fail2ban; }
-    persist_network_stack() { execute "state=$NETWORK_STACK"; }
+    persist_network_stack() { execute "state=$NETWORK_STACK"; [[ "$scenario" != state-fail ]]; }
     run_safe_cleanup() { execute cleanup; }
     print_report() { execute report; }
     if [[ "$scenario" == ipv6-guard ]]; then SSH_CONNECTION='2001:db8::1 12345 2001:db8::2 22'; else unset SSH_CONNECTION; fi
@@ -233,6 +233,9 @@ if (
   SSH_LISTENERS_CONFIRMED=true SSH_CONFIRMED_LISTENERS='0.0.0.0:22'
   configure_ssh
 ); then fail 'accepted listeners changed after confirmation'; fi
+# Enter at the split-listener prompt must mean "no" (default N), not override the listeners.
+# shellcheck disable=SC2016 # Evaluated inside the isolated fixture.
+expect_bash_failure '已取消 SSH 切换' 'ssh_listener_addresses() { printf "0.0.0.0:22\n[::]:2222\n"; }; read_tty() { printf -v "$2" ""; }; confirm_ssh_listener_change'
 expect_bash_failure '执行阶段出现未预收集的交互' 'CONFIG_CONFIRMED=true; read_tty unexpected response'
 # shellcheck disable=SC2016 # Evaluated inside the isolated fixture.
 expect_bash_failure '需要交互输入，但当前没有可用' 'rm -f -- "$work/tty"; CONFIG_CONFIRMED=false; ask_yes_no "确认以上配置并开始自动安装？" true'

@@ -259,11 +259,19 @@ EOF
 
     local state address route expected output
     output="$TEST_TEMP_DIR/network-prompt"
-    for state in absent invalid ipv4 dual; do
+    for state in absent invalid empty blank binary mixedcase multiline ipv4 dual; do
         for address in yes no; do
             for route in yes no; do
                 rm -f "$NETWORK_STACK_STATE"
-                [[ "$state" == absent ]] || printf '%s\n' "$state" >"$NETWORK_STACK_STATE"
+                case "$state" in
+                    absent) ;;
+                    empty) : >"$NETWORK_STACK_STATE" ;;
+                    blank) printf '  \n' >"$NETWORK_STACK_STATE" ;;
+                    binary) printf '\000\377dual\377\n\000' >"$NETWORK_STACK_STATE" ;;
+                    mixedcase) printf 'DUAL\n' >"$NETWORK_STACK_STATE" ;;
+                    multiline) printf 'garbage\ndual\n' >"$NETWORK_STACK_STATE" ;;
+                    *) printf '%s\n' "$state" >"$NETWORK_STACK_STATE" ;;
+                esac
                 # shellcheck disable=SC2329 # Invoked by the sourced wizard.
                 ip() {
                     case "$*" in
