@@ -98,6 +98,7 @@ done
 )
 (
   preflight() { :; }
+  ensure_system_dns() { :; }
   acquire_lock() { :; }
   collect_initialization_config() { fail 'update dispatch entered initialization'; }
   run_system_update_only() { echo update-only >"$work/dispatch"; }
