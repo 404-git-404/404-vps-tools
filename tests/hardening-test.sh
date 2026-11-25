@@ -5,6 +5,51 @@ repo=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 work=$(mktemp -d)
 root="$work/root"
 mkdir -p "$root" "$work/tmp" "$work/backup"
+if [[ ${1:-} == --exim4-package-manager ]]; then
+  [[ -f /.dockerenv && $EUID == 0 ]] || { echo 'Exim package test requires a disposable root Docker container.' >&2; exit 1; }
+  # shellcheck disable=SC1091
+  source "$repo/debian-init.sh"
+  trap - ERR HUP INT TERM
+  trap 'rm -rf -- "$work"' EXIT
+  TMP_DIR="$work/tmp" BACKUP_DIR="$work/backup"
+  build_exim_fixture() (
+    local name=$1 depends=${2:-}
+    umask 022
+    mkdir -p "$work/$name/DEBIAN"
+    {
+      printf 'Package: %s\nVersion: 1\nArchitecture: all\nMaintainer: Test\nDescription: Disposable Exim test fixture\n' "$name"
+      if [[ -n "$depends" ]]; then printf 'Depends: %s\n' "$depends"; fi
+    } >"$work/$name/DEBIAN/control"
+    if [[ "$name" == exim4-base ]]; then
+      mkdir -p "$work/$name/etc/exim4"
+      echo 'local fixture configuration' >"$work/$name/etc/exim4/fixture.conf"
+      echo /etc/exim4/fixture.conf >"$work/$name/DEBIAN/conffiles"
+    fi
+    dpkg-deb --build "$work/$name" "$work/$name.deb"
+    dpkg --install "$work/$name.deb"
+  )
+  build_exim_fixture exim4-base
+  build_exim_fixture exim4-config
+  build_exim_fixture exim4 'exim4-base, exim4-config'
+  build_exim_fixture mail-consumer-fixture exim4-base
+  extra_confirmed=false
+  ask_yes_no() {
+    [[ "$2" == false ]]
+    if [[ "$1" == '额外确认：'* ]]; then [[ "$extra_confirmed" == true ]]; else return 0; fi
+  }
+  hardening_purge_exim4
+  [[ $(dpkg-query -W -f='${db:Status-Status}' mail-consumer-fixture) == installed ]]
+  [[ $(dpkg-query -W -f='${db:Status-Status}' exim4-base) == installed ]]
+  [[ ! -e "$BACKUP_DIR/exim4-purge-plan.txt" ]]
+  extra_confirmed=true
+  hardening_purge_exim4
+  [[ $(dpkg-query -W -f='${db:Status-Status}' exim4-base 2>/dev/null || true) != installed ]]
+  [[ $(dpkg-query -W -f='${db:Status-Status}' mail-consumer-fixture 2>/dev/null || true) != installed ]]
+  grep -Fxq 'local fixture configuration' "$BACKUP_DIR/files/etc/exim4/fixture.conf"
+  grep -Fq mail-consumer-fixture "$BACKUP_DIR/exim4-purge-plan.txt"
+  echo 'PASS: real APT Exim wildcard, collateral dependency confirmation, purge and backup'
+  exit 0
+fi
 sed -e "s|^readonly AUDIT_ROOT=.*|readonly AUDIT_ROOT='$root'|" \
   -e "s|^readonly TRUSTED_KEYS_STATE=.*|readonly TRUSTED_KEYS_STATE='$work/trusted'|" \
   -e "s|^readonly AUTHORIZED_KEYS=.*|readonly AUTHORIZED_KEYS='$root/root/.ssh/authorized_keys'|" \
@@ -201,7 +246,7 @@ dpkg-query() {
     -S) if [[ "$audit_mode" == negative || "$*" == *'/usr/bin/official'* ]]; then echo 'official: /usr/bin/official'; else return 1; fi ;;
     -W)
       if [[ "$*" == *'${Version}'* ]]; then echo 1.0
-      elif [[ "$*" == *'${binary:Package}'* ]]; then printf 'official\tinstalled\n'; [[ "$audit_mode" != positive ]] || printf 'external\tinstalled\n'
+      elif [[ "$*" == *'${binary:Package}'* ]]; then printf 'official\tinstalled\n'; [[ "$audit_mode" != positive ]] || printf 'external\tinstalled\nexim4-base\tinstalled\n'
       elif [[ "$*" == *'-- aegis' && "$audit_mode" == positive ]]; then echo installed
       else return 1; fi ;;
     *) return 1 ;;
@@ -237,7 +282,7 @@ printf '%s\n%s\n' "$current" "$other" >"$file"
 rm "$TRUSTED_KEYS_STATE"
 collect_security_audit
 print_security_audit full >"$work/positive"
-for detector in key cloud qga agent package service cron sudo port preload uid ssh; do
+for detector in key cloud qga agent mail package service cron sudo port preload uid ssh; do
   printf '%s\n' "${AUDIT_FINDINGS[@]}" | grep -q $'\t'"$detector"$'\t' || fail "missing positive $detector"
 done
 grep -Fq '没有归属记录' "$work/positive"
@@ -278,6 +323,96 @@ cmp "$work/before" "$work/after"
   ask_yes_no() { fail 'network uncertainty reached execution'; }
   run_security_hardening
 )
+
+# Exim purge: default N, independent collateral confirmation, fixed list, changes,
+# unsafe simulations and failures. The real confirmation parser is used throughout.
+for scenario in family multiarch collateral collateral-cancel cancel absent malformed simulation-failure resim-failure changed version-change only-extra ssh-package purge-failure verification-failure query-failure; do
+  exim_dir="$work/exim-$scenario"
+  mkdir -p "$exim_dir/backup"
+  echo 0 >"$exim_dir/count"
+  : >"$exim_dir/trace"
+  set +e
+  (
+    set -Ee
+    BACKUP_DIR="$exim_dir/backup"
+    wait_for_package_manager() { :; }
+    read_tty() {
+      [[ "$1" == *'[y/N] '* ]] || fail 'Exim confirmation not default N'
+      printf '%s\n' "$1" >>"$exim_dir/trace"
+      if [[ "$scenario" == cancel || ( "$scenario" == collateral-cancel && "$1" == '额外确认：'* ) ]]; then
+        printf -v "$2" ''
+      else printf -v "$2" y; fi
+    }
+    apt_get() {
+      local IFS=' ' calls
+      [[ "$*" == '-s -o APT::Get::AutomaticRemove=false purge -- exim4*' ]] || fail 'Exim wildcard not passed literally to APT'
+      calls=$(cat "$exim_dir/count"); calls=$((calls + 1)); echo "$calls" >"$exim_dir/count"
+      echo simulate >>"$exim_dir/trace"
+      [[ "$scenario" != simulation-failure ]] || return 100
+      if [[ "$scenario" == resim-failure && "$calls" == 2 ]]; then return 100; fi
+      case "$scenario" in
+        absent) echo '0 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.' ;;
+        only-extra) printf '0 upgraded, 0 newly installed, 1 to remove and 0 not upgraded.\nPurg mail-consumer [1]\n' ;;
+        malformed) printf '1 upgraded, 0 newly installed, 1 to remove and 0 not upgraded.\nInst unrelated [1]\nPurg exim4 [1]\n' ;;
+        multiarch) printf '0 upgraded, 0 newly installed, 2 to remove and 0 not upgraded.\nPurg exim4:amd64 [1]\nPurg exim4-base:amd64 [1]\n' ;;
+        collateral|collateral-cancel) printf '0 upgraded, 0 newly installed, 3 to remove and 0 not upgraded.\nPurg exim4 [1]\nPurg exim4-base [1]\nRemv mail-consumer [1]\n' ;;
+        ssh-package) printf '0 upgraded, 0 newly installed, 2 to remove and 0 not upgraded.\nPurg exim4 [1]\nPurg openssh-server [1]\n' ;;
+        changed)
+          if (( calls == 2 )); then printf '0 upgraded, 0 newly installed, 3 to remove and 0 not upgraded.\nPurg exim4 [1]\nPurg exim4-base [1]\nPurg unexpected-package [1]\n'
+          else printf '0 upgraded, 0 newly installed, 2 to remove and 0 not upgraded.\nPurg exim4 [1]\nPurg exim4-base [1]\n'; fi ;;
+        *) printf '0 upgraded, 0 newly installed, 2 to remove and 0 not upgraded.\nPurg exim4 [1]\nPurg exim4-base [1]\n' ;;
+      esac
+    }
+    dpkg-query() {
+      local IFS=' '
+      if [[ "$*" == *'${db:Status-Status}'* ]]; then
+        [[ -f "$exim_dir/purged" ]] || fail 'unexpected verification before purge'
+        case "$scenario" in
+          verification-failure) echo config-files ;;
+          query-failure) return 2 ;;
+          *) return 1 ;;
+        esac
+      elif [[ "$1" == -W ]]; then
+        if [[ "$scenario" == version-change && $(cat "$exim_dir/count") == 2 ]]; then echo 'exim4 2'; else echo 'exim4 1'; fi
+      elif [[ "$1" == -L ]]; then echo /etc/exim4/fixture.conf
+      else fail 'unexpected Exim dpkg-query'; fi
+    }
+    hardening_backup() { [[ "$1" == /etc/exim4 ]]; echo backup >>"$exim_dir/trace"; touch "$exim_dir/config-backup"; }
+    dpkg() {
+      local IFS=' ' expected
+      [[ "${*:1:3}" == '--no-force-depends,depends-version --purge --' ]] || fail 'unsafe Exim dpkg flags'
+      expected=$'exim4\nexim4-base'
+      case "$scenario" in multiarch) expected=$'exim4-base:amd64\nexim4:amd64';; collateral) expected+=$'\nmail-consumer';; esac
+      [[ $(printf '%s\n' "${@:4}" | sort) == "$expected" ]] || fail 'unapproved Exim purge list'
+      [[ -f "$exim_dir/config-backup" && -s "$BACKUP_DIR/exim4-purge-plan.txt" && -s "$BACKUP_DIR/exim4-purge-versions.txt" ]] || fail 'Exim purge preceded backups'
+      echo purge >>"$exim_dir/trace"
+      [[ "$scenario" != purge-failure ]] || return 1
+      touch "$exim_dir/purged"
+    }
+    hardening_purge_exim4
+  ) >"$exim_dir/output" 2>&1
+  result=$?
+  set -e
+  case "$scenario" in
+    malformed|simulation-failure|resim-failure|changed|version-change|only-extra|ssh-package|purge-failure|verification-failure|query-failure)
+      (( result != 0 )) || fail "Exim $scenario accepted" ;;
+    *) (( result == 0 )) || { cat "$exim_dir/output"; fail "Exim $scenario failed"; } ;;
+  esac
+  case "$scenario" in
+    family|multiarch|collateral|purge-failure|verification-failure|query-failure) grep -Fxq purge "$exim_dir/trace" ;;
+    *) if grep -Fxq purge "$exim_dir/trace"; then fail "Exim $scenario purged packages"; fi ;;
+  esac
+  case "$scenario" in
+    collateral|collateral-cancel)
+      grep -Fxq '  mail-consumer' "$exim_dir/output"
+      grep -Fq '额外确认：也删除' "$exim_dir/trace" ;;
+    *) if grep -Fq '额外确认：' "$exim_dir/trace"; then fail 'unexpected collateral confirmation'; fi ;;
+  esac
+  case "$scenario" in
+    absent|malformed|simulation-failure|only-extra|ssh-package) ;;
+    *) grep -Fq 'cron 任务的输出邮件将无法投递' "$exim_dir/output" ;;
+  esac
+done
 
 # Boot checks enable only, preserve SSH, report UFW active and waiting config.
 trace="$work/boot-trace" enabled_file="$work/enabled"

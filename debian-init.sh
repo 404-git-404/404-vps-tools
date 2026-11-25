@@ -3561,7 +3561,7 @@ collect_security_audit() {
   AUDIT_NETWORK_SAFE=false
   AUDIT_SESSION_KEY=$(audit_session_key) || AUDIT_SESSION_KEY=''
   AUDIT_APT_SOURCES=$(apt-cache policy 2>/dev/null || true)
-  local file package status unit path uid user effective command keys listener pid exe
+  local file package status unit path uid user effective command keys listener pid exe exim4_found=false
   audit_keys
   [[ -n "$AUDIT_SESSION_KEY" ]] || audit_add B keys session '无法确定当前 SSH 公钥，禁止删除任何公钥'
   if [[ -d "$AUDIT_ROOT/etc/cloud" && ! -e "$AUDIT_ROOT/etc/cloud/cloud-init.disabled" ]]; then
@@ -3573,8 +3573,12 @@ collect_security_audit() {
   audit_agents
   while IFS=$'\t' read -r package status; do
     [[ "$status" == installed ]] || continue
+    case "${package%%:*}" in exim4|exim4-*) exim4_found=true ;; esac
     if ! audit_debian_package "$package"; then audit_add B package "$package" '本地缓存不能证明已安装版本来自 Debian 官方源（包括缓存缺失或旧版本），请核实'; fi
   done < <(dpkg-query -W -f='${binary:Package}\t${db:Status-Status}\n' 2>/dev/null || true)
+  if [[ "$exim4_found" == true ]]; then
+    audit_add A mail exim4 'Debian 邮件服务，VPS 上一般用不上；卸载后 cron 任务的输出邮件将无法投递。先模拟 purge，连带删除其他包时还需额外确认'
+  fi
   while IFS=' ' read -r unit _; do
     [[ -n "$unit" ]] || continue
     path=$(systemctl show -p FragmentPath --value "$unit" 2>/dev/null || true)
@@ -3708,12 +3712,81 @@ KEY_REPLACE
   log "已删除 $file 中的 $remove；保留 $(wc -l <<<"$after") 把有效公钥。"
 }
 
+hardening_purge_plan() {
+  local plan=$1
+  plan=${plan/#Purg /Remv }
+  cleanup_apt_plan "${plan//$'\n'Purg /$'\n'Remv }"
+}
+
+hardening_purge_exim4() {
+  local plan planned current versions observed_versions package status path rc found=false
+  local -a packages=() extra=()
+  CURRENT_STEP='模拟卸载 exim4 邮件服务'
+  wait_for_package_manager
+  # Quote the wildcard: APT must simulate the entire exim4 family, not shell matches.
+  plan=$(apt_get -s -o APT::Get::AutomaticRemove=false purge -- 'exim4*') || return 1
+  planned=$(hardening_purge_plan "$plan" | sort) || { warn '无法安全解析 exim4 purge 计划，已停止。'; return 1; }
+  [[ -n "$planned" ]] || { log '没有需要清除的 exim4 软件包。'; return 0; }
+  mapfile -t packages <<<"$planned"
+  for package in "${packages[@]}"; do
+    case "${package%%:*}" in
+      exim4|exim4-*) found=true ;;
+      openssh-server) warn '计划涉及 openssh-server，可能修改 sshd 配置，已停止加固。'; return 1 ;;
+      *) extra+=("$package") ;;
+    esac
+  done
+  [[ "$found" == true ]] || { warn '计划中没有 exim4 系列，拒绝仅删除其他软件包。'; return 1; }
+  versions=$(dpkg-query -W -- "${packages[@]}") || return 1
+  printf 'exim4 完整卸载预览：\n%s\n' "$plan"
+  warn '卸载 exim4 后，cron 任务的输出邮件将无法投递；仍需要邮件通知时请保留。'
+  if (( ${#extra[@]} > 0 )); then
+    printf '除 exim4 系列外，还会连带删除以下软件包：\n'
+    printf '  %s\n' "${extra[@]}"
+  fi
+  ask_yes_no '确认卸载 exim4 邮件服务（cron 输出邮件将无法投递）？' false || return 0
+  if (( ${#extra[@]} > 0 )); then
+    ask_yes_no '额外确认：也删除上面列出的非 exim4 软件包？' false || return 0
+  fi
+  wait_for_package_manager
+  # Recheck after both confirmations. Never widen an already approved removal list.
+  plan=$(apt_get -s -o APT::Get::AutomaticRemove=false purge -- 'exim4*') || return 1
+  current=$(hardening_purge_plan "$plan" | sort) || return 1
+  observed_versions=$(dpkg-query -W -- "${packages[@]}") || return 1
+  if [[ "$current" != "$planned" || "$observed_versions" != "$versions" ]]; then
+    warn 'exim4 删除计划或包版本发生变化，已停止；请重新体检和确认。'
+    return 1
+  fi
+  [[ -n "$BACKUP_DIR" ]] || die '缺少备份目录，拒绝卸载 exim4。'
+  printf '%s\n' "$plan" >"$BACKUP_DIR/exim4-purge-plan.txt"
+  printf '%s\n' "$versions" >"$BACKUP_DIR/exim4-purge-versions.txt"
+  # Include local Exim configuration as well as conffiles of every approved package.
+  hardening_backup /etc/exim4
+  for package in "${packages[@]}"; do
+    dpkg-query -L -- "$package" >"$BACKUP_DIR/$package.files"
+    while IFS= read -r path; do
+      if [[ "$path" == /etc/* && -f "$path" && ! -L "$path" ]]; then hardening_backup "$path"; fi
+    done <"$BACKUP_DIR/$package.files"
+  done
+  # Purge exactly the reviewed list. dpkg enforces dependencies under its own lock;
+  # a new dependency may stop removal, but cannot silently add another package.
+  CURRENT_STEP='清除已确认的 exim4 邮件服务软件包'
+  dpkg --no-force-depends,depends-version --purge -- "${packages[@]}" || return 1
+  for package in "${packages[@]}"; do
+    if status=$(dpkg-query -W -f='${db:Status-Status}' -- "$package" 2>/dev/null); then
+      [[ "$status" == not-installed ]] || { warn "$package 未完成 purge：$status"; return 1; }
+    else
+      rc=$?
+      (( rc == 1 )) || { warn "无法验证 $package 的卸载状态。"; return 1; }
+    fi
+  done
+  log 'exim4 及已额外确认的软件包已清除；cron 输出邮件将无法投递。'
+}
+
 hardening_purge_agent() {
   local package=$1 plan actual
   wait_for_package_manager
   plan=$(apt_get -s -o APT::Get::AutomaticRemove=false purge -- "$package") || return 1
-  # shellcheck disable=SC2001 # Normalize only line-leading APT purge records.
-  actual=$(cleanup_apt_plan "$(sed 's/^Purg /Remv /' <<<"$plan")") || return 1
+  actual=$(hardening_purge_plan "$plan") || return 1
   [[ "$actual" == "$package" ]] || { warn '卸载会影响其他软件包，已跳过。'; return 0; }
   printf '%s\n' "$plan"
   ask_yes_no "确认这个 purge 预览（$package）？" false || return 0
@@ -3773,6 +3846,7 @@ run_security_hardening() {
       agent)
         ask_yes_no "卸载商家 agent 软件包 $target？" false || continue
         hardening_purge_agent "$target" ;;
+      mail) hardening_purge_exim4 ;;
     esac
   done > >(tee "$BACKUP_DIR/actions.txt") 2>&1
   collect_security_audit

@@ -194,6 +194,13 @@ jobs:
               bash /repo/debian-init.sh --audit
           done
 
+      - name: Verify Exim purge and collateral confirmation on Debian 12 and 13
+        run: |
+          for debian_version in 12 13; do
+            docker run --rm --network none --volume "$PWD:/repo:ro" "debian:$debian_version" \
+              bash /repo/tests/hardening-test.sh --exim4-package-manager
+          done
+
       - name: Verify TCP tuning and IPv6 override without /etc/sysctl.d on Debian 12 and 13
         run: |
           for debian_version in 12 13; do
