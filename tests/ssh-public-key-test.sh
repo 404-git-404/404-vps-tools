@@ -97,6 +97,7 @@ for scenario in reuse-many reuse-one decline first empty comments corrupt duplic
             prompt_index=0
             # Reach the actual quick-install dispatch and stop after the key step.
             preflight() { :; }
+            ensure_system_dns() { :; }
             acquire_lock() { :; }
             install_early_dependencies() { :; }
             ensure_port_validation_dependency() { :; }

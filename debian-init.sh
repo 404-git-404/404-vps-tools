@@ -523,8 +523,6 @@ preflight() {
   log "地址：$(ip -brief address show scope global 2>/dev/null | tr '\n' '; ' || true)"
   log "默认路由：$({ ip -4 route show default 2>/dev/null; ip -6 route show default 2>/dev/null; } | tr '\n' '; ' || true)"
   log "本轮备份：$BACKUP_DIR"
-  # Fail2ban-only checks lazily: it needs no network when its packages are already installed.
-  if [[ "$INSTALL_MODE" != fail2ban ]]; then ensure_system_dns; fi
 }
 
 apt_get() {
@@ -1155,29 +1153,85 @@ dns_prompt_available() {
   ( : </dev/tty ) 2>/dev/null && ( : >/dev/tty ) 2>/dev/null
 }
 
-restore_early_dns_original() {
-  local target=/etc/resolv.conf backup=$1 flags=$2
-  if [[ -L "$backup/resolv.conf.symlink" ]]; then
-    rm -f -- "$target"
-    ln -s -- "$(readlink "$backup/resolv.conf.symlink")" "$target" || true
-  elif [[ -e "$backup/resolv.conf" ]]; then
-    if mountpoint -q "$target" 2>/dev/null; then
-      cat "$backup/resolv.conf" >"$target" || true
-    else
-      rm -f -- "$target"
-      cp -a -- "$backup/resolv.conf" "$target" || true
-    fi
-  elif [[ -e "$backup/no-resolv-conf" ]]; then
-    rm -f -- "$target"
-  fi
-  if [[ "$flags" == *i* ]] && command -v chattr >/dev/null 2>&1; then chattr +i -- "$target" 2>/dev/null || true; fi
+# lsattr flags of a regular file; empty for anything else or when lsattr is missing.
+early_dns_flags() {
+  local out
+  [[ -f "$1" && ! -L "$1" ]] || return 0
+  command -v lsattr >/dev/null 2>&1 || return 0
+  out=$(lsattr -d -- "$1" 2>/dev/null) || return 0
+  printf '%s\n' "${out%% *}"
 }
 
-# Independent early repair: it is deliberately not part of any rollback transaction, so a
-# later failure never puts the broken resolver configuration back. The backup is kept.
+# Put /etc/resolv.conf back exactly as backed up: content, existence, symlink and the
+# i/a attributes. Returns non-zero (and says why) when anything could not be restored.
+restore_early_dns_original() {
+  local target=/etc/resolv.conf backup=$1 flags=$2 dir tmp want flag now ok=true
+  dir=${target%/*}
+  tmp="$dir/.resolv.conf.vps-init-restore.$$"
+  if command -v chattr >/dev/null 2>&1; then chattr -i -a -- "$target" 2>/dev/null || true; fi
+  if [[ -L "$backup/resolv.conf.symlink" ]]; then
+    want=$(readlink "$backup/resolv.conf.symlink") || ok=false
+    if [[ ! -L "$target" || "$(readlink "$target")" != "$want" ]]; then
+      rm -f -- "$tmp" || ok=false
+      if ln -s -- "$want" "$tmp" && mv -f -T -- "$tmp" "$target"; then :; else rm -f -- "$tmp"; ok=false; fi
+    fi
+    [[ -L "$target" && "$(readlink "$target")" == "$want" ]] || ok=false
+  elif [[ -f "$backup/resolv.conf" ]]; then
+    if mountpoint -q "$target" 2>/dev/null; then
+      cat "$backup/resolv.conf" >"$target" || ok=false
+    elif [[ -L "$target" || ! -f "$target" ]] || ! cmp -s -- "$backup/resolv.conf" "$target"; then
+      if cp -a -- "$backup/resolv.conf" "$tmp" && mv -f -- "$tmp" "$target"; then :; else rm -f -- "$tmp"; ok=false; fi
+    fi
+    if [[ -L "$target" ]] || ! cmp -s -- "$backup/resolv.conf" "$target"; then ok=false; fi
+  elif [[ -e "$backup/no-resolv-conf" ]]; then
+    rm -f -- "$target" || ok=false
+    if [[ -e "$target" || -L "$target" ]]; then ok=false; fi
+  else
+    ok=false
+  fi
+  for flag in i a; do
+    if [[ "$flags" == *"$flag"* ]]; then
+      if ! command -v chattr >/dev/null 2>&1 || ! chattr "+$flag" -- "$target" 2>/dev/null; then ok=false; fi
+    fi
+  done
+  if [[ -n "$flags" ]]; then
+    now=$(early_dns_flags "$target")
+    for flag in i a; do
+      if [[ "$flags" == *"$flag"* && "$now" != *"$flag"* ]]; then ok=false; fi
+    done
+  fi
+  if [[ "$ok" != true ]]; then warn "未能完整恢复 $target（内容、链接或属性），请手动核对。"; fi
+  [[ "$ok" == true ]]
+}
+
+# Write the new resolv.conf. Every step is checked explicitly (the caller runs this inside
+# a condition, where errexit does not apply). A regular file is replaced by renaming a
+# complete temporary file from the same directory, so a failed write never leaves an empty
+# or missing resolv.conf.
+early_dns_apply() {
+  local target=$1 content=$2 flags=$3 tmp
+  if [[ "$flags" == *i* || "$flags" == *a* ]]; then
+    log "临时解除文件属性 i/a：$target"
+    command -v chattr >/dev/null 2>&1 || return 1
+    chattr -i -a -- "$target" || return 1
+  fi
+  if mountpoint -q "$target" 2>/dev/null; then
+    cat "$content" >"$target" || return 1
+    return 0
+  fi
+  tmp=$(mktemp "${target%/*}/.resolv.conf.vps-init.XXXXXXXX") || return 1
+  if ! cat "$content" >"$tmp" || ! chmod 0644 "$tmp" || ! mv -f -- "$tmp" "$target"; then
+    rm -f -- "$tmp"
+    return 1
+  fi
+}
+
+# Independent early repair: once it has succeeded it is deliberately not part of any
+# rollback transaction, so a later failure never puts the broken resolver configuration
+# back. Until it has succeeded, any failure restores the original and then exits.
 early_repair_system_dns() {
   local target=/etc/resolv.conf staged="$TMP_DIR/resolv.conf.early" backup="$BACKUP_DIR/dns-precheck"
-  local out='' flags='' saved
+  local flags='' saved
   install -d -m 0700 "$backup"
   if [[ -L "$target" ]]; then
     saved="$backup/resolv.conf.symlink"
@@ -1190,32 +1244,25 @@ early_repair_system_dns() {
     : >"$saved"
   fi
   printf 'nameserver 127.0.0.1\nnameserver %s\noptions timeout:2 attempts:2\n' "$FALLBACK_DNS" >"$staged"
-  if [[ -e "$target" && ! -L "$target" ]] && command -v lsattr >/dev/null 2>&1; then
-    out=$(lsattr -d -- "$target" 2>/dev/null || true)
-    flags=${out%% *}
-    if [[ "$flags" == *i* || "$flags" == *a* ]]; then
-      log "临时解除文件属性 i/a：$target"
-      if ! command -v chattr >/dev/null 2>&1 || ! chattr -i -a -- "$target"; then
-        die "无法解除 $target 的 immutable/append-only 属性；原文件备份在 $saved"
-      fi
+  flags=$(early_dns_flags "$target")
+  if ! early_dns_apply "$target" "$staged" "$flags"; then
+    if restore_early_dns_original "$backup" "$flags"; then
+      die "无法写入备用 DNS；已恢复原 $target；备份在 $saved"
     fi
-  fi
-  if mountpoint -q "$target" 2>/dev/null; then
-    cp "$staged" "$target" || die "无法写入挂载点 $target；原文件备份在 $saved"
-  else
-    rm -f -- "$target" || die "无法替换 $target；原文件备份在 $saved"
-    install -m 0644 -- "$staged" "$target"
+    die "无法写入备用 DNS，且未能完整恢复原 $target；原文件备份在 $saved"
   fi
   if ! system_dns_works; then
-    restore_early_dns_original "$backup" "$flags"
-    die "已写入备用 DNS $FALLBACK_DNS，但仍无法解析 $DNS_PROBE_HOST（可能拦截了 UDP 53）。已恢复原 resolv.conf；备份在 $saved"
+    if restore_early_dns_original "$backup" "$flags"; then
+      die "已写入备用 DNS $FALLBACK_DNS，但仍无法解析 $DNS_PROBE_HOST（可能拦截了 UDP 53）。已恢复原 $target；备份在 $saved"
+    fi
+    die "已写入备用 DNS $FALLBACK_DNS，但仍无法解析 $DNS_PROBE_HOST，且未能完整恢复原 $target；原文件备份在 $saved"
   fi
   EARLY_DNS_FIXED=true
   EARLY_DNS_BACKUP=$saved
   log "已提前修复系统 DNS：写入 127.0.0.1 / $FALLBACK_DNS；原文件备份在 $saved"
 }
 
-# Runs before the first apt or network use. A broken system resolver must not stop the
+# Runs after the lock is held and before the first apt or network use. A broken system resolver must not stop the
 # installer, but a dead IPv4 network must be reported as such.
 ensure_system_dns() {
   CURRENT_STEP='检查系统 DNS'
@@ -3784,6 +3831,12 @@ main() {
   fi
   preflight
   acquire_lock
+  # The DNS repair rewrites /etc/resolv.conf, so it only runs once the lock is held. Modes that
+  # never touch the network skip it; Fail2ban-only checks lazily, when packages must be installed.
+  case "$INSTALL_MODE" in
+    fail2ban|qemu-agent-remove) ;;
+    *) ensure_system_dns ;;
+  esac
   case "$INSTALL_MODE" in
     smartdns) run_smartdns_only; return 0 ;;
     singbox) run_singbox_only; return 0 ;;

@@ -19,6 +19,7 @@ record() { local IFS=' '; echo "$*" >>"$TRACE"; }
 quick_fixture() {
   INSTALL_MODE=quick
   preflight() { :; }
+  ensure_system_dns() { :; }
   acquire_lock() { :; }
   read_tty() {
     case "$1" in

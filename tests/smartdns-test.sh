@@ -164,6 +164,7 @@ check_preserved_ssh_network_mode() (
   INSTALL_MODE=quick
   CONTAINER_KIND=lxc
   preflight() { :; }
+  ensure_system_dns() { :; }
   acquire_lock() { :; }
   qemu_guest_agent_status() { echo not-installed; }
   # Simulate menu choice 4 and explicitly select the requested network mode.
@@ -524,6 +525,7 @@ for mode in smartdns singbox; do
     parse_args() { :; }
     select_install_mode() { :; }
     preflight() { record preflight; }
+    ensure_system_dns() { record dns; }
     acquire_lock() { record lock; }
     install_component_dependencies() { record dependencies; }
     install_sing_box() { record singbox; }
@@ -540,10 +542,10 @@ for mode in smartdns singbox; do
     collect_choices() { fail 'component mode reached initialization'; }
     main
     if [[ "$mode" == smartdns ]]; then
-      assert_eq $'preflight\nlock\ndependencies\ndns-backup\nsmartdns\nresolver' "$(cat "$TRACE")" 'SmartDNS scope/order'
+      assert_eq $'preflight\nlock\ndns\ndependencies\ndns-backup\nsmartdns\nresolver' "$(cat "$TRACE")" 'SmartDNS scope/order'
       assert_eq ipv4 "$NETWORK_STACK" 'auto DNS family'
     else
-      assert_eq $'preflight\nlock\ndependencies\nsingbox\nwizard' "$(cat "$TRACE")" 'sing-box scope/order'
+      assert_eq $'preflight\nlock\ndns\ndependencies\nsingbox\nwizard' "$(cat "$TRACE")" 'sing-box scope/order'
     fi
   )
 done

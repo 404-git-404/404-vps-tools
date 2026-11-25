@@ -29,6 +29,7 @@ for scenario in port22 default custom-port preserve reuse missing-keygen existin
     INSTALL_MODE=quick
     case "$scenario" in custom-full|custom-base|custom-remove) INSTALL_MODE=custom;; base) INSTALL_MODE='';; esac
     preflight() { :; }
+    ensure_system_dns() { :; }
     acquire_lock() { :; }
     command() {
       if [[ "$1" == -v && "$2" == ss ]]; then return 0; fi
