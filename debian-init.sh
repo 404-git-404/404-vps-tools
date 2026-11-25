@@ -29,6 +29,14 @@ readonly -a IPV4_POLICY_FILES=("$IPV4_POLICY_HELPER" "$IPV4_POLICY_SERVICE" "$IP
 readonly TCP_SYSCTL='/etc/sysctl.d/99-vps-init-tcp.conf'
 readonly NETWORK_STACK_STATE='/var/lib/404-vps-tools/network-stack'
 readonly BBR_MODULES='/etc/modules-load.d/vps-init-bbr.conf'
+readonly TRUSTED_KEYS_STATE='/var/lib/404-vps-tools/trusted-key-fingerprints'
+readonly SECURITY_APT_CONF='/etc/apt/apt.conf.d/zzzz-404-security'
+AUTO_SECURITY=true
+BOOT_REPORT='未检查'
+declare -a AUDIT_FINDINGS=()
+AUDIT_SESSION_KEY=''
+AUDIT_NETWORK_SAFE=false
+AUDIT_APT_SOURCES=''
 readonly SMARTDNS_CONF='/etc/smartdns/smartdns.conf'
 readonly SMARTDNS_CACHE='/var/cache/smartdns/smartdns.cache'
 readonly SMARTDNS_APT_PIN='/etc/apt/preferences.d/vps-init-smartdns'
@@ -77,7 +85,6 @@ SSH_KEYS_TX=false
 SSH_KEY_DIR_STATE=''
 BASE_ONLY=false
 INSTALL_MODE=''
-REMOVE_QEMU_GUEST_AGENT=false
 SINGBOX_RUNTIME_MASK=false
 NETWORK_REQUEST='auto'
 NETWORK_REQUEST_SET=false
@@ -117,8 +124,6 @@ SMARTDNS_TRANSPORT='unknown'
 RESOLVED_OLD_ACTIVE=false
 RESOLVED_OLD_ENABLED=false
 SINGBOX_WAS_INSTALLED=false
-SINGBOX_WAS_ACTIVE=false
-SINGBOX_WAS_ENABLED=false
 SINGBOX_CONFIG_PREEXISTED=false
 SINGBOX_WAS_MANAGED=false
 SWAP_RECOMMENDED_MIB=0
@@ -158,7 +163,7 @@ usage() {
   bash debian-init.sh
   bash debian-init.sh [选项]
 
-交互菜单：快速安装、自定义安装、退出、仅安装/更新 SmartDNS、仅部署 sing-box、仅安装/更新 Fail2ban、系统清理、仅更新系统、卸载 QEMU Guest Agent。
+交互菜单：1 快速初始化、2 自定义初始化、3 SmartDNS、4 sing-box 节点、5 Fail2ban、6 系统更新、7 清理、8 安全加固、0 退出（9 预留）。
 仅部署 sing-box 独立运行节点配置向导；完整初始化只安装 sing-box，不创建节点。
 
 默认流程：
@@ -196,6 +201,7 @@ usage() {
   --fail2ban-only            仅安装/更新 Fail2ban 并验证 Jail
   --cleanup-only             系统清理，删除软件包和旧内核需分别确认
   --update-only              仅系统更新，保留 sing-box/SmartDNS hold，不安装初始化工具
+  --audit                    只读体检，完整报告输出到终端，不创建备份、锁或临时文件
   --help                     显示帮助
 EOF
 }
@@ -287,8 +293,10 @@ cleanup() {
   restore_ipv6_probe_state || true
   rollback_fail2ban || true
   if [[ "$SINGBOX_RUNTIME_MASK" == true ]]; then
-    systemctl disable sing-box.service >/dev/null 2>&1 || true
-    systemctl stop sing-box.service >/dev/null 2>&1 || true
+    if [[ "$SINGBOX_WAS_INSTALLED" == false ]]; then
+      systemctl disable sing-box.service >/dev/null 2>&1 || true
+      systemctl stop sing-box.service >/dev/null 2>&1 || true
+    fi
     systemctl unmask --runtime sing-box.service >/dev/null 2>&1 || true
   fi
   restore_attrs
@@ -453,7 +461,7 @@ parse_args() {
       --network-stack) [[ $# -ge 2 ]] || die '--network-stack 缺少参数。'; NETWORK_REQUEST=$2; NETWORK_REQUEST_SET=true; shift 2 ;;
       --cloudflare-8443) CF8443_MODE='enable'; shift ;;
       --no-cloudflare-8443) CF8443_MODE='disable'; shift ;;
-      --base-only|--smartdns-only|--sing-box-only|--fail2ban-only|--cleanup-only|--update-only)
+      --base-only|--smartdns-only|--sing-box-only|--fail2ban-only|--cleanup-only|--update-only|--audit)
         [[ -z "$INSTALL_MODE" ]] || die '只能选择一种独立运行模式。'
         case "$1" in
           --base-only) BASE_ONLY=true; INSTALL_MODE=base ;;
@@ -462,6 +470,7 @@ parse_args() {
           --fail2ban-only) INSTALL_MODE=fail2ban ;;
           --cleanup-only) INSTALL_MODE=cleanup ;;
           --update-only) INSTALL_MODE=update ;;
+          --audit) INSTALL_MODE=audit ;;
         esac
         shift ;;
       --help|-h) usage; exit 0 ;;
@@ -496,7 +505,7 @@ preflight() {
   # shellcheck disable=SC1091
   . /etc/os-release
   [[ "${ID:-}" == debian && "${VERSION_ID:-}" =~ ^(12|13)$ ]] || die '仅支持 Debian 12/13。'
-  if [[ "$INSTALL_MODE" == qemu-agent-remove ]]; then return 0; fi
+  if [[ "$INSTALL_MODE" == qemu-agent-remove || "$INSTALL_MODE" == hardening ]]; then return 0; fi
   if [[ ! -d /run/systemd/system ]] || ! command -v systemctl >/dev/null 2>&1; then
     die '需要正在运行的 systemd。'
   fi
@@ -2086,12 +2095,8 @@ capture_singbox_state() {
 
   if dpkg-query -W sing-box >/dev/null 2>&1; then
     SINGBOX_WAS_INSTALLED=true
-    systemctl is-active --quiet sing-box.service 2>/dev/null && SINGBOX_WAS_ACTIVE=true || SINGBOX_WAS_ACTIVE=false
-    systemctl is-enabled --quiet sing-box.service 2>/dev/null && SINGBOX_WAS_ENABLED=true || SINGBOX_WAS_ENABLED=false
   else
     SINGBOX_WAS_INSTALLED=false
-    SINGBOX_WAS_ACTIVE=false
-    SINGBOX_WAS_ENABLED=false
   fi
 }
 
@@ -2124,12 +2129,12 @@ remove_fresh_singbox_default_config() {
 
 restore_singbox_state() {
   if [[ "$SINGBOX_WAS_INSTALLED" == false ]]; then
-    systemctl disable sing-box.service >/dev/null 2>&1 || true
     systemctl stop sing-box.service >/dev/null 2>&1 || true
-    return 0
   fi
-  if [[ "$SINGBOX_WAS_ENABLED" == true ]]; then systemctl enable sing-box.service >/dev/null 2>&1 || true; else systemctl disable sing-box.service >/dev/null 2>&1 || true; fi
-  if [[ "$SINGBOX_WAS_ACTIVE" == true ]]; then systemctl restart sing-box.service; else systemctl stop sing-box.service >/dev/null 2>&1 || true; fi
+  # The gate must exist before enabling. Never start/restart during initialization.
+  configure_singbox_boot_gate
+  systemctl enable sing-box.service
+  systemctl is-enabled --quiet sing-box.service || die 'sing-box 开机自启验证失败。'
 }
 
 install_sing_box() {
@@ -2139,25 +2144,24 @@ install_sing_box() {
   apt_get update
 
   if [[ "$SINGBOX_WAS_INSTALLED" == true && -z "$SING_BOX_VERSION" ]]; then
+    restore_singbox_state
     if [[ "$SINGBOX_WAS_MANAGED" == true ]]; then
       configure_singbox_boot_gate
       mark_singbox_managed
       if [[ ! -e "$SINGBOX_CONFIG" ]]; then
         systemctl stop sing-box.service >/dev/null 2>&1 || true
       fi
-      log "sing-box 已由 vps-init 管理，重跑不升级；保持原有启用状态，配置不存在时保持 inactive：$(sing-box version 2>/dev/null | head -1 || true)"
+      log "sing-box 重跑不升级；已启用开机自启，未启动：$(sing-box version 2>/dev/null | head -1 || true)"
     else
-      log "检测到脚本运行前已存在的 sing-box；重跑默认不升级，也不改其 service/config 状态：$(sing-box version 2>/dev/null | head -1 || true)"
+      log "已有 sing-box 未升级，已添加启动条件并设为开机自启，未启动：$(sing-box version 2>/dev/null | head -1 || true)"
     fi
     return 0
   fi
 
-  if [[ "$SINGBOX_WAS_INSTALLED" == false ]]; then
-    [[ ! -e /run/systemd/system/sing-box.service && ! -L /run/systemd/system/sing-box.service ]] ||
-      die 'sing-box 已有 runtime service 覆盖或 mask，请先检查。'
-    systemctl mask --runtime sing-box.service
-    SINGBOX_RUNTIME_MASK=true
-  fi
+  [[ ! -e /run/systemd/system/sing-box.service && ! -L /run/systemd/system/sing-box.service ]] ||
+    die 'sing-box 已有 runtime service 覆盖或 mask，请先检查。'
+  systemctl mask --runtime sing-box.service
+  SINGBOX_RUNTIME_MASK=true
 
   if [[ -n "$SING_BOX_VERSION" ]]; then
     apt-cache madison sing-box | awk '{print $3}' | grep -Fqx "$SING_BOX_VERSION" || die "仓库中找不到 sing-box=$SING_BOX_VERSION。"
@@ -3265,6 +3269,518 @@ EOF
   log "Fail2ban jails：$(fail2ban-client status | sed -n 's/.*Jail list:[[:space:]]*//p')"
 }
 
+# No files, locks, APT refreshes or temporary files are created by audit helpers.
+# This prefix is empty in production; offline tests replace the constant in a copy.
+readonly AUDIT_ROOT=''
+
+hardening_backup() {
+  local path=$1 dest="$BACKUP_DIR/files$1"
+  [[ -n "$BACKUP_DIR" ]] || die '缺少备份目录，拒绝修改。'
+  reject_symlink "$path"
+  if [[ -e "$path" && ! -e "$dest" ]]; then
+    install -d -m 0700 "${dest%/*}"
+    cp -a -- "$path" "$dest"
+  fi
+}
+
+record_trusted_keys() {
+  local fingerprints
+  if [[ "$REUSE_PUBLIC_KEY" == true ]]; then fingerprints=$REUSED_KEY_FINGERPRINTS
+  else fingerprints=$(ssh_public_key_fingerprints <<<"$PUBLIC_KEY"); fi
+  [[ -n "$fingerprints" ]] || die '没有已确认的公钥指纹。'
+  reject_symlink "${TRUSTED_KEYS_STATE%/*}"
+  reject_symlink "$TRUSTED_KEYS_STATE"
+  hardening_backup "$TRUSTED_KEYS_STATE"
+  install -d -o root -g root -m 0700 "${TRUSTED_KEYS_STATE%/*}"
+  # Replace this account's record only; keep decisions for other accounts.
+  { if [[ -f "$TRUSTED_KEYS_STATE" ]]; then awk -F '\t' -v p="$AUTHORIZED_KEYS" '$1 != p' "$TRUSTED_KEYS_STATE"; fi
+    while IFS= read -r fp; do printf '%s\t%s\n' "$AUTHORIZED_KEYS" "$fp"; done <<<"$fingerprints"
+  } >"$TMP_DIR/trusted-keys"
+  install -o root -g root -m 0600 "$TMP_DIR/trusted-keys" "$TRUSTED_KEYS_STATE"
+  cmp -s "$TMP_DIR/trusted-keys" "$TRUSTED_KEYS_STATE" || die '公钥指纹记录验证失败。'
+}
+
+write_security_update_policy() {
+  cat <<'EOF'
+// Managed by 404-vps-tools. Preserve dpkg holds and exclude external packages.
+#clear Unattended-Upgrade::Allowed-Origins;
+#clear Unattended-Upgrade::Origins-Pattern;
+Unattended-Upgrade::Origins-Pattern {
+  "origin=Debian,codename=${distro_codename}-security,label=Debian-Security";
+};
+Unattended-Upgrade::Package-Blacklist { "^sing-box$"; "^smartdns$"; };
+Unattended-Upgrade::Automatic-Reboot "false";
+Unattended-Upgrade::Mail "";
+APT::Periodic::Enable "1";
+APT::Periodic::Update-Package-Lists "1";
+APT::Periodic::Unattended-Upgrade "1";
+EOF
+}
+
+security_updates_enabled() {
+  local config
+  config=$(apt-config dump 2>/dev/null) || return 1
+  grep -Fxq 'APT::Periodic::Unattended-Upgrade "1";' <<<"$config" &&
+    grep -Fxq 'APT::Periodic::Enable "1";' <<<"$config" &&
+    systemctl is-enabled --quiet apt-daily.timer && systemctl is-enabled --quiet apt-daily-upgrade.timer
+}
+
+configure_security_updates() {
+  [[ "$AUTO_SECURITY" == true ]] || { log '未选择自动安全更新，保留现状。'; return 0; }
+  ensure_dir "${SECURITY_APT_CONF%/*}"
+  hardening_backup "$SECURITY_APT_CONF"
+  write_security_update_policy >"$TMP_DIR/security-policy"
+  install -m 0644 "$TMP_DIR/security-policy" "$SECURITY_APT_CONF"
+  # Install only after the restrictive policy is in place.
+  apt_get install -y unattended-upgrades
+  local effective origins
+  effective=$(apt-config dump)
+  origins=$(awk '/^Unattended-Upgrade::(Origins-Pattern|Allowed-Origins):: /' <<<"$effective")
+  # shellcheck disable=SC2016 # APT expands this placeholder at upgrade time.
+  [[ "$origins" == 'Unattended-Upgrade::Origins-Pattern:: "origin=Debian,codename=${distro_codename}-security,label=Debian-Security";' ]] ||
+    die '自动安全更新来源验证失败，请检查其他 APT 配置。'
+  grep -Fxq 'Unattended-Upgrade::Automatic-Reboot "false";' <<<"$effective" || die '禁止自动重启的配置未生效。'
+  grep -Fxq 'Unattended-Upgrade::Mail "";' <<<"$effective" || die '禁止邮件的配置未生效。'
+  systemctl enable apt-daily.timer apt-daily-upgrade.timer
+  security_updates_enabled || die '自动安全更新开机自启验证失败。'
+}
+
+check_boot_services() {
+  local unit result enabled active extra before
+  local -a units=(ssh.service ufw.service smartdns.service fail2ban.service chrony.service cron.service vnstat.service sing-box.service)
+  [[ ! -f "$CF_TIMER" ]] || units+=(vps-init-cloudflare-8443.timer)
+  if [[ "$AUTO_SECURITY" == true ]] || command -v unattended-upgrade >/dev/null; then units+=(apt-daily.timer apt-daily-upgrade.timer); fi
+  BOOT_REPORT=''
+  for unit in "${units[@]}"; do
+    before=$(systemctl is-enabled "$unit" 2>/dev/null || true)
+    enabled=$before
+    result=''
+    if [[ "$PRESERVE_SSH" == true && "$unit" =~ ^(ssh|ufw|fail2ban)\.service$ ]]; then
+      result='保留 SSH：只报告'
+    elif [[ "$unit" == ssh.service ]] && systemctl is-enabled --quiet ssh.socket 2>/dev/null; then
+      result='检测到 ssh.socket 自启：只报告，避免冲突'
+    else
+      if [[ "$unit" == sing-box.service ]]; then configure_singbox_boot_gate; fi
+      if [[ "$before" != enabled ]]; then
+        printf '%s\t%s\n' "$unit" "$before" >>"$BACKUP_DIR/boot-before.tsv"
+        if ! systemctl enable "$unit"; then result='启用失败，请检查'; fi
+      fi
+      enabled=$(systemctl is-enabled "$unit" 2>/dev/null || true)
+      [[ "$enabled" == enabled ]] || result="${result}；未获得持久自启状态"
+    fi
+    active=$(systemctl is-active "$unit" 2>/dev/null || true)
+    extra=''
+    if [[ "$unit" == ufw.service ]]; then extra="；$(ufw status 2>/dev/null | head -1 || true)"; fi
+    if [[ "$unit" == sing-box.service && "$enabled" == enabled && ! -e "$SINGBOX_CONFIG" ]]; then extra='；已启用，等待配置'; fi
+    BOOT_REPORT+="$unit: ${enabled:-未知} / ${active:-未知}${extra} ${result}"$'\n'
+  done
+}
+
+audit_add() {
+  local target=$3 detail=$4
+  target=${target//$'\t'/ }; target=${target//$'\n'/ }; target=${target//$'\r'/ }; target=${target//$'\e'/ }
+  detail=${detail//$'\t'/ }; detail=${detail//$'\n'/ }; detail=${detail//$'\r'/ }; detail=${detail//$'\e'/ }
+  AUDIT_FINDINGS+=("$1"$'\t'"$2"$'\t'"$target"$'\t'"$detail")
+}
+
+audit_package_owner() {
+  local record
+  record=$(dpkg-query -S -- "$1" 2>/dev/null | head -1) || return 1
+  [[ "$record" == *': '* ]] || return 1
+  printf '%s\n' "${record%%: *}"
+}
+
+audit_debian_package() {
+  # Require the *installed version* to have an official origin in the local APT cache.
+  # No network access. Unknown/obsolete versions are intentionally reported for review.
+  local version policy sources
+  version=$(dpkg-query -W -f='${Version}' -- "$1" 2>/dev/null) || return 1
+  policy=$(apt-cache policy -- "$1" 2>/dev/null) || return 1
+  sources=$(awk '
+    /^[ ]*[0-9]+ / {source=$0; sub(/^[ ]*[0-9]+ /,"",source)}
+    /release / && /(^|[, ])o=Debian([, ]|$)/ {print source}
+  ' <<<"$AUDIT_APT_SOURCES")
+  awk -v version="$version" -v sources="$sources" '
+    BEGIN {n=split(sources,s,"\n"); for(i=1;i<=n;i++) official[s[i]]=1}
+    $1=="***" {v=$2; next}
+    NF==2 && $2 ~ /^[0-9]+$/ {v=$1; next}
+    v==version && $1 ~ /^[0-9]+$/ {line=$0; sub(/^[ ]*[0-9]+ /,"",line); if(official[line]) ok=1}
+    END {exit !ok}' <<<"$policy"
+}
+
+audit_session_key() {
+  local ip port server serverport pid=$PPID parent comm since logs fp found=''
+  IFS=' ' read -r ip port server serverport <<<"${SSH_CONNECTION:-}"
+  [[ -n "$ip" && "$port" =~ ^[0-9]+$ && -n "$server" && "$serverport" =~ ^[0-9]+$ ]] || return 1
+  # Bind the log to a live sshd ancestor and its start time, not an arbitrary old login.
+  while [[ "$pid" =~ ^[0-9]+$ ]] && (( pid > 1 )); do
+    comm=$(ps -o comm= -p "$pid") || return 1
+    if [[ "$comm" == sshd || "$comm" == sshd-session ]]; then
+      since=$(ps -o lstart= -p "$pid") || return 1
+      since=$(date -d "$since" '+%Y-%m-%d %H:%M:%S') || return 1
+      logs=$(journalctl -b --since "$since" --no-pager -o cat "_PID=$pid" 2>/dev/null) || return 1
+      fp=$(awk -v ip="$ip" -v port="$port" '
+        $1 == "Accepted" && $2 == "publickey" && $5 == "from" && $6 == ip && $7 == "port" && $8 == port {
+          for(i=9;i<=NF;i++) if($i ~ /^SHA256:[A-Za-z0-9+\/]+$/) print $i
+        }' <<<"$logs" | sort -u)
+      if [[ -n "$fp" ]]; then found+="$fp"$'\n'; fi
+    fi
+    parent=$(ps -o ppid= -p "$pid") || return 1
+    pid=${parent//[[:space:]]/}
+  done
+  found=$(printf '%s' "$found" | sed '/^$/d' | sort -u)
+  [[ -n "$found" && "$found" != *$'\n'* ]] || return 1
+  printf '%s\n' "$found"
+}
+
+audit_regular_key_path() {
+  local path=$1 parent=$1
+  [[ -f "$path" && ! -L "$path" ]] || return 1
+  while [[ "$parent" != / && -n "$parent" ]]; do
+    [[ ! -L "$parent" ]] || return 1
+    parent=${parent%/*}
+  done
+}
+
+audit_keys() {
+  local file line fp comment recorded count owner mode
+  for file in "$AUDIT_ROOT"/root/.ssh/authorized_keys "$AUDIT_ROOT"/home/*/.ssh/authorized_keys; do
+    [[ -e "$file" || -L "$file" ]] || continue
+    if ! audit_regular_key_path "$file"; then audit_add B keys "$file" '路径不是普通文件或含软链接，只报告'; continue; fi
+    recorded=''
+    if audit_regular_key_path "$TRUSTED_KEYS_STATE"; then
+      IFS=' ' read -r owner mode < <(stat -c '%u %a' "$TRUSTED_KEYS_STATE")
+      if [[ "$owner" == 0 ]] && (( !(8#$mode & 022) )); then
+        recorded=$(awk -F '\t' -v p="$file" '$1 == p {print $2}' "$TRUSTED_KEYS_STATE")
+      fi
+    fi
+    count=$(ssh_public_key_fingerprints "$file" | sort -u | wc -l) || count=0
+    # shellcheck disable=SC2094 # audit_add only appends an in-memory finding.
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      fp=$(ssh_public_key_fingerprints <<<"$line") || continue
+      [[ -n "$fp" ]] || continue
+      comment=$(ssh-keygen -l -f /dev/stdin <<<"$line" 2>/dev/null || printf '%s' "$line")
+      if [[ -n "$recorded" ]] && grep -Fxq "$fp" <<<"$recorded"; then continue; fi
+      audit_add A key "$file" "$fp；$([[ -n "$recorded" ]] && echo '不是你提供的' || echo '没有归属记录，请选择保留哪些')；$comment；共 $count 把；当前会话=$([[ "$fp" == "$AUDIT_SESSION_KEY" ]] && echo 是 || echo 未匹配)"
+    done <"$file"
+  done
+}
+
+audit_network_persistent() {
+  # A deliberately small allowlist. Do not interpret arbitrary YAML, globbed Match rules,
+  # cloud-generated files, interfaces hooks, or NetworkManager profiles as proof.
+  local iface file text found=false route interface_files='' network_count=0
+  route=$(ip -o route show default 2>/dev/null) || return 1
+  # This allowlist proves IPv4 DHCP only. Never risk an IPv6 management session.
+  [[ "${SSH_CONNECTION:-}" != *:* ]] || return 1
+  local -a interfaces=()
+  mapfile -t interfaces < <(awk '{for(i=1;i<NF;i++) if($i=="dev") print $(i+1)}' <<<"$route" | sort -u)
+  (( ${#interfaces[@]} > 0 )) || return 1
+  for iface in "${interfaces[@]}"; do
+    [[ "$iface" =~ ^[a-zA-Z0-9_.:-]+$ ]] || return 1
+    # Require live evidence of DHCP, not merely a dormant config file.
+    ip -o -4 addr show dev "$iface" scope global 2>/dev/null | grep -qw dynamic || return 1
+    awk -v iface="$iface" '{dev=""; dhcp=0; for(i=1;i<NF;i++) {if($i=="dev") dev=$(i+1); if($i=="proto" && $(i+1)=="dhcp") dhcp=1} if(dev==iface && dhcp) ok=1} END {exit !ok}' <<<"$route" || return 1
+    found=false
+    for file in "$AUDIT_ROOT"/etc/network/interfaces "$AUDIT_ROOT"/etc/network/interfaces.d/*; do
+      [[ -f "$file" && ! -L "$file" ]] || continue
+      text=$(cat -- "$file")
+      # Only interfaces.d inclusion is supported. Arbitrary sources/hooks are unknown.
+      if grep -Eiq 'cloud[- ]init|generated|metadata|169\.254|(^|[[:space:]])(pre-up|post-up|pre-down|post-down|up|down)[[:space:]]' <<<"$text"; then return 1; fi
+      # Accept only standalone DHCP/loopback stanzas and the known include path.
+      if ! awk '/^[[:space:]]*(#|$)/ {next}
+        $1 ~ /^(auto|allow-hotplug)$/ {next}
+        $1=="iface" && $3=="inet" && $4 ~ /^(dhcp|loopback)$/ && NF==4 {next}
+        $1 ~ /^source(-directory)?$/ && $2 ~ /^\/etc\/network\/interfaces.d\/(\*)?$/ && NF==2 {next}
+        {bad=1} END {exit bad}' <<<"$text"; then return 1; fi
+      if [[ "$file" != */interfaces ]] && ! grep -Eq '^source(-directory)?[[:space:]]+/etc/network/interfaces.d/\*?[[:space:]]*$' "$AUDIT_ROOT/etc/network/interfaces" 2>/dev/null; then continue; fi
+      interface_files+=$'\n'"$text"
+    done
+    if systemctl is-enabled --quiet networking.service 2>/dev/null && ifquery --state "$iface" >/dev/null 2>&1 &&
+      awk -v iface="$iface" '$1 ~ /^(auto|allow-hotplug)$/ {for(i=2;i<=NF;i++) if($i==iface) boot=1}
+        $1=="iface" && $2==iface && $3=="inet" && $4=="dhcp" {dhcp=1}
+        END {exit !(boot && dhcp)}' <<<"$interface_files"; then found=true; fi
+    # Exact Name= and DHCP=yes/ipv4 are accepted only with networkd enabled and no
+    # other matching/dynamic directives. Static/bridged/routed setups need manual review.
+    for file in "$AUDIT_ROOT"/etc/systemd/network/*.network; do
+      [[ -f "$file" && ! -L "$file" ]] || continue
+      text=$(cat -- "$file")
+      if grep -Eiq 'cloud[- ]init|generated|metadata|169\.254' <<<"$text"; then return 1; fi
+      if systemctl is-enabled --quiet systemd-networkd.service 2>/dev/null &&
+        networkctl status --no-pager "$iface" 2>/dev/null | grep -Fq "Network File: ${file#"$AUDIT_ROOT"}" &&
+        awk -v iface="$iface" '
+          /^[[:space:]]*([#;]|$)/ {next}
+          /^\[Match\]$/ {section="match"; next} /^\[Network\]$/ {section="network"; next}
+          section=="match" && $0=="Name=" iface {name=1; next}
+          section=="network" && /^DHCP=(yes|ipv4)$/ {dhcp=1; next}
+          {bad=1} END {exit !(name && dhcp && !bad)}' <<<"$text"; then found=true; fi
+    done
+    [[ "$found" == true ]] || return 1
+  done
+  # Netplan and runtime generators can supersede the above. Never guess precedence.
+  for file in "$AUDIT_ROOT"/etc/netplan/*.yaml "$AUDIT_ROOT"/run/systemd/network/*; do
+    [[ ! -e "$file" ]] || return 1
+  done
+  if systemctl is-enabled --quiet systemd-networkd.service 2>/dev/null; then
+    for file in "$AUDIT_ROOT"/etc/systemd/network/*.network "$AUDIT_ROOT"/usr/lib/systemd/network/*.network "$AUDIT_ROOT"/lib/systemd/network/*.network "$AUDIT_ROOT"/etc/systemd/network/*.network.d/*; do
+      [[ ! -e "$file" ]] || network_count=$((network_count + 1))
+    done
+    (( network_count == 1 )) || return 1
+  fi
+  return 0
+}
+
+audit_agents() {
+  local package status path unit
+  # Explicit names only: Alibaba, Tencent, Huawei and common provider guest agents.
+  for package in aliyun-assist aliyun-assist-client aegis aliyun-service \
+    tat-agent qcloud-assist stargate barad-agent hostguard uniagent; do
+    status=$(dpkg-query -W -f='${db:Status-Status}' -- "$package" 2>/dev/null || true)
+    # Debian also ships packages with generic names (for example aegis). A name
+    # match is insufficient when this version is available from an official source.
+    if [[ "$status" == installed ]] && ! audit_debian_package "$package"; then
+      audit_add A agent "$package" '名称匹配商家 agent，来源未经 Debian 官方缓存确认；核实后可预览 purge'
+    fi
+  done
+  for path in /usr/local/aegis /usr/local/uniagent /usr/local/hostguard /usr/local/qcloud /usr/local/share/aliyun-assist; do
+    [[ ! -e "$AUDIT_ROOT$path" ]] || audit_add B agent "$path" '检测到商家客户端目录；非包管理文件不自动删除，请向商家核实卸载方法'
+  done
+  while IFS=' ' read -r unit _; do
+    case "$unit" in
+      aliyun*|aegis*|tat-agent*|qcloud*|stargate*|barad*|hostguard*|uniagent*)
+        path=$(systemctl show -p FragmentPath --value "$unit" 2>/dev/null || true)
+        if [[ -n "$path" ]] && ! audit_package_owner "$path" >/dev/null; then
+          audit_add B agent "$unit" '非软件包安装的商家服务，只报告；请按商家文档手动卸载'
+        fi ;;
+    esac
+  done < <(systemctl list-unit-files --type=service --no-legend --no-pager 2>/dev/null || true)
+}
+
+collect_security_audit() {
+  AUDIT_FINDINGS=()
+  AUDIT_NETWORK_SAFE=false
+  AUDIT_SESSION_KEY=$(audit_session_key) || AUDIT_SESSION_KEY=''
+  AUDIT_APT_SOURCES=$(apt-cache policy 2>/dev/null || true)
+  local file package status unit path uid user effective command keys listener pid exe
+  audit_keys
+  [[ -n "$AUDIT_SESSION_KEY" ]] || audit_add B keys session '无法确定当前 SSH 公钥，禁止删除任何公钥'
+  if [[ -d "$AUDIT_ROOT/etc/cloud" && ! -e "$AUDIT_ROOT/etc/cloud/cloud-init.disabled" ]]; then
+    if audit_network_persistent; then AUDIT_NETWORK_SAFE=true
+    else audit_add B network cloud-init '无法可靠判断网络是否依赖 cloud-init，跳过关闭；加固执行停止，请人工检查'; fi
+    audit_add A cloud cloud-init "创建 /etc/cloud/cloud-init.disabled 关闭；网络检查=$AUDIT_NETWORK_SAFE；恢复：删除这个文件"
+  fi
+  [[ $(qemu_guest_agent_status) != installed ]] || audit_add A qga qemu-guest-agent '面板通信助手，可复用现有安全卸载流程'
+  audit_agents
+  while IFS=$'\t' read -r package status; do
+    [[ "$status" == installed ]] || continue
+    if ! audit_debian_package "$package"; then audit_add B package "$package" '本地缓存不能证明已安装版本来自 Debian 官方源（包括缓存缺失或旧版本），请核实'; fi
+  done < <(dpkg-query -W -f='${binary:Package}\t${db:Status-Status}\n' 2>/dev/null || true)
+  while IFS=' ' read -r unit _; do
+    [[ -n "$unit" ]] || continue
+    path=$(systemctl show -p FragmentPath --value "$unit" 2>/dev/null || true)
+    if [[ -z "$path" ]] || ! audit_package_owner "$path" >/dev/null; then audit_add B service "$unit" "已启用但服务文件不属于软件包：$path"; fi
+    # Drop-ins can change an otherwise official service's executable.
+    for path in $(systemctl show -p DropInPaths --value "$unit" 2>/dev/null | tr ' ' '\n'); do
+      if ! audit_package_owner "$path" >/dev/null; then audit_add B service "$unit" "额外的服务覆盖文件：$path"; fi
+    done
+  done < <(systemctl list-unit-files --state=enabled --type=service --no-legend --no-pager 2>/dev/null || true)
+  for file in "$AUDIT_ROOT"/etc/crontab "$AUDIT_ROOT"/etc/cron.d/* "$AUDIT_ROOT"/etc/cron.{hourly,daily,weekly,monthly}/* "$AUDIT_ROOT"/var/spool/cron/crontabs/*; do
+    [[ -f "$file" ]] || continue
+    if ! audit_package_owner "$file" >/dev/null; then audit_add B cron "$file" '计划任务文件不属于软件包，请看一眼其中的命令'; fi
+  done
+  for file in "$AUDIT_ROOT"/etc/sudoers.d/*; do
+    [[ -s "$file" && "$file" != */README ]] || continue
+    audit_add B sudo "$file" '额外的提权规则，请确认谁可以获得 root 权限'
+  done
+  while IFS= read -r listener; do
+    while IFS= read -r pid; do
+      [[ -n "$pid" ]] || continue
+      exe=$(readlink -f "$AUDIT_ROOT/proc/$pid/exe" 2>/dev/null || true)
+      package=$(audit_package_owner "$exe" || true)
+      if [[ -z "$package" ]] || ! audit_debian_package "$package"; then audit_add B port "$pid" "$listener；程序=$exe；来源=${package:-不属于软件包}"; fi
+    done < <(grep -oE 'pid=[0-9]+' <<<"$listener" | cut -d= -f2 | sort -u)
+  done < <(ss -H -lntup 2>/dev/null || true)
+  [[ ! -s "$AUDIT_ROOT/etc/ld.so.preload" ]] || audit_add C preload /etc/ld.so.preload '存在全局预加载，可能影响每个程序；建议用官方镜像重装'
+  while IFS=: read -r user _ uid _; do
+    [[ "$uid" != 0 || "$user" == root ]] || audit_add C uid "$user" '除 root 外还有 UID 0 用户；建议用官方镜像重装'
+  done <"$AUDIT_ROOT/etc/passwd"
+  if effective=$(sshd -T 2>/dev/null); then
+    command=$(awk '$1=="authorizedkeyscommand" {$1=""; sub(/^ /, ""); print}' <<<"$effective")
+    keys=$(awk '$1=="authorizedkeysfile" {$1=""; sub(/^ /, ""); print}' <<<"$effective")
+    [[ "$command" == none ]] || audit_add C ssh AuthorizedKeysCommand "公钥通过额外命令获取：$command；只报告，不改 sshd，建议官方重装"
+    [[ "$keys" == '.ssh/authorized_keys .ssh/authorized_keys2' ]] || audit_add C ssh AuthorizedKeysFile "公钥文件位置不是 Debian 默认值：$keys；只报告，不改 sshd，建议官方重装"
+  else audit_add B ssh sshd 'sshd -T 无法读取有效配置，未能完成 SSH 配置检查'; fi
+}
+
+print_security_audit() {
+  local mode=${1:-summary} level title row count type target detail
+  for level in A B C; do
+    case "$level" in
+      A) title='建议删除：这些是登录钥匙或商家助手；确认不需要再处理，默认保留。' ;;
+      B) title='需要你看一眼：这些有额外权限或后台行为；可能是你装的，只报告。' ;;
+      C) title='严重异常：这些会改变系统或登录信任；只报告，建议用官方系统重装。' ;;
+    esac
+    count=0
+    for row in "${AUDIT_FINDINGS[@]}"; do [[ "$row" != "$level"$'\t'* ]] || count=$((count + 1)); done
+    printf '\n[%s] %s（%s 项）\n' "$level" "$title" "$count"
+    if [[ "$mode" == full ]]; then
+      for row in "${AUDIT_FINDINGS[@]}"; do
+        IFS=$'\t' read -r _ type target detail <<<"$row"
+        [[ "$row" != "$level"$'\t'* ]] || printf '  %s：%s — %s\n' "$type" "$target" "$detail"
+      done
+    fi
+  done
+  printf '\n当前会话公钥：%s\n' "${AUDIT_SESSION_KEY:-无法确定，禁止删除公钥}"
+}
+
+hardening_delete_key() {
+  local file=$1 remove=$2 session before after line fp stage="$TMP_DIR/authorized-keys" original count
+  session=$(audit_session_key) || { warn '无法确定当前会话公钥，只报告，禁止删除。'; return 0; }
+  [[ "$remove" != "$session" ]] || { warn '不能删除当前 SSH 会话的公钥。'; return 0; }
+  audit_regular_key_path "$file" || { warn '公钥路径不安全，跳过。'; return 0; }
+  original=$(sha256sum -- "$file")
+  before=$(ssh_public_key_fingerprints "$file" | sort -u) || { warn '无法完整解析公钥，跳过。'; return 0; }
+  count=$(wc -l <<<"$before")
+  (( count > 1 )) || { warn '至少保留一把公钥，跳过。'; return 0; }
+  : >"$stage"
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    fp=$(ssh_public_key_fingerprints <<<"$line" || true)
+    [[ "$fp" == "$remove" ]] || printf '%s\n' "$line" >>"$stage"
+  done <"$file"
+  after=$(ssh_public_key_fingerprints "$stage" | sort -u) || { warn '删除后的公钥校验失败，跳过。'; return 0; }
+  [[ -n "$after" ]] || { warn '至少保留一把有效公钥。'; return 0; }
+  if grep -Fxq "$session" <<<"$before"; then grep -Fxq "$session" <<<"$after" || die '当前会话公钥保护失败。'; fi
+  [[ "$(sha256sum -- "$file")" == "$original" && "$(audit_session_key || true)" == "$session" ]] || { warn '公钥或当前会话发生变化，跳过。'; return 0; }
+  command -v python3 >/dev/null || { warn '缺少 python3，无法安全原子替换公钥，只报告。'; return 0; }
+  # Open every parent with O_NOFOLLOW and pin it by fd: a user's writable home
+  # must never let a rename/symlink race redirect root's writes elsewhere.
+  # The stage stays in root's private temp dir; cross-filesystem moves safely fail.
+  if ! python3 - "$file" "$stage" "${original%% *}" "$BACKUP_DIR" <<'KEY_REPLACE'
+import hashlib
+import os
+import stat
+import sys
+
+path, stage, digest, backup = sys.argv[1:]
+directory = os.open('/', os.O_RDONLY | os.O_DIRECTORY)
+try:
+    parts = path.split('/')[1:]
+    if not parts or any(p in ('', '.', '..') for p in parts):
+        raise ValueError('unsafe path')
+    for part in parts[:-1]:
+        child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory)
+        os.close(directory)
+        directory = child
+    source = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
+    try:
+        attrs = os.fstat(source)
+        if not stat.S_ISREG(attrs.st_mode) or attrs.st_nlink != 1:
+            raise ValueError('not a single regular file')
+        with os.fdopen(os.dup(source), 'rb') as stream:
+            data = stream.read()
+        if hashlib.sha256(data).hexdigest() != digest:
+            raise ValueError('authorized_keys changed')
+        destination = backup + '/files' + path
+        os.makedirs(os.path.dirname(destination), mode=0o700, exist_ok=True)
+        if not os.path.lexists(destination):
+            with open(destination, 'xb') as stream:
+                stream.write(data)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.chown(destination, attrs.st_uid, attrs.st_gid)
+            os.chmod(destination, stat.S_IMODE(attrs.st_mode))
+        os.chown(stage, attrs.st_uid, attrs.st_gid)
+        os.chmod(stage, stat.S_IMODE(attrs.st_mode))
+        for name in os.listxattr(source):
+            os.setxattr(stage, name, os.getxattr(source, name))
+        # Reject a replacement of the original inode during verification/backup.
+        latest = os.stat(parts[-1], dir_fd=directory, follow_symlinks=False)
+        if (latest.st_ino, latest.st_dev, latest.st_mtime_ns, latest.st_size) != (attrs.st_ino, attrs.st_dev, attrs.st_mtime_ns, attrs.st_size):
+            raise ValueError('authorized_keys changed during backup')
+        os.replace(stage, parts[-1], dst_dir_fd=directory)
+        os.fsync(directory)
+    finally:
+        os.close(source)
+finally:
+    os.close(directory)
+KEY_REPLACE
+  then warn '公钥原子替换未完成，已停止删除，请检查备份与文件系统。'; return 0; fi
+  log "已删除 $file 中的 $remove；保留 $(wc -l <<<"$after") 把有效公钥。"
+}
+
+hardening_purge_agent() {
+  local package=$1 plan actual
+  wait_for_package_manager
+  plan=$(apt_get -s -o APT::Get::AutomaticRemove=false purge -- "$package") || return 1
+  # shellcheck disable=SC2001 # Normalize only line-leading APT purge records.
+  actual=$(cleanup_apt_plan "$(sed 's/^Purg /Remv /' <<<"$plan")") || return 1
+  [[ "$actual" == "$package" ]] || { warn '卸载会影响其他软件包，已跳过。'; return 0; }
+  printf '%s\n' "$plan"
+  ask_yes_no "确认这个 purge 预览（$package）？" false || return 0
+  dpkg-query -L "$package" >"$BACKUP_DIR/$package.files"
+  # Preserve package-owned configuration and the simulated plan before apt runs.
+  printf '%s\n' "$plan" >"$BACKUP_DIR/$package.purge-plan"
+  local path
+  while IFS= read -r path; do
+    if [[ "$path" == /etc/* && -f "$path" && ! -L "$path" ]]; then hardening_backup "$path"; fi
+  done <"$BACKUP_DIR/$package.files"
+  # Hold the native package-manager lock across the final dependency check and purge.
+  # dpkg will refuse any removal that breaks dependencies; never force dependencies.
+  dpkg --no-force-depends,depends-version --purge -- "$package"
+  [[ $(dpkg-query -W -f='${db:Status-Status}' -- "$package" 2>/dev/null || true) != installed ]] || return 1
+}
+
+run_security_hardening() {
+  collect_security_audit
+  install -d -m 0700 "$BACKUP_ROOT"
+  BACKUP_DIR=$(mktemp -d "$BACKUP_ROOT/hardening-XXXXXXXX")
+  print_security_audit full >"$BACKUP_DIR/audit-before.txt"
+  print_security_audit summary
+  log "完整体检报告：$BACKUP_DIR/audit-before.txt"
+  local row level type target detail fp
+  for row in "${AUDIT_FINDINGS[@]}"; do
+    if [[ "$row" == B$'\t'network$'\t'* ]]; then
+      warn '无法可靠判断网络配置是否依赖 cloud-init，已停止加固执行；请先人工确认网络持久化。'
+      return 0
+    fi
+  done
+  printf '%s\n' '关闭 cloud-init 和 Guest Agent 后，面板上的重置密码等功能可能失效。请确认你在面板上能看到 root 密码，或者自己知道 root 密码。'
+  ask_yes_no '已了解上述风险，并确认知道 root 密码，继续逐项确认？' false || return 0
+  TMP_DIR=$(mktemp -d /root/vps-hardening-XXXXXXXX)
+  for row in "${AUDIT_FINDINGS[@]}"; do
+    IFS=$'\t' read -r level type target detail <<<"$row"
+    [[ "$level" == A ]] || continue
+    printf '%s：%s\n' "$target" "$detail"
+    case "$type" in
+      key)
+        fp=${detail%%；*}
+        if [[ -z "$AUDIT_SESSION_KEY" || "$fp" == "$AUDIT_SESSION_KEY" ]]; then log '当前会话的钥匙或会话无法确定，禁止删除。'; continue; fi
+        if ask_yes_no "保留 $target 的 $fp？" true; then continue; fi
+        ask_yes_no "确认删除 $fp（默认不删除）？" false || continue
+        hardening_delete_key "$target" "$fp" ;;
+      cloud)
+        ask_yes_no '关闭 cloud-init？' false || continue
+        if ! audit_network_persistent; then warn '网络检查结果变化，已停止加固执行。'; break; fi
+        reject_symlink /etc/cloud
+        hardening_backup /etc/cloud/cloud-init.disabled
+        touch /etc/cloud/cloud-init.disabled
+        [[ -f /etc/cloud/cloud-init.disabled ]] || die 'cloud-init 关闭标记验证失败。'
+        log 'cloud-init 已关闭；恢复：删除 /etc/cloud/cloud-init.disabled' ;;
+      qga)
+        ask_yes_no '卸载 QEMU Guest Agent？' false || continue
+        hardening_backup /etc/qemu
+        remove_qemu_guest_agent ;;
+      agent)
+        ask_yes_no "卸载商家 agent 软件包 $target？" false || continue
+        hardening_purge_agent "$target" ;;
+    esac
+  done > >(tee "$BACKUP_DIR/actions.txt") 2>&1
+  collect_security_audit
+  print_security_audit full >"$BACKUP_DIR/audit-after.txt"
+  print_security_audit summary
+  log "加固报告和备份：$BACKUP_DIR"
+}
+
 print_report() {
   local ssh_listeners fail2ban_status='已安装、自启并运行；sshd 和 sshd-slow 已验证'
   ssh_listeners=$(ssh_listener_addresses | sort -u | paste -sd ' ' -) || ssh_listeners=''
@@ -3298,9 +3814,12 @@ TCP / qdisc   : $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo 
 Swap          : $(awk '/SwapTotal:/ {printf "%.0f MiB", $2/1024}' /proc/meminfo)
 系统 DNS      : $(if [[ "$EARLY_DNS_FIXED" == true ]]; then printf '已提前修复系统 DNS，原文件备份在 %s' "$EARLY_DNS_BACKUP"; else printf '未提前修复（系统 DNS 原本可用）'; fi)
 备份目录      : $BACKUP_DIR
-需要重启      : $([[ -e /var/run/reboot-required ]] && echo yes || echo no)
+自动安全更新  : $(if security_updates_enabled; then echo 已启用; else echo 未启用; fi)
+需要重启      : $([[ -e /run/reboot-required ]] && echo yes || echo no)
 安全清理      : $SAFE_CLEANUP_RESULT
 重启后可运行 [7] 清理旧内核和无用包
+开机自启检查（不额外启动）：
+$BOOT_REPORT
 ============================================================
 请保持当前 SSH 会话，并从另一终端验证所需的 SSH 监听地址和端口。
 EOF
@@ -3310,18 +3829,18 @@ select_install_mode() {
   [[ -z "$INSTALL_MODE" ]] || return 0
   local choice=''
   while true; do
-    printf '\n1. 快速安装\n2. 自定义安装\n3. 退出\n4. 仅安装/更新 SmartDNS\n5. 仅部署 sing-box\n6. 仅安装/更新 Fail2ban\n7. 系统清理\n8. 仅更新系统\n9. 卸载 QEMU Guest Agent\n' >/dev/tty
-    read_tty '请选择 [1-9]: ' choice
+    printf '\n1. 快速初始化\n2. 自定义初始化\n3. 仅安装/更新 SmartDNS\n4. 仅部署 sing-box 节点\n5. 仅安装/更新 Fail2ban\n6. 仅更新系统\n7. 系统清理\n8. 安全加固（体检 → 建议 → 确认后执行）\n0. 退出\n' >/dev/tty
+    read_tty '请选择 [0-8]: ' choice
     case "$choice" in
       1) INSTALL_MODE=quick; return 0 ;;
       2) INSTALL_MODE=custom; return 0 ;;
-      3) exit 0 ;;
-      4) INSTALL_MODE=smartdns; return 0 ;;
-      5) INSTALL_MODE=singbox; return 0 ;;
-      6) INSTALL_MODE=fail2ban; return 0 ;;
+      0) exit 0 ;;
+      3) INSTALL_MODE=smartdns; return 0 ;;
+      4) INSTALL_MODE=singbox; return 0 ;;
+      5) INSTALL_MODE=fail2ban; return 0 ;;
+      6) INSTALL_MODE=update; return 0 ;;
       7) INSTALL_MODE=cleanup; return 0 ;;
-      8) INSTALL_MODE=update; return 0 ;;
-      9) INSTALL_MODE=qemu-agent-remove; return 0 ;;
+      8) INSTALL_MODE=hardening; return 0 ;;
       *) printf '无效选择。\n' >/dev/tty ;;
     esac
   done
@@ -3369,12 +3888,12 @@ check_ssh_change_prerequisites() {
 collect_initialization_config() {
   CURRENT_STEP='收集初始化配置'
   case "$INSTALL_MODE" in
-    quick) REMOVE_QEMU_GUEST_AGENT=true; collect_quick_choices; collect_choices ;;
+    quick) collect_quick_choices; collect_choices ;;
     custom)
       collect_custom_phase_choice
       collect_choices
       if [[ "$BASE_ONLY" == false ]]; then collect_network_choice; fi
-      if ask_yes_no '是否卸载 QEMU Guest Agent？' false; then REMOVE_QEMU_GUEST_AGENT=true; fi
+      if ask_yes_no '是否开启 Debian 自动安全更新？' true; then AUTO_SECURITY=true; else AUTO_SECURITY=false; fi
       ;;
   esac
   if [[ "$BASE_ONLY" == false ]]; then
@@ -3401,16 +3920,12 @@ collect_initialization_config() {
 
 print_initialization_summary() {
   local ssh="端口 $SSH_PORT/tcp；备用 22=$KEEP_SSH_22" key='使用已验证的新公钥' network=$NETWORK_REQUEST
-  local qemu_guest_agent='保留'
   if [[ "$REUSE_PUBLIC_KEY" == true ]]; then key='复用已确认的公钥'; fi
   if [[ "$PRESERVE_SSH" == true ]]; then ssh='保留原有监听、认证及 UFW'; key='保留原有公钥'; fi
   if [[ "$BASE_ONLY" == true ]]; then ssh='不配置'; key='不配置'; network='不修改'; fi
   printf '\n本次执行配置：\n模式：%s；仅基础工具：%s\nSSH：%s\n公钥：%s\n网络：%s\nfull-upgrade：%s；Swap：%sMiB（0 表示不创建）\n' \
     "$INSTALL_MODE" "$BASE_ONLY" "$ssh" "$key" "$network" "$DO_FULL_UPGRADE" "$SWAP_CONFIRMED_MIB"
-  if [[ "$INSTALL_MODE" == quick || "$INSTALL_MODE" == custom ]]; then
-    if [[ "$REMOVE_QEMU_GUEST_AGENT" == true ]]; then qemu_guest_agent='已安装则卸载'; fi
-    printf 'QEMU Guest Agent：%s\n' "$qemu_guest_agent"
-  fi
+  printf '自动安全更新：%s\n' "$AUTO_SECURITY"
   if [[ "$NETWORK_REQUEST" == auto && "$BASE_ONLY" == false ]]; then
     case "$IPV6_BOOT_STATE:$IPV6_RESTORE_CHOICE" in
       off:restore) printf '重启后 IPv6：将被现有配置关闭；选择恢复，写入 %s 覆盖，不改原文件\n' "$NETWORK_SYSCTL" ;;
@@ -3520,14 +4035,14 @@ remove_qemu_guest_agent() {
   CURRENT_STEP='模拟卸载 QEMU Guest Agent'
   plan=$(LC_ALL=C apt_get -s -o APT::Get::AutomaticRemove=false -o APT::Get::Purge=false remove -- qemu-guest-agent) ||
     die 'APT 模拟卸载 qemu-guest-agent 失败。'
-  if [[ "$INSTALL_MODE" == qemu-agent-remove ]]; then
+  if [[ "$INSTALL_MODE" == qemu-agent-remove || "$INSTALL_MODE" == hardening ]]; then
     log 'QEMU Guest Agent 卸载预览：'
     printf '%s\n' "$plan"
   fi
   if ! packages=$(cleanup_apt_plan "$plan") || [[ ! "$packages" =~ ^qemu-guest-agent(:[a-z0-9-]+)?$ ]]; then
     die 'APT 模拟结果并非仅卸载 qemu-guest-agent，已阻止执行。'
   fi
-  if [[ "$INSTALL_MODE" == qemu-agent-remove ]]; then
+  if [[ "$INSTALL_MODE" == qemu-agent-remove || "$INSTALL_MODE" == hardening ]]; then
     if ! ask_yes_no '确认卸载 QEMU Guest Agent？' false; then
       log '已取消卸载 QEMU Guest Agent。'
       return 0
@@ -3857,6 +4372,18 @@ persist_network_stack() {
 main() {
   parse_args "$@"
   select_install_mode
+  if [[ "$INSTALL_MODE" == audit ]]; then
+    (( EUID == 0 )) || die '完整只读体检需要 root。'
+    collect_security_audit
+    print_security_audit full
+    return 0
+  fi
+  if [[ "$INSTALL_MODE" == hardening ]]; then
+    preflight
+    acquire_lock
+    run_security_hardening
+    return 0
+  fi
   if [[ "$INSTALL_MODE" == cleanup ]]; then
     cleanup_preflight
     run_system_cleanup
@@ -3878,13 +4405,13 @@ main() {
     qemu-agent-remove) remove_qemu_guest_agent; return 0 ;;
   esac
   collect_initialization_config
-  if [[ "$REMOVE_QEMU_GUEST_AGENT" == true ]]; then remove_qemu_guest_agent; fi
   install_early_dependencies
   if [[ "$BASE_ONLY" == false && "$PRESERVE_SSH" == false ]]; then
     install_authorized_key
   fi
   configure_swap
   update_system_and_tools
+  configure_security_updates
   if [[ "$BASE_ONLY" == true ]]; then
     log '已按 --base-only 完成系统更新与基础工具安装。'
     return 0
@@ -3906,6 +4433,7 @@ main() {
   configure_system_dns
   configure_ssh
   configure_ufw
+  if [[ "$PRESERVE_SSH" == false ]]; then record_trusted_keys; fi
   configure_cf8443
   if [[ "$PRESERVE_SSH" == true ]]; then
     log '保留现有 Fail2ban 状态，避免重启时变更 SSH 封禁规则。'
@@ -3914,6 +4442,7 @@ main() {
   fi
   persist_network_stack || warn '网络栈状态未保存；sing-box 向导将按本地 IPv6 检测给出默认值。'
   run_safe_cleanup
+  check_boot_services
   print_report
 }
 

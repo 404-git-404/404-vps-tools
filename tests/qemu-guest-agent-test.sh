@@ -60,7 +60,7 @@ for scenario in installed not-installed config-files repeat cancel extra simulat
   set +e
   (
     set -e
-    preflight() { [[ "$INSTALL_MODE" == qemu-agent-remove ]]; echo preflight >>"$trace"; }
+    preflight() { [[ "$INSTALL_MODE" == hardening ]]; echo preflight >>"$trace"; }
     acquire_lock() { echo lock >>"$trace"; }
     wait_for_package_manager() { :; }
     collect_initialization_config() { fail 'standalone initialized the system'; }
@@ -71,7 +71,7 @@ for scenario in installed not-installed config-files repeat cancel extra simulat
     }
     read_tty() {
       case "$1" in
-        '请选择 [1-9]: ') printf -v "$2" 9 ;;
+        '请选择 [0-8]: ') printf -v "$2" 8 ;;
         '确认卸载 QEMU Guest Agent？ [y/N] ')
           echo confirm >>"$trace"
           if [[ "$scenario" == cancel ]]; then printf -v "$2" ''; else printf -v "$2" y; fi ;;
@@ -101,9 +101,10 @@ for scenario in installed not-installed config-files repeat cancel extra simulat
       [[ "$scenario" != removal-failure ]] || return 1
       if [[ "$scenario" != verification-failure ]]; then fixture_state='config-files'; fi
     }
+    run_security_hardening() { INSTALL_MODE=qemu-agent-remove; remove_qemu_guest_agent; }
     IFS=' '
     main
-    grep -Fxq '9. 卸载 QEMU Guest Agent' "$work/tty"
+    grep -Fq '8. 安全加固' "$work/tty"
     if [[ "$scenario" == repeat ]]; then remove_qemu_guest_agent; fi
   ) >"$output" 2>&1
   result=$?
@@ -130,4 +131,4 @@ for scenario in installed not-installed config-files repeat cancel extra simulat
 done
 grep -Fxq 'Remv qemu-guest-agent [1]' "$work/installed.output"
 grep -Fq 'qemu-guest-agent 未安装，无需卸载。' "$work/repeat.output"
-echo 'PASS: menu 9, preview, default cancel, installed, absent, repeat, dependency guard and failure reporting'
+echo 'PASS: menu 8, preview, default cancel, installed, absent, repeat, dependency guard and failure reporting'

@@ -50,6 +50,9 @@ quick_fixture() {
   configure_chrony() { :; }
   configure_tcp_tuning() { :; }
   install_sing_box() { :; }
+  configure_security_updates() { :; }
+  check_boot_services() { :; }
+  record_trusted_keys() { :; }
   backup_dns_state() { :; }
   apply_network_stack() { :; }
   cleanup_legacy_network_stack() { :; }
@@ -372,8 +375,8 @@ help_output=$(bash "$TEST_DIR/../debian-init.sh" --help)
 
 # A PTY exercises the real interactive menu on Linux CI.
 if [[ "$(uname -s)" == Linux ]] && command -v script >/dev/null; then
-  printf '6\n' | script -qec "bash -c 'source \"$TEST_DIR/../debian-init.sh\"; select_install_mode; echo \"selected=\$INSTALL_MODE\"'" /dev/null >"$TEST_TMP/menu"
-  grep -Fq '6. 仅安装/更新 Fail2ban' "$TEST_TMP/menu"
+  printf '5\n' | script -qec "bash -c 'source \"$TEST_DIR/../debian-init.sh\"; select_install_mode; echo \"selected=\$INSTALL_MODE\"'" /dev/null >"$TEST_TMP/menu"
+  grep -Fq '5. 仅安装/更新 Fail2ban' "$TEST_TMP/menu"
   grep -Fq 'selected=fail2ban' "$TEST_TMP/menu"
 fi
 echo 'PASS: Fail2ban quick install, preserve mode, standalone backends, custom jails and rollback'
