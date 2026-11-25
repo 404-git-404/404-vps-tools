@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # shellcheck disable=SC2329,SC2034 # Mocks/state used through the sourced initializer.
 set -Eeuo pipefail
+# shellcheck source=tests/process-helper.sh
+source "$(dirname -- "${BASH_SOURCE[0]}")/process-helper.sh"
 repo=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 work=$(mktemp -d)
 # Redirect menu presentation only; test doubles supply all terminal replies.
@@ -19,6 +21,10 @@ source "$work/installer"
 trap - ERR HUP INT TERM
 trap 'rm -rf -- "$work"' EXIT
 fail() { echo "FAIL: $*" >&2; exit 1; }
+# Verify the process helper preserves errexit even when called by an `if`.
+# shellcheck disable=SC2329 # Invoked in the isolated fixture.
+errexit_probe() { echo 'errexit probe'; false; echo 'unexpected continuation'; }
+expect_bash_failure 'errexit probe' errexit_probe
 
 for scenario in port22 default custom-port preserve reuse missing-keygen existing-swap no-swap low-memory multi multi-cancel ipv6-guard cancel custom-full custom-base custom-remove cli base ipv6-restore ipv6-keep; do
   trace="$work/$scenario.trace"
@@ -70,7 +76,7 @@ for scenario in port22 default custom-port preserve reuse missing-keygen existin
         '确认以上配置并开始自动安装？'*)
           if grep -q '^execute ' "$trace"; then fail 'mutation before final confirmation'; fi
           [[ "$SSH_KEYS_TX" == false && "$SSH_TX" == false && "$UFW_TX" == false && "$DNS_TX" == false ]]
-          if [[ "$scenario" == cancel ]]; then printf -v "$2" n; else printf -v "$2" y; fi ;;
+          if [[ "$scenario" == cancel ]]; then printf -v "$2" n; else printf -v "$2" ''; fi ;;
         *) fail "unexpected question: $1" ;;
       esac
     }
@@ -141,6 +147,8 @@ for scenario in port22 default custom-port preserve reuse missing-keygen existin
     configure_ufw() { if [[ "$PRESERVE_SSH" == false ]]; then execute ufw; fi; }
     configure_cf8443() { :; }
     configure_fail2ban() { execute fail2ban; }
+    persist_network_stack() { execute "state=$NETWORK_STACK"; }
+    run_safe_cleanup() { execute cleanup; }
     print_report() { execute report; }
     if [[ "$scenario" == ipv6-guard ]]; then SSH_CONNECTION='2001:db8::1 12345 2001:db8::2 22'; else unset SSH_CONNECTION; fi
     args=()
@@ -181,8 +189,16 @@ for scenario in port22 default custom-port preserve reuse missing-keygen existin
       esac ;;
   esac
   if [[ "$scenario" == custom-base || "$scenario" == base ]]; then
-    if grep -Eq '^execute (ssh|ufw|key|network|smartdns|singbox)$' "$trace"; then fail 'base-only changed components'; fi
+    if grep -Eq '^execute (ssh|ufw|key|network|smartdns|singbox|cleanup|state=.*)$' "$trace"; then fail 'base-only changed components'; fi
   fi
+  case "$scenario" in
+    base|custom-base|multi-cancel|ipv6-guard|cancel) ;;
+    *)
+      grep -Fxq 'execute cleanup' "$trace"
+      tail -n 3 "$trace" | grep -Eq '^execute state=(ipv4|dual)$'
+      [[ "$(tail -n 2 "$trace")" == $'execute cleanup\nexecute report' ]] || fail 'cleanup/report order'
+      ;;
+  esac
   case "$scenario" in
     custom-full|custom-base|custom-remove)
       grep -Fxq 'prompt 是否卸载 QEMU Guest Agent？ [y/N] ' "$trace"
@@ -217,5 +233,7 @@ if (
   SSH_LISTENERS_CONFIRMED=true SSH_CONFIRMED_LISTENERS='0.0.0.0:22'
   configure_ssh
 ); then fail 'accepted listeners changed after confirmation'; fi
-if (CONFIG_CONFIRMED=true; read_tty 'unexpected' response); then fail 'accepted execution-stage prompt'; fi
+expect_bash_failure '执行阶段出现未预收集的交互' 'CONFIG_CONFIRMED=true; read_tty unexpected response'
+# shellcheck disable=SC2016 # Evaluated inside the isolated fixture.
+expect_bash_failure '需要交互输入，但当前没有可用' 'rm -f -- "$work/tty"; CONFIG_CONFIRMED=false; ask_yes_no "确认以上配置并开始自动安装？" true'
 echo 'PASS: early configuration, SSH menus, key reuse/dependency, safety, Swap, confirmation, custom and CLI'

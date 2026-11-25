@@ -36,6 +36,7 @@ jobs:
             tests/ufw-sync-test.sh
             tests/system-update-test.sh
             tests/init-flow-test.sh
+            tests/process-helper.sh
             tests/ipv6-boot-state-test.sh
             tests/qemu-guest-agent-test.sh
             tests/ci-workflow-test.sh
@@ -200,6 +201,7 @@ jobs:
       - name: Run ShellCheck
         run: |
           shellcheck \
+            tests/process-helper.sh \
             debian-init.sh \
             request-cloudflare-certificate.sh \
             tests/gg-status-container-test.sh \

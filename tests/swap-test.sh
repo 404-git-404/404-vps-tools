@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # shellcheck disable=SC2329,SC2034 # Mocks and state used by the sourced installer.
 set -Eeuo pipefail
+# shellcheck source=tests/process-helper.sh
+source "$(dirname -- "${BASH_SOURCE[0]}")/process-helper.sh"
 repo=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 export SWAP_TEST_DIR
 SWAP_TEST_DIR=$(mktemp -d)
@@ -81,7 +83,7 @@ done
 disk=$((2048*1024-1))
 recommend_swap
 [[ "$SWAP_RECOMMENDED_MIB" == 512 ]] || fail 'one KiB below 2048 MiB'
-if (check_root_space) >"$SWAP_TEST_DIR/preflight" 2>&1; then fail 'preflight accepted less than 2 GiB'; fi
+if run_in_bash 'check_root_space' >"$SWAP_TEST_DIR/preflight" 2>&1; then fail 'preflight accepted less than 2 GiB'; fi
 grep -Fq '还需释放：0.0009765625MiB' "$SWAP_TEST_DIR/preflight"
 disk=$((2048*1024))
 check_root_space

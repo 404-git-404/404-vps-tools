@@ -103,7 +103,17 @@ done
   df() { printf 'header\n/dev/test 5138022 4000000 665600 90%% /\n'; }
   apt-get() { [[ "$1" == clean ]]; echo apt >>"$trace"; }
   journalctl() { [[ "$1" == --vacuum-size=50M ]]; echo journal >>"$trace"; return 1; }
-  systemd-tmpfiles() { [[ "$1" == --clean && "$2" == --prefix=/tmp && "$3" == --prefix=/var/tmp ]]; echo tmpfiles >>"$trace"; }
+  TMP_DIR="$test_dir/tmp"
+  BACKUP_DIR="$test_dir/backup"
+  mkdir -p "$TMP_DIR" "$BACKUP_DIR"
+  systemd-tmpfiles() {
+    [[ "$1" == --clean && "$2" == --prefix=/tmp && "$3" == --prefix=/var/tmp ]]
+    local arg
+    for arg in "$TMP_DIR" "$BACKUP_DIR" /tmp/smartdns /tmp/sing-box /tmp/fail2ban /var/tmp/smartdns /var/tmp/sing-box /var/tmp/fail2ban; do
+      printf '%s\n' "$@" | grep -Fxq -- "--exclude-prefix=$arg" || fail "missing cleanup exclusion: $arg"
+    done
+    echo tmpfiles >>"$trace"
+  }
   swapon() { [[ "$1" == --show=NAME,SIZE && "$2" == --bytes ]]; printf 'NAME SIZE\n/swapfile-vps-init 536866816\n'; }
   swapoff() { fail 'cleanup called swapoff'; }
   : >"$trace"
@@ -120,6 +130,42 @@ done
   grep -Fxq '临时文件：完成' "$test_dir/report"
   grep -Fxq 'Swap：未修改' "$test_dir/report"
 )
+
+(
+  apt-get() { return 1; }
+  journalctl() { return 1; }
+  systemd-tmpfiles() { return 1; }
+  run_safe_cleanup 2>"$test_dir/warning"
+  [[ "$SAFE_CLEANUP_APT" == 失败 && "$SAFE_CLEANUP_JOURNAL" == 失败 && "$SAFE_CLEANUP_TMPFILES" == 失败 ]]
+  grep -Fq '安全清理未全部完成' "$test_dir/warning"
+  PRESERVE_SSH=true NETWORK_REQUEST=auto
+  ssh_listener_addresses() { :; }
+  fail2ban_package_installed() { return 1; }
+  ufw() { echo unavailable; }
+  smartdns() { echo fixture; }
+  sing-box() { echo fixture; }
+  print_report >"$test_dir/init-report" 2>/dev/null
+  grep -Fq "安全清理      : $SAFE_CLEANUP_RESULT" "$test_dir/init-report"
+  grep -Fxq '重启后可运行 [7] 清理旧内核和无用包' "$test_dir/init-report"
+)
+
+# State is written only by the complete flow (covered in init-flow-test), and
+# overwritten with a readable mode while retaining the original backup.
+sed "s|^readonly NETWORK_STACK_STATE=.*|readonly NETWORK_STACK_STATE='$test_dir/state/network-stack'|" "$repo/debian-init.sh" >"$test_dir/installer"
+bash -Eeuo pipefail -s "$test_dir" <<'TEST'
+source "$1/installer"
+trap - EXIT ERR HUP INT TERM
+BACKUP_DIR="$1/backups"
+mkdir -p "$BACKUP_DIR"
+NETWORK_STACK=dual
+persist_network_stack
+[[ "$(cat "$NETWORK_STACK_STATE")" == dual && "$(stat -c %a "$NETWORK_STACK_STATE")" == 644 ]]
+chmod 0600 "$NETWORK_STACK_STATE"
+NETWORK_STACK=ipv4
+persist_network_stack
+[[ "$(cat "$NETWORK_STACK_STATE")" == ipv4 && "$(stat -c %a "$NETWORK_STACK_STATE")" == 644 ]]
+[[ "$(cat "$BACKUP_DIR/files$NETWORK_STACK_STATE")" == dual ]]
+TEST
 
 if [[ "$(uname -s)" == Linux ]] && command -v script >/dev/null; then
   for mode in quick custom exit smartdns singbox fail2ban cleanup update; do

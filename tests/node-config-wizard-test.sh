@@ -8,16 +8,16 @@ REPO_ROOT=$(cd -- "$TEST_DIR/.." && pwd)
 readonly REPO_ROOT
 readonly WIZARD_SCRIPT="$REPO_ROOT/debian-init.sh"
 readonly INSTALL_SCRIPT="$REPO_ROOT/debian-init.sh"
+TEST_TEMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/node-config-wizard-tests.XXXXXXXX")
+readonly TEST_TEMP_DIR
 
 # The path is anchored to this test file, rather than the caller's directory.
 # shellcheck disable=SC1090
-source <(sed -n "/^  bash \/dev\/fd\/3 3<<'SINGBOX_WIZARD'$/,/^SINGBOX_WIZARD$/ { /SINGBOX_WIZARD/d; p; }" "$WIZARD_SCRIPT")
+source <(sed "s|^readonly NETWORK_STACK_STATE=.*|readonly NETWORK_STACK_STATE='$TEST_TEMP_DIR/network-stack'|" "$WIZARD_SCRIPT" | sed -n "/^  bash \/dev\/fd\/3 3<<'SINGBOX_WIZARD'$/,/^SINGBOX_WIZARD$/ { /SINGBOX_WIZARD/d; p; }")
 trap - EXIT INT TERM
 
 TEST_COUNT=0
 TEST_COMPLETE=false
-TEST_TEMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/node-config-wizard-tests.XXXXXXXX")
-readonly TEST_TEMP_DIR
 
 SERVICE_CASE_DIR=''
 SERVICE_TARGET_DIR=''
@@ -222,11 +222,11 @@ test_network_stack_listen_addresses() {
     local mode=''
     local expected=''
 
-    for mode in ipv4 ipv6 dual; do
+    for mode in ipv4 dual; do
         NETWORK_STACK="$mode"
         case "$mode" in
             ipv4) expected='0.0.0.0' ;;
-            ipv6|dual) expected='::' ;;
+            dual) expected='::' ;;
         esac
         assert_equal "$expected" "$(get_listen_address)" \
             "$mode maps to the required public listen address"
@@ -250,9 +250,48 @@ EOF
     done
 
     NETWORK_STACK='dual'
+    # shellcheck disable=SC2329 # Invoked by the sourced wizard.
+    ip() { return 1; }
     select_network_stack >/dev/null <<<''
+    unset -f ip
     assert_equal 'ipv4' "$NETWORK_STACK" \
         'direct Enter selects IPv4-only by default'
+
+    local state address route expected output
+    output="$TEST_TEMP_DIR/network-prompt"
+    for state in absent invalid ipv4 dual; do
+        for address in yes no; do
+            for route in yes no; do
+                rm -f "$NETWORK_STACK_STATE"
+                [[ "$state" == absent ]] || printf '%s\n' "$state" >"$NETWORK_STACK_STATE"
+                # shellcheck disable=SC2329 # Invoked by the sourced wizard.
+                ip() {
+                    case "$*" in
+                        '-6 -o addr show scope global') [[ "$address" == no ]] || echo 'global IPv6 fixture' ;;
+                        '-6 route show default') [[ "$route" == no ]] || echo 'default IPv6 fixture' ;;
+                        *) fail "unexpected network probe: $*" ;;
+                    esac
+                }
+                expected=ipv4
+                if [[ "$address" == yes && "$route" == yes ]]; then expected=dual; fi
+                if [[ "$state" == ipv4 || "$state" == dual ]]; then expected=$state; fi
+                select_network_stack >"$output" <<<''
+                assert_equal "$expected" "$NETWORK_STACK" "$state/$address/$route default"
+                if [[ "$state" == ipv4 || "$state" == dual ]]; then
+                    grep -Fq '来源：初始化状态' "$output" || fail 'missing state source'
+                else
+                    grep -Fq '来源：本地 IPv6 地址与默认路由检测' "$output" || fail 'missing local source'
+                fi
+                if grep -Fq 'IPv6-only' "$output"; then fail 'IPv6-only still offered'; fi
+            done
+        done
+    done
+    select_network_stack >"$output" <<<'1'
+    assert_equal ipv4 "$NETWORK_STACK" 'explicit IPv4 overrides saved dual'
+    select_network_stack >"$output" <<<'2'
+    assert_equal dual "$NETWORK_STACK" 'option 2 selects dual'
+    rm -f "$NETWORK_STACK_STATE"
+    unset -f ip
 }
 
 test_reality_domain_is_reused() {

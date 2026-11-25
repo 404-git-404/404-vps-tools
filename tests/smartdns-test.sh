@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2016 # Code strings expand in the isolated Bash fixture.
 set -Eeuo pipefail
+# shellcheck source=tests/process-helper.sh
+source "$(dirname -- "${BASH_SOURCE[0]}")/process-helper.sh"
 
 TEST_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(cd -- "$TEST_DIR/.." && pwd)
@@ -131,9 +134,9 @@ done
 for args in --ssh-port --keep-22 --close-22 --pubkey --pubkey-file --cloudflare-8443; do
   case "$args" in
     --ssh-port|--pubkey|--pubkey-file)
-      if (parse_args --preserve-ssh "$args" 22) >/dev/null 2>&1; then fail "accepted conflicting $args"; fi ;;
+      expect_bash_failure --preserve-ssh 'parse_args --preserve-ssh "$args" 22' ;;
     *)
-      if (parse_args --preserve-ssh "$args") >/dev/null 2>&1; then fail "accepted conflicting $args"; fi ;;
+      expect_bash_failure --preserve-ssh 'parse_args --preserve-ssh "$args"' ;;
   esac
 done
 
@@ -204,6 +207,8 @@ check_preserved_ssh_network_mode() (
   ipv6_https_works() { [[ "$connection" == ipv6 ]]; }
   install_and_configure_smartdns() { echo "smartdns=$NETWORK_STACK" >>"$phase_trace"; }
   configure_system_dns() { DNS_TX=false; }
+  persist_network_stack() { :; }
+  run_safe_cleanup() { :; }
   print_report() { :; }
   (main) >"$TEST_TMP/preserve-network.log" 2>&1 || result=$?
   if [[ "$expected" == blocked ]]; then
@@ -551,9 +556,10 @@ for mode in smartdns singbox; do
 done
 
 # Conflicting independent CLI modes fail, before any system modification.
-if (parse_args --smartdns-only --sing-box-only) >"$TEST_TMP/conflict.log" 2>&1; then
+if run_in_bash 'parse_args --smartdns-only --sing-box-only' >"$TEST_TMP/conflict.log" 2>&1; then
   fail 'conflicting modes accepted'
 fi
+grep -Fq '只能选择一种独立运行模式' "$TEST_TMP/conflict.log"
 
 # A new sing-box is masked through package installation and config removal.
 (
@@ -1005,7 +1011,7 @@ for _ in 1 2 3; do
 done
 eq 'nameserver 9.9.9.9' "$(sed -n 1p "$BACKUP_DIR/files$d/resolv.conf")" 'original resolv.conf backup'
 getent() { return 2; }
-if (configure_system_dns) >/dev/null 2>&1; then fail 'unresolvable system DNS accepted'; fi
+expect_bash_failure '切换到本机 SmartDNS 后系统解析失败' 'configure_system_dns'
 getent() { return 0; }
 
 # SmartDNS: an old [::1] listener is removed on rerun; start-up and health never depend on ::1.
@@ -1171,7 +1177,7 @@ eq DNS53 "$SMARTDNS_TRANSPORT" 'fallback result'
 : >"$TRACE"
 available_transport=none
 rollback_dns() { echo rollback >>"$TRACE"; }
-if (install_and_configure_smartdns) >/dev/null 2>&1; then fail 'complete upstream failure accepted'; fi
+expect_bash_failure 'SmartDNS DoH 与 UDP/TCP 53 上游均未通过健康检查' 'install_and_configure_smartdns'
 eq $'h2\ndns53\nrollback' "$(cat "$TRACE")" 'complete failure invokes rollback'
 TEST
 

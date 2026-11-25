@@ -2,6 +2,8 @@
 # The sourced installer invokes the mocks and reads the test environment.
 # shellcheck disable=SC2329,SC2034
 set -Eeuo pipefail
+# shellcheck source=tests/process-helper.sh
+source "$(dirname -- "${BASH_SOURCE[0]}")/process-helper.sh"
 
 TEST_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck disable=SC1091
@@ -57,6 +59,8 @@ quick_fixture() {
   configure_ssh() { :; }
   configure_ufw() { :; }
   configure_cf8443() { :; }
+  persist_network_stack() { :; }
+  run_safe_cleanup() { :; }
   verify_ipv4_policy() { :; }
 }
 
@@ -96,7 +100,7 @@ MATRIX
   menu_ssh=2 menu_network=1 expected_port=53651 expected_network=auto expected_preserve=false
   override=/etc/fail2ban/jail.d/zz-test-disable-sshd-slow.local
   printf '[sshd-slow]\nenabled = false\n' >"$override"
-  if (quick_fixture; main --skip-upgrade) >"$TEST_TMP/missing-jail" 2>&1; then
+  if run_in_bash 'quick_fixture; main --skip-upgrade' >"$TEST_TMP/missing-jail" 2>&1; then
     fail 'quick install accepted the operator override that disables a required jail'
   fi
   grep -F 'Fail2ban Jail 未运行：sshd-slow' "$TEST_TMP/missing-jail"
@@ -219,7 +223,12 @@ for scenario in fresh repeat reality config-error action-error no-backend; do
 
     case "$scenario" in
       config-error|action-error|no-backend)
-        if (trap rollback_fail2ban EXIT; main --fail2ban-only); then fail "$scenario returned success"; fi
+        case "$scenario" in
+          config-error) reason='Fail2ban 配置测试失败' ;;
+          action-error) reason='Fail2ban 封禁动作验证失败' ;;
+          no-backend) reason='UFW 未启用，nftables 也无法写入规则' ;;
+        esac
+        expect_bash_failure "$reason" 'trap rollback_fail2ban EXIT; main --fail2ban-only'
         if [[ "$scenario" != no-backend ]]; then
           grep -Fxq 'old managed defaults' "$FAIL2BAN_DIR/jail.d/00-vps-init-defaults.local"
           grep -Fxq 'old managed sshd' "$FAIL2BAN_DIR/jail.d/vps-init-sshd.local"
@@ -357,7 +366,7 @@ for scenario in quick-ok missing-package apt-error inactive disabled no-pong mis
   )
 done
 
-if (parse_args --fail2ban-only --smartdns-only); then fail 'conflicting modes accepted'; fi
+expect_bash_failure '只能选择一种独立运行模式' 'parse_args --fail2ban-only --smartdns-only'
 help_output=$(bash "$TEST_DIR/../debian-init.sh" --help)
 [[ "$help_output" == *--fail2ban-only* ]] || fail 'missing CLI help'
 
