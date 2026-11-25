@@ -30,14 +30,14 @@ if [[ -z "${VPS_TEST_WORK:-}" ]]; then
 
   # Fake external commands. getent resolves when the (redirected) resolv.conf lists a working
   # resolver: 1.1.1.1 (the fallback) or 9.9.9.9 (an ordinary healthy system).
-  cat >"$work/bin/getent" <<'EOF'
+  command cat >"$work/bin/getent" <<'EOF'
 #!/bin/sh
 echo "getent $*" >>"$VPS_TEST_WORK/getent.log"
 [ "$1" = ahostsv4 ] && [ "$2" = deb.debian.org ] || exit 2
 [ -z "${FAKE_DNS_BROKEN:-}" ] || exit 2
 grep -Eqx 'nameserver (1\.1\.1\.1|9\.9\.9\.9)' "$VPS_TEST_WORK/resolv.conf" 2>/dev/null
 EOF
-  cat >"$work/bin/curl" <<'EOF'
+  command cat >"$work/bin/curl" <<'EOF'
 #!/bin/sh
 echo "curl $*" >>"$VPS_TEST_WORK/curl.log"
 case "${FAKE_DIRECT:-ok}" in
@@ -48,14 +48,14 @@ esac
 printf 400
 EOF
   # lsattr/chattr emulate the i and a attributes with marker files.
-  cat >"$work/bin/lsattr" <<'EOF'
+  command cat >"$work/bin/lsattr" <<'EOF'
 #!/bin/sh
 i=-; a=-
 [ ! -e "$VPS_TEST_WORK/resolv.conf.i" ] || i=i
 [ ! -e "$VPS_TEST_WORK/resolv.conf.a" ] || a=a
 printf -- '-%s%s-------------e------- %s\n' "$i" "$a" "$3"
 EOF
-  cat >"$work/bin/chattr" <<'EOF'
+  command cat >"$work/bin/chattr" <<'EOF'
 #!/bin/sh
 echo "chattr $*" >>"$VPS_TEST_WORK/chattr.log"
 for arg in "$@"; do
@@ -67,7 +67,7 @@ for arg in "$@"; do
   esac
 done
 EOF
-  chmod +x "$work/bin/"*
+  command chmod +x "$work/bin/"*
 else
   work=$VPS_TEST_WORK
 fi
