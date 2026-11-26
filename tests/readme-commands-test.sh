@@ -34,7 +34,7 @@ run_commands() {
     fi
     verified=${command% && *}' && echo VERIFIED'
     [[ "$verified" == *' && echo VERIFIED' && "$verified" != *"${FINALS[$index]}"* ]] || fail "marker was not substituted for command $index"
-    shell_name=sh
+    shell_name='sh'
     if [[ "$lang" == bash ]]; then shell_name=bash; fi
     for scenario in ok tampered "missing-${NAMES[$index]}"; do
       local_command=${verified//"$OFFICIAL_BASE"/"$base/$scenario/download"}

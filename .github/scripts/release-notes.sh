@@ -15,6 +15,7 @@ bash "$here/readme-commands.sh" "$readme" | while IFS=$'\t' read -r lang command
     printf '::error::README command cannot be pinned to %s\n' "$tag" >&2
     exit 1
   fi
+# shellcheck disable=SC2016 # The backticks are literal Markdown fences.
   printf '```%s\n%s\n```\n\n' "$lang" "$pinned"
 done
 printf '%s\n' 'Files: debian-init.sh, alpine-init.sh, gg-status, SHA256SUMS (sha256sum format).'
