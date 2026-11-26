@@ -131,8 +131,11 @@ SINGBOX_WAS_INSTALLED=false
 SINGBOX_CONFIG_PREEXISTED=false
 SINGBOX_WAS_MANAGED=false
 SINGBOX_CHECK_OUTPUT=''
+SINGBOX_CHECK_BIN=''
+SINGBOX_CHECK_CWD='/'
+SINGBOX_CHECK_REASON=''
+SINGBOX_CHECK_ARGS=()
 POLICY_RC_D_ACTIVE=false
-POLICY_RC_D_HAD_ORIGINAL=false
 SWAP_RECOMMENDED_MIB=0
 SWAP_REUSE_FILE=false
 SWAPFILE_SNAPSHOT=''
@@ -424,7 +427,10 @@ on_error() {
 
 on_signal() {
   local sig=$1
-  trap - ERR HUP INT TERM
+  # Rollback must finish: ignore repeated signals from here on, and put policy-rc.d back first.
+  trap - ERR
+  trap '' HUP INT TERM
+  policy_rc_d_restore || true
   restore_ipv6_probe_state || true
   rollback_ufw || true
   rollback_ssh || true
@@ -2197,36 +2203,60 @@ install_sing_box() {
 
 # While sing-box is installed or changed, policy-rc.d (exit 101) stops maintainer scripts from
 # restarting the service, so a new binary never runs before its config has been checked. A
-# pre-existing policy-rc.d is moved aside and always put back, whatever the exit path.
+# pre-existing policy-rc.d is moved aside and always put back, whatever the exit path. These
+# functions run in || contexts where errexit is off, so every file operation is checked.
+policy_rc_d_is_stub() {
+  [[ -f "$POLICY_RC_D" && ! -L "$POLICY_RC_D" ]] && grep -Fq -- "$POLICY_RC_D_MARK" "$POLICY_RC_D" 2>/dev/null
+}
+
 policy_rc_d_block() {
   [[ "$POLICY_RC_D_ACTIVE" == false ]] || return 0
   if [[ -e "$POLICY_RC_D_BACKUP" || -L "$POLICY_RC_D_BACKUP" ]]; then
-    if [[ ! -e "$POLICY_RC_D" && ! -L "$POLICY_RC_D" ]] || grep -Fq "$POLICY_RC_D_MARK" "$POLICY_RC_D" 2>/dev/null; then
-      rm -f -- "$POLICY_RC_D"
-      mv -f -- "$POLICY_RC_D_BACKUP" "$POLICY_RC_D"
-      warn "已还原上次中断遗留的 $POLICY_RC_D。"
-    else
+    # Left by an interrupted run: the user's file goes back before anything else happens.
+    if [[ -e "$POLICY_RC_D" || -L "$POLICY_RC_D" ]] && ! policy_rc_d_is_stub; then
       die "发现 $POLICY_RC_D_BACKUP 且 $POLICY_RC_D 不是本脚本创建，请先手动确认并还原。"
     fi
+    if { ! policy_rc_d_is_stub || rm -f -- "$POLICY_RC_D"; } && mv -f -- "$POLICY_RC_D_BACKUP" "$POLICY_RC_D"; then
+      warn "已还原上次中断遗留的 $POLICY_RC_D。"
+    else
+      warn "无法还原上次中断遗留的 $POLICY_RC_D_BACKUP。"
+      return 1
+    fi
+  elif policy_rc_d_is_stub; then
+    # A stub without a backup means the user never had a policy-rc.d: delete it, never back it up.
+    if ! rm -f -- "$POLICY_RC_D"; then
+      warn "无法删除上次中断遗留的 policy-rc.d 脚桩：$POLICY_RC_D"
+      return 1
+    fi
+    warn "已删除上次中断遗留的 policy-rc.d 脚桩：$POLICY_RC_D"
   fi
+  # From here a failure or a signal must put things back, so restoring is armed first.
   POLICY_RC_D_ACTIVE=true
-  POLICY_RC_D_HAD_ORIGINAL=false
   if [[ -e "$POLICY_RC_D" || -L "$POLICY_RC_D" ]]; then
-    mv -- "$POLICY_RC_D" "$POLICY_RC_D_BACKUP"
-    POLICY_RC_D_HAD_ORIGINAL=true
+    if ! mv -- "$POLICY_RC_D" "$POLICY_RC_D_BACKUP"; then
+      warn "无法移走现有 $POLICY_RC_D。"
+      policy_rc_d_restore || true
+      return 1
+    fi
   fi
-  printf '#!/bin/sh\n%s\nexit 101\n' "$POLICY_RC_D_MARK" >"$TMP_DIR/policy-rc.d"
-  install -m 0755 "$TMP_DIR/policy-rc.d" "$POLICY_RC_D"
+  if ! printf '#!/bin/sh\n%s\nexit 101\n' "$POLICY_RC_D_MARK" >"$TMP_DIR/policy-rc.d" ||
+    ! install -m 0755 "$TMP_DIR/policy-rc.d" "$POLICY_RC_D"; then
+    warn "无法写入临时 $POLICY_RC_D。"
+    policy_rc_d_restore || true
+    return 1
+  fi
 }
 
+# Restoring is driven by what is on disk: drop our stub, then put a backup back if one exists.
 policy_rc_d_restore() {
   [[ "$POLICY_RC_D_ACTIVE" == true ]] || return 0
   local rc=0
-  if grep -Fq "$POLICY_RC_D_MARK" "$POLICY_RC_D" 2>/dev/null; then rm -f -- "$POLICY_RC_D" || rc=1; fi
-  if [[ "$POLICY_RC_D_HAD_ORIGINAL" == true ]]; then mv -f -- "$POLICY_RC_D_BACKUP" "$POLICY_RC_D" || rc=1; fi
+  if policy_rc_d_is_stub; then rm -f -- "$POLICY_RC_D" || rc=1; fi
+  if [[ -e "$POLICY_RC_D_BACKUP" || -L "$POLICY_RC_D_BACKUP" ]]; then
+    mv -f -- "$POLICY_RC_D_BACKUP" "$POLICY_RC_D" || rc=1
+  fi
   if (( rc == 0 )); then
     POLICY_RC_D_ACTIVE=false
-    POLICY_RC_D_HAD_ORIGINAL=false
   else
     warn "无法还原 $POLICY_RC_D，原文件备份在 $POLICY_RC_D_BACKUP。"
   fi
@@ -2255,36 +2285,78 @@ singbox_repo_has_version() {
   grep -Fxq -- "$1" <<<"$versions"
 }
 
-# Run "sing-box check" with the -c/-C/-D arguments the service really starts with. The result goes
-# to SINGBOX_CHECK_OUTPUT; anything that cannot be matched to the service counts as a failure.
-singbox_check_config() {
-  local line argv tok bin n i have_config=false
-  local -a toks=() args=()
-  SINGBOX_CHECK_OUTPUT=''
-  systemctl daemon-reload || true
-  line=$(systemctl show -p ExecStart --value sing-box.service 2>/dev/null) || line=''
-  argv=$(printf '%s\n' "$line" | sed -n 's/.*argv\[\]=\(.*\) ; ignore_errors=.*/\1/p' | head -n 1)
+# Work out, before anything is installed, how to run "sing-box check" exactly like the service
+# starts. Only the plain systemd form is trusted: one ExecStart whose program is an executable
+# named sing-box, no quoting or escapes, standard -c/-C/-D arguments, no Environment/EnvironmentFile.
+# Anything else sets SINGBOX_CHECK_REASON and fails, and the caller does not upgrade.
+singbox_resolve_check() {
+  local exec_out line argv path_field tok value kind wd env_value env_files cfg_path re n i have_config=false
+  local -a toks=() lines=()
+  SINGBOX_CHECK_BIN=''
+  SINGBOX_CHECK_CWD='/'
+  SINGBOX_CHECK_REASON=''
+  SINGBOX_CHECK_ARGS=()
+  exec_out=$(systemctl show -p ExecStart --value sing-box.service 2>/dev/null) || exec_out=''
+  mapfile -t lines < <(printf '%s\n' "$exec_out" | sed '/^[[:space:]]*$/d')
+  if (( ${#lines[@]} != 1 )); then SINGBOX_CHECK_REASON="ExecStart 有 ${#lines[@]} 条，只支持 1 条"; return 1; fi
+  line=${lines[0]}
+  re='^\{ path=([^;]*) ; argv\[\]=(.*) ; ignore_errors='
+  if [[ ! "$line" =~ $re ]]; then SINGBOX_CHECK_REASON='无法解析 systemctl show 的 ExecStart 输出'; return 1; fi
+  path_field=${BASH_REMATCH[1]}
+  argv=${BASH_REMATCH[2]}
+  if [[ "$argv" == *[\"\'\\\$]* ]]; then SINGBOX_CHECK_REASON='ExecStart 含引号、反斜杠或变量'; return 1; fi
+  if [[ "$argv" == *'  '* || "$argv" == ' '* ]]; then SINGBOX_CHECK_REASON='ExecStart 含空参数'; return 1; fi
   IFS=' ' read -r -a toks <<<"$argv"
   n=${#toks[@]}
-  if (( n == 0 )); then SINGBOX_CHECK_OUTPUT='无法读取 sing-box.service 的 ExecStart。'; return 1; fi
-  bin=${toks[0]}
-  [[ -x "$bin" ]] || bin=$(command -v sing-box) || bin=sing-box
+  if (( n == 0 )) || [[ "${toks[0]}" != /* || "${toks[0]}" != "$path_field" || "${toks[0]##*/}" != sing-box ||
+    ! -f "${toks[0]}" || ! -x "${toks[0]}" ]]; then
+    SINGBOX_CHECK_REASON="ExecStart 的程序不是名为 sing-box 的可执行文件（${toks[0]:-空}；env/sh 包装等不支持）"
+    return 1
+  fi
+  env_value=$(systemctl show -p Environment --value sing-box.service 2>/dev/null) || env_value=''
+  env_files=$(systemctl show -p EnvironmentFiles --value sing-box.service 2>/dev/null) || env_files=''
+  if [[ -n "${env_value//[[:space:]]/}" || -n "${env_files//[[:space:]]/}" ]]; then
+    SINGBOX_CHECK_REASON='服务设置了 Environment/EnvironmentFile，无法可靠还原运行环境'
+    return 1
+  fi
+  wd=$(systemctl show -p WorkingDirectory --value sing-box.service 2>/dev/null) || wd=''
+  if [[ -n "$wd" ]]; then
+    if [[ "$wd" != /* || ! -d "$wd" ]]; then SINGBOX_CHECK_REASON="WorkingDirectory 不是现有的绝对目录：$wd"; return 1; fi
+    SINGBOX_CHECK_CWD=$wd
+  fi
+  SINGBOX_CHECK_BIN=${toks[0]}
   for ((i = 1; i < n; i++)); do
     tok=${toks[i]}
     case "$tok" in
       -c|-C|-D|--config|--config-directory|--directory)
-        if (( i + 1 >= n )); then SINGBOX_CHECK_OUTPUT="ExecStart 参数 $tok 缺少值。"; return 1; fi
-        args+=("$tok" "${toks[i + 1]}"); i=$((i + 1)) ;;
-      --config=*|--config-directory=*|--directory=*|-c?*|-C?*|-D?*) args+=("$tok") ;;
+        if (( i + 1 >= n )) || [[ "${toks[i + 1]}" == -* ]]; then SINGBOX_CHECK_REASON="ExecStart 参数 $tok 缺少值"; return 1; fi
+        value=${toks[i + 1]}
+        i=$((i + 1))
+        kind=dir
+        case "$tok" in -c|--config) kind=cfgfile ;; esac
+        if [[ "$tok" != -D && "$tok" != --directory ]]; then
+          have_config=true
+          cfg_path=$value
+          if [[ "$cfg_path" != /* ]]; then cfg_path=$SINGBOX_CHECK_CWD/$cfg_path; fi
+          if [[ "$kind" == cfgfile && ! -f "$cfg_path" ]] || [[ "$kind" == dir && ! -d "$cfg_path" ]]; then
+            SINGBOX_CHECK_REASON="ExecStart 指向的配置不存在或类型不符：$cfg_path"
+            return 1
+          fi
+        fi
+        SINGBOX_CHECK_ARGS+=("$tok" "$value") ;;
+      -c?*|-C?*|-D?*|--config=*|--config-directory=*|--directory=*)
+        SINGBOX_CHECK_REASON="ExecStart 参数 $tok 不是标准写法"
+        return 1 ;;
     esac
-    case "$tok" in -c|-C|--config|--config-directory|--config=*|--config-directory=*|-c?*|-C?*) have_config=true ;; esac
   done
-  if [[ "$have_config" == false ]]; then
-    SINGBOX_CHECK_OUTPUT='ExecStart 中没有 -c/-C 配置参数，无法确定服务实际读取的配置。'
-    return 1
-  fi
-  ( IFS=' '; log "sing-box check ${args[*]}" )
-  SINGBOX_CHECK_OUTPUT=$("$bin" check "${args[@]}" 2>&1) || return 1
+  if [[ "$have_config" == false ]]; then SINGBOX_CHECK_REASON='ExecStart 中没有 -c/-C 配置参数'; return 1; fi
+}
+
+# Run the check with the program and arguments singbox_resolve_check settled on, never another binary.
+singbox_run_check() {
+  SINGBOX_CHECK_OUTPUT=''
+  ( IFS=' '; log "sing-box check ${SINGBOX_CHECK_ARGS[*]}（目录 $SINGBOX_CHECK_CWD）" )
+  SINGBOX_CHECK_OUTPUT=$(cd "$SINGBOX_CHECK_CWD" && "$SINGBOX_CHECK_BIN" check "${SINGBOX_CHECK_ARGS[@]}" 2>&1) || return 1
 }
 
 # Put the previous package version back so program and config match on the next start.
@@ -2295,14 +2367,25 @@ singbox_downgrade() {
   [[ "$(singbox_installed_version || true)" == "$version" ]]
 }
 
+# After a downgrade, bring a service that went down back up from a clean unit state.
+singbox_start_after_downgrade() {
+  systemctl stop sing-box.service || true
+  systemctl daemon-reload || true
+  systemctl reset-failed sing-box.service || true
+  systemctl start sing-box.service || true
+  sleep 5
+  systemctl is-active --quiet sing-box.service
+}
+
 # Menu option 4. A held, unconfigured or first-time install is never checked or started; a
 # configured one is only restarted after the new version accepts the config the service uses.
+# With a config whose start-up arguments cannot be determined, nothing is installed.
 upgrade_sing_box() {
   CURRENT_STEP='安装/升级 sing-box'
   local old_ver='' new_ver='' final_ver='' held_list='' held=false was_active=false has_config=false
-  local hold_note='否' check_note='未检查' restart_note='否' downgrade_note='否' fail_reason=''
-  local rollback=false unrecoverable=false
-  local -a target=()
+  local hold_note='否' check_note='未检查' restart_note='否' downgrade_note='否' pkg_note='否' fail_reason=''
+  local pid_before='' pid_after='' rollback=false args_known=true a
+  local -a target=() alerts=()
 
   capture_singbox_state
   configure_sagernet_repo
@@ -2315,11 +2398,16 @@ upgrade_sing_box() {
   if [[ -e "$SINGBOX_CONFIG" ]]; then has_config=true; fi
   held_list=$(apt-mark showhold) || die '无法读取 APT hold 状态。'
   if grep -Fxq sing-box <<<"$held_list"; then held=true; fi
+  if [[ "$was_active" == true ]]; then pid_before=$(systemctl show -p MainPID --value sing-box.service 2>/dev/null) || pid_before=''; fi
   log "sing-box 当前：版本=${old_ver:-未安装}，运行=$was_active，配置=$has_config，hold=$held"
+  if [[ "$held" == false && -n "$old_ver" && "$has_config" == true ]] && ! singbox_resolve_check; then args_known=false; fi
 
   if [[ "$held" == true ]]; then
     hold_note='是（已被 hold，跳过升级）'
     log 'sing-box 已被 hold，跳过升级。'
+  elif [[ "$args_known" == false ]]; then
+    check_note="无法确定（$SINGBOX_CHECK_REASON）"
+    warn "无法确定服务的启动参数（原因：$SINGBOX_CHECK_REASON），为安全起见未升级，请手动升级。"
   else
     if [[ -n "$SING_BOX_VERSION" ]]; then
       singbox_repo_has_version "$SING_BOX_VERSION" || die "仓库中找不到 sing-box=$SING_BOX_VERSION。"
@@ -2332,6 +2420,13 @@ upgrade_sing_box() {
     singbox_apt_install "${target[@]}" || die 'sing-box 安装/升级失败。'
     new_ver=$(singbox_installed_version) || die '安装后找不到 sing-box。'
     install -d -m 0755 "${SINGBOX_CONFIG%/*}"
+    if [[ "$was_active" == true ]]; then
+      pid_after=$(systemctl show -p MainPID --value sing-box.service 2>/dev/null) || pid_after=''
+      if [[ "$pid_after" != "$pid_before" ]]; then
+        pkg_note="是（MainPID $pid_before → ${pid_after:-无}）"
+        warn "软件包自行重启了服务（MainPID $pid_before → ${pid_after:-无}），policy-rc.d 没能拦住；立即检查配置。"
+      fi
+    fi
     if [[ -z "$old_ver" || "$SINGBOX_WAS_MANAGED" == true ]]; then
       configure_singbox_boot_gate
       remove_fresh_singbox_default_config
@@ -2344,7 +2439,7 @@ upgrade_sing_box() {
       check_note='未检查（没有配置）'
     elif [[ "$new_ver" == "$old_ver" ]]; then
       check_note='未检查（版本未变化）'
-    elif singbox_check_config; then
+    elif singbox_run_check; then
       check_note='通过'
       if [[ "$was_active" == true ]]; then
         systemctl restart sing-box.service || true
@@ -2369,23 +2464,22 @@ upgrade_sing_box() {
       if singbox_downgrade "$old_ver"; then
         downgrade_note="是（$new_ver → $old_ver）"
         warn "新版本 $new_ver 与现有配置不兼容，已回退到 $old_ver。"
-        if [[ "$restart_note" == 失败 ]]; then
-          systemctl reset-failed sing-box.service >/dev/null 2>&1 || true
-          systemctl start sing-box.service || true
-          sleep 5
-          if systemctl is-active --quiet sing-box.service; then
-            restart_note='失败，已回退并重新启动'
+        if [[ "$was_active" == true ]] && ! systemctl is-active --quiet sing-box.service; then
+          if singbox_start_after_downgrade; then
+            restart_note='服务曾中断，已回退并重新启动'
           else
-            restart_note='失败，回退后仍未能启动'
+            restart_note='服务中断，回退后仍未能启动'
           fi
-        else
+        elif [[ "$restart_note" != 失败 ]]; then
           restart_note='否（原进程未动）'
         fi
       else
-        unrecoverable=true
         downgrade_note="失败（仓库中找不到 $old_ver 或降级未成功）"
-        warn '!!! 重启后 sing-box 将无法启动，请先修改配置 !!!'
-        warn "新版本 $new_ver 与现有配置不兼容，且无法回退到 $old_ver；没有重启服务。"
+        if [[ "$was_active" == true ]] && ! systemctl is-active --quiet sing-box.service; then
+          alerts+=("服务已中断，当前未运行；无法回退到 $old_ver，请先修改配置")
+        else
+          alerts+=("未重启，但下次开机将无法启动：重启后 sing-box 将无法启动，请先修改配置（新版本 $new_ver 与现有配置不兼容，无法回退到 $old_ver）")
+        fi
       fi
       if [[ -n "$fail_reason" ]]; then
         warn '失败原因：'
@@ -2396,6 +2490,9 @@ upgrade_sing_box() {
 
   final_ver=$(singbox_installed_version) || final_ver=''
   if [[ -n "$final_ver" ]]; then restore_singbox_state; fi
+  if [[ "$was_active" == true ]] && ! systemctl is-active --quiet sing-box.service; then
+    alerts+=('sing-box 服务已中断，当前未运行')
+  fi
 
   cat <<EOF
 ============================================================
@@ -2403,23 +2500,43 @@ sing-box 安装/升级报告
 版本：${old_ver:-未安装} → ${final_ver:-未安装}
 hold：$hold_note
 配置检查：$check_note
+软件包自行重启服务：$pkg_note
 已重启：$restart_note
 已降级：$downgrade_note
 服务状态：$(systemctl is-active sing-box.service 2>/dev/null || true)
 开机自启：$(systemctl is-enabled sing-box.service 2>/dev/null || true)
 ============================================================
 EOF
-  [[ "$unrecoverable" == false ]] || die '新版本与现有配置不兼容且无法回退，请先修改配置再重启 sing-box。'
+  for a in "${alerts[@]}"; do warn "!!! $a !!!"; done
+  (( ${#alerts[@]} == 0 )) || die 'sing-box 升级未能恢复到可用状态，见上方告警。'
 }
 
+# Best-effort cleanup of a state file older versions wrote. It must never stop the run, so a file
+# that cannot be backed up or made mutable is only reported.
 remove_legacy_network_stack_state() {
-  [[ -f "$LEGACY_NETWORK_STACK_STATE" && ! -L "$LEGACY_NETWORK_STACK_STATE" ]] || return 0
-  make_mutable "$LEGACY_NETWORK_STACK_STATE"
-  if rm -f -- "$LEGACY_NETWORK_STACK_STATE"; then
-    log "已删除旧版网络栈状态文件：$LEGACY_NETWORK_STACK_STATE"
-  else
-    warn "无法删除旧版网络栈状态文件：$LEGACY_NETWORK_STACK_STATE"
+  local path=$LEGACY_NETWORK_STACK_STATE backup out flags
+  [[ -f "$path" && ! -L "$path" ]] || return 0
+  if [[ -n "$BACKUP_DIR" ]]; then
+    backup="$BACKUP_DIR/files$path"
+    if [[ ! -e "$backup" ]] && ! { install -d -m 0700 "${backup%/*}" && cp -a -- "$path" "$backup"; }; then
+      warn "无法备份旧版网络栈状态文件，保留：$path"
+      return 0
+    fi
   fi
+  if command -v lsattr >/dev/null 2>&1 && command -v chattr >/dev/null 2>&1; then
+    out=$(lsattr -d -- "$path" 2>/dev/null || true)
+    flags=${out%% *}
+    if [[ "$flags" == *i* || "$flags" == *a* ]] && ! chattr -i -a -- "$path"; then
+      warn "无法解除旧版网络栈状态文件的 immutable/append-only 属性，保留：$path"
+      return 0
+    fi
+  fi
+  if rm -f -- "$path"; then
+    log "已删除旧版网络栈状态文件：$path"
+  else
+    warn "无法删除旧版网络栈状态文件：$path"
+  fi
+  return 0
 }
 
 smartdns_pkg_values() {

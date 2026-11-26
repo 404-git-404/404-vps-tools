@@ -171,6 +171,21 @@ rm -f "$LEGACY_NETWORK_STACK_STATE"
 mkdir "$LEGACY_NETWORK_STACK_STATE"
 remove_legacy_network_stack_state
 [[ -d "$LEGACY_NETWORK_STACK_STATE" ]]
+# A file that cannot be made mutable or backed up is only reported: the run (and its report) goes on.
+rmdir "$LEGACY_NETWORK_STACK_STATE"
+printf 'dual\n' >"$LEGACY_NETWORK_STACK_STATE"
+lsattr() { echo '----i---------e------- x'; }
+chattr() { return 1; }
+make_mutable() { echo 'make_mutable must not be used' >&2; return 1; }
+remove_legacy_network_stack_state 2>"$BACKUP_DIR/warn"
+[[ -f "$LEGACY_NETWORK_STACK_STATE" ]]
+grep -Fq '保留' "$BACKUP_DIR/warn"
+unset -f lsattr chattr
+BACKUP_DIR=/dev/null/none
+remove_legacy_network_stack_state 2>"$1/warn2"
+[[ -f "$LEGACY_NETWORK_STACK_STATE" ]]
+grep -Fq '无法备份' "$1/warn2"
+echo report-still-printed >"$1/report"
 TEST
 
 if [[ "$(uname -s)" == Linux ]] && command -v script >/dev/null; then
