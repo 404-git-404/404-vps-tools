@@ -198,7 +198,7 @@ for scenario in port22 default state-fail custom-port preserve reuse missing-key
     *)
       grep -Fxq 'execute cleanup' "$trace"
       tail -n 4 "$trace" | grep -Eq '^execute state=(ipv4|dual)$'
-      [[ "$(tail -n 2 "$trace")" == $'execute cleanup\nexecute report' ]] || fail 'cleanup/report order'
+      [[ "$(tail -n 3 "$trace")" == $'execute cleanup\nexecute boot-check\nexecute report' ]] || fail 'cleanup, boot check, report order'
       ;;
   esac
   if grep -Fq 'prompt 是否卸载 QEMU Guest Agent？' "$trace"; then fail "$scenario asked about QGA"; fi

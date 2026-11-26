@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # shellcheck disable=SC2329,SC2034,SC2016 # Mocks/state and literal APT placeholders.
 set -Eeuo pipefail
+# shellcheck source=tests/process-helper.sh
+source "$(dirname -- "${BASH_SOURCE[0]}")/process-helper.sh"
 repo=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 work=$(mktemp -d)
 root="$work/root"
@@ -68,6 +70,9 @@ trap - ERR HUP INT TERM
 trap 'rm -rf -- "$work"' EXIT
 TMP_DIR="$work/tmp" BACKUP_DIR="$work/backup"
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
+# The process helper must keep errexit even when invoked from a condition.
+errexit_probe() { echo 'errexit probe'; false; echo 'unexpected continuation'; }
+expect_bash_failure 'errexit probe' errexit_probe
 
 # Actual menu, including invalid reserved 9 and exit 0.
 for mapping in 1:quick 2:custom 3:smartdns 4:singbox 5:fail2ban 6:update 7:cleanup 8:hardening; do
@@ -157,9 +162,9 @@ journalctl() {
 }
 [[ $(audit_session_key) == "$current_fp" ]] || fail 'session correlation'
 journalctl() { local IFS=' '; printf 'Accepted password for root from 192.0.2.10 port 1234 ssh2\n'; }
-if audit_session_key; then fail 'password session treated as publickey'; fi
+if run_in_bash audit_session_key >/dev/null 2>&1; then fail 'password session treated as publickey'; fi
 journalctl() { local IFS=' '; printf 'Accepted publickey for root from 192.0.2.10 port 1234 ssh2: ED25519 %s\n' "$current_fp" "$other_fp"; }
-if audit_session_key; then fail 'ambiguous session allowed'; fi
+if run_in_bash audit_session_key >/dev/null 2>&1; then fail 'ambiguous session allowed'; fi
 unset -f ps journalctl
 audit_session_key() { [[ -n "${session_key:-}" ]] && printf '%s\n' "$session_key"; }
 session_key=$current_fp
@@ -182,7 +187,7 @@ grep -Fxq '# keep comment' "$file"
 cmp "$BACKUP_DIR/files$file" "$work/keys-before"
 [[ $(stat -c %a "$file") == 600 ]] || fail 'key permissions changed'
 ln -s "$file" "$root/home/person/.ssh/authorized_keys"
-if audit_regular_key_path "$root/home/person/.ssh/authorized_keys"; then fail 'symlink accepted'; fi
+if run_in_bash "audit_regular_key_path '$root/home/person/.ssh/authorized_keys'" >/dev/null 2>&1; then fail 'symlink accepted'; fi
 rm "$root/home/person/.ssh/authorized_keys"
 printf '%s\n' "$other" >"$root/home/person/.ssh/authorized_keys"
 
@@ -203,9 +208,16 @@ net_reset() {
   rm -rf "$root/etc/network/interfaces" "$root/etc/cloud/cloud.cfg" "$root/run/systemd/network/"*
   rm -f "$root"/etc/network/interfaces.d/* "$root"/etc/netplan/* "$root"/etc/systemd/network/* "$root"/etc/cloud/cloud.cfg.d/*
 }
+# Classification runs in its own Bash process (fresh errexit, as in production) and reports
+# its globals through an EXIT trap.
+net_probe() {
+  trap 'printf "RESULT|%s|%s|%s\n" "$CLOUD_NET_KIND" "$CLOUD_NET_STATIC" "$CLOUD_NET_REASON"' EXIT
+  audit_cloud_network_classify
+}
 expect_net() { # expect_net pass|skip static|dynamic label
-  local want=$1 static=$2 label=$3 rc=0
-  audit_cloud_network_classify || rc=$?
+  local want=$1 static=$2 label=$3 rc=0 out
+  out=$(run_in_bash net_probe 2>&1) || rc=$?
+  IFS='|' read -r _ CLOUD_NET_KIND CLOUD_NET_STATIC CLOUD_NET_REASON <<<"$(grep '^RESULT|' <<<"$out")"
   if [[ "$want" == pass ]]; then
     (( rc == 0 )) || fail "$label refused: $CLOUD_NET_REASON"
     [[ "$CLOUD_NET_STATIC" == "$static" ]] || fail "$label static flag=$CLOUD_NET_STATIC"
