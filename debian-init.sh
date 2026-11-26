@@ -9,6 +9,7 @@ export DEBIAN_FRONTEND=noninteractive
 export APT_LISTCHANGES_FRONTEND=none
 export LC_ALL=C
 
+readonly SCRIPT_VERSION='0.1.0'
 readonly DEFAULT_SSH_PORT='53651'
 readonly APT_WAIT_MAX="${VPS_INIT_APT_WAIT:-1800}"
 readonly LOCK_FILE='/run/lock/vps-init.lock'
@@ -212,6 +213,7 @@ usage() {
   --cleanup-only             系统清理，删除软件包和旧内核需分别确认
   --update-only              仅系统更新，保留 sing-box/SmartDNS hold，不安装初始化工具
   --audit                    只读体检，完整报告输出到终端，不创建备份、锁或临时文件
+  --version                  显示版本并退出
   --help                     显示帮助
 EOF
 }
@@ -488,6 +490,7 @@ parse_args() {
         esac
         shift ;;
       --help|-h) usage; exit 0 ;;
+      --version|-V) printf 'debian-init.sh %s\n' "$SCRIPT_VERSION"; exit 0 ;;
       *) die "未知参数：$1" ;;
     esac
   done
@@ -3298,15 +3301,41 @@ TMP=$(mktemp -d /root/vps-init-cf.XXXXXXXX)
 trap 'rm -rf "$TMP"' EXIT
 [[ $EUID -eq 0 ]] || { echo 'root required' >&2; exit 1; }
 ufw status | grep -q '^Status: active$' || { echo 'UFW inactive' >&2; exit 1; }
-curl -fsSL --retry 3 https://www.cloudflare.com/ips-v4 -o "$TMP/v4"
-curl -fsSL --retry 3 https://www.cloudflare.com/ips-v6 -o "$TMP/v6"
-python3 - "$TMP/v4" "$TMP/v6" <<'PY'
-import ipaddress,sys
-for p in sys.argv[1:]:
-    with open(p) as f:
-        vals=[x.strip() for x in f if x.strip()]
-    if not vals: raise SystemExit(f'empty: {p}')
-    for v in vals: ipaddress.ip_network(v, strict=False)
+refuse() { echo "WARNING: $1; existing Cloudflare 8443 rules were left unchanged." >&2; exit 1; }
+for family in v4 v6; do
+  curl -fsSL --proto '=https' --retry 3 --connect-timeout 10 --max-time 60 "https://www.cloudflare.com/ips-$family" -o "$TMP/$family" ||
+    refuse "downloading the Cloudflare IP$family list failed"
+done
+# Nothing below is touched unless both lists pass: every line a real network CIDR of the right
+# family, a plausible count, and no catch-all, private, loopback or multicast range.
+python3 - "$TMP/v4" "$TMP/v6" <<'PY' || refuse 'the downloaded Cloudflare IP lists failed validation'
+import ipaddress, sys
+LIMITS = {4: (5, 100, 8), 6: (3, 100, 16)}  # version: (min entries, max entries, min prefix length)
+for version, path in zip((4, 6), sys.argv[1:]):
+    low, high, min_prefix = LIMITS[version]
+    with open(path, encoding='ascii', errors='strict') as handle:
+        lines = [line.strip() for line in handle if line.strip()]
+    networks = set()
+    for line in lines:
+        if '/' not in line:
+            raise SystemExit(f'IPv{version} list: not a CIDR: {line[:60]!r}')
+        try:
+            network = ipaddress.ip_network(line, strict=True)
+        except ValueError as error:
+            raise SystemExit(f'IPv{version} list: invalid CIDR {line[:60]!r}: {error}')
+        if network.version != version:
+            raise SystemExit(f'IPv{version} list: wrong address family: {line}')
+        if network.prefixlen < min_prefix:
+            raise SystemExit(f'IPv{version} list: range too wide: {line}')
+        if (not network.is_global or network.is_private or network.is_loopback or
+                network.is_link_local or network.is_multicast or network.is_reserved or
+                network.is_unspecified):
+            raise SystemExit(f'IPv{version} list: non-public range: {line}')
+        networks.add(network)
+    if not low <= len(networks) <= high:
+        raise SystemExit(f'IPv{version} list: {len(networks)} entries, expected {low}-{high}')
+    with open(f'{path}.ok', 'w', newline='\n') as out:
+        out.write(''.join(f'{network}\n' for network in sorted(networks)))
 PY
 # Refuse to pretend 8443 is Cloudflare-only when an unmanaged global allow exists.
 if ufw status | grep -E '^8443/tcp[[:space:]]+ALLOW[[:space:]]+(Anywhere|Anywhere \(v6\))' | grep -vq "# $COMMENT"; then
@@ -3319,9 +3348,9 @@ while :; do
   [[ -n "$nums" ]] || break
   while IFS= read -r n; do [[ -n "$n" ]] && ufw --force delete "$n" >/dev/null; done <<<"$nums"
 done
-while IFS= read -r cidr; do [[ -n "$cidr" ]] && ufw allow proto tcp from "$cidr" to any port 8443 comment "$COMMENT" >/dev/null; done <"$TMP/v4"
+while IFS= read -r cidr; do [[ -n "$cidr" ]] && ufw allow proto tcp from "$cidr" to any port 8443 comment "$COMMENT" >/dev/null; done <"$TMP/v4.ok"
 if grep -Eq '^IPV6=yes' /etc/default/ufw 2>/dev/null; then
-  while IFS= read -r cidr; do [[ -n "$cidr" ]] && ufw allow proto tcp from "$cidr" to any port 8443 comment "$COMMENT" >/dev/null; done <"$TMP/v6"
+  while IFS= read -r cidr; do [[ -n "$cidr" ]] && ufw allow proto tcp from "$cidr" to any port 8443 comment "$COMMENT" >/dev/null; done <"$TMP/v6.ok"
 fi
 ufw status | grep -Fq "# $COMMENT" || { echo 'No managed rules installed' >&2; exit 1; }
 CFEOF
@@ -4462,6 +4491,7 @@ print_report() {
 ============================================================
 VPS 初始化完成
 ============================================================
+脚本版本      : $SCRIPT_VERSION
 系统          : ${PRETTY_NAME:-Debian}
 网络栈        : $NETWORK_STACK（策略 $NETWORK_REQUEST）
 $(if [[ "$NETWORK_REQUEST" == ipv4 ]]; then printf '内核 IPv6     : %s\n' "$IPV4_POLICY_STATUS"; fi)
@@ -4493,7 +4523,7 @@ select_install_mode() {
   [[ -z "$INSTALL_MODE" ]] || return 0
   local choice=''
   while true; do
-    printf '\n1. 快速初始化\n2. 自定义初始化\n3. 仅安装/更新 SmartDNS\n4. 安装/升级 sing-box\n5. 仅安装/更新 Fail2ban\n6. 仅更新系统\n7. 系统清理\n8. 安全加固（体检 → 建议 → 确认后执行）\n0. 退出\n' >/dev/tty
+    printf '\n404-vps-tools debian-init.sh v%s\n1. 快速初始化\n2. 自定义初始化\n3. 仅安装/更新 SmartDNS\n4. 安装/升级 sing-box\n5. 仅安装/更新 Fail2ban\n6. 仅更新系统\n7. 系统清理\n8. 安全加固（体检 → 建议 → 确认后执行）\n0. 退出\n' "$SCRIPT_VERSION" >/dev/tty
     read_tty '请选择 [0-8]: ' choice
     case "$choice" in
       1) INSTALL_MODE=quick; return 0 ;;

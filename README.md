@@ -1,14 +1,16 @@
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/404-git-404/404-vps-tools/main/debian-init.sh)
+cd "$(mktemp -d)" && B=https://github.com/404-git-404/404-vps-tools/releases/latest/download && curl -fsSLO "$B/debian-init.sh" && curl -fsSLO "$B/SHA256SUMS" && grep '  debian-init\.sh$' SHA256SUMS | sha256sum -c - && bash debian-init.sh
 ```
 
 ```sh
-wget -qO alpine-init.sh https://raw.githubusercontent.com/404-git-404/404-vps-tools/main/alpine-init.sh && sh alpine-init.sh
+cd "$(mktemp -d)" && B=https://github.com/404-git-404/404-vps-tools/releases/latest/download && wget -qO alpine-init.sh "$B/alpine-init.sh" && wget -qO SHA256SUMS "$B/SHA256SUMS" && grep '  alpine-init\.sh$' SHA256SUMS | sha256sum -c - && sh alpine-init.sh
 ```
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/404-git-404/404-vps-tools/main/gg-status -o gg-status && chmod +x gg-status && ./gg-status
+cd "$(mktemp -d)" && B=https://github.com/404-git-404/404-vps-tools/releases/latest/download && curl -fsSLO "$B/gg-status" && curl -fsSLO "$B/SHA256SUMS" && grep '  gg-status$' SHA256SUMS | sha256sum -c - && sh gg-status
 ```
+
+以上命令下载最新发布的版本，校验 SHA256SUMS 通过后才运行；校验失败不会执行。想锁定版本，见对应 Release 的说明。`bash debian-init.sh --version` 查看版本。
 
 第一条命令以 root 在 Debian 12/13（amd64/arm64、systemd）运行，菜单：1 快速初始化、2 自定义初始化、3 SmartDNS、4 安装/升级 sing-box、5 Fail2ban、6 系统更新、7 清理、8 安全加固、0 退出；9 预留。本地运行 `bash debian-init.sh`。
 
