@@ -28,7 +28,6 @@ jobs:
             tests/gg-status-container-test.sh
             tests/gg-status-test.sh
             tests/fail2ban-test.sh
-            tests/node-config-wizard-test.sh
             tests/smartdns-test.sh
             tests/ssh-public-key-test.sh
             tests/swap-test.sh
@@ -36,6 +35,7 @@ jobs:
             tests/ufw-sync-test.sh
             tests/system-update-test.sh
             tests/init-flow-test.sh
+            tests/singbox-upgrade-test.sh
             tests/process-helper.sh
             tests/ipv6-boot-state-test.sh
             tests/hardening-test.sh
@@ -58,7 +58,6 @@ jobs:
             tests/fail2ban-test.sh \
             tests/gg-status-container-test.sh \
             tests/gg-status-test.sh \
-            tests/node-config-wizard-test.sh \
             tests/smartdns-test.sh \
             tests/ssh-public-key-test.sh \
             tests/swap-test.sh \
@@ -66,6 +65,7 @@ jobs:
             tests/ufw-sync-test.sh \
             tests/system-update-test.sh \
             tests/init-flow-test.sh \
+            tests/singbox-upgrade-test.sh \
             tests/ipv6-boot-state-test.sh \
             tests/hardening-test.sh \
             tests/qemu-guest-agent-test.sh \
@@ -85,9 +85,8 @@ jobs:
 
       - name: Extract and check embedded tools
         run: |
-          sed -n "/^  bash \/dev\/fd\/3 3<<'SINGBOX_WIZARD'$/,/^SINGBOX_WIZARD$/ { /SINGBOX_WIZARD/d; p; }" debian-init.sh > /tmp/node-wizard.sh
           awk '/<<.CFEOF./ { capture=1; next } capture && $0 == "CFEOF" { exit } capture { print }' debian-init.sh > /tmp/update-cloudflare-ufw
-          for script in /tmp/node-wizard.sh /tmp/update-cloudflare-ufw; do
+          for script in /tmp/update-cloudflare-ufw; do
             test -s "$script"
             bash -n "$script"
           done
@@ -140,7 +139,6 @@ jobs:
           PATH="$RUNNER_TEMP/mawk-bin:$PATH" awk -W version
           PATH="$RUNNER_TEMP/mawk-bin:$PATH" bash tests/gg-status-test.sh
           GG_STATUS_SHELL=/bin/dash PATH="$RUNNER_TEMP/mawk-bin:$PATH" bash tests/gg-status-test.sh
-          PATH="$RUNNER_TEMP/mawk-bin:$PATH" bash tests/node-config-wizard-test.sh
           PATH="$RUNNER_TEMP/mawk-bin:$PATH" bash tests/smartdns-test.sh
           PATH="$RUNNER_TEMP/mawk-bin:$PATH" bash tests/fail2ban-test.sh
           PATH="$RUNNER_TEMP/mawk-bin:$PATH" bash tests/ssh-public-key-test.sh
@@ -149,6 +147,7 @@ jobs:
           PATH="$RUNNER_TEMP/mawk-bin:$PATH" bash tests/ufw-sync-test.sh
           PATH="$RUNNER_TEMP/mawk-bin:$PATH" bash tests/system-update-test.sh
           PATH="$RUNNER_TEMP/mawk-bin:$PATH" bash tests/init-flow-test.sh
+          PATH="$RUNNER_TEMP/mawk-bin:$PATH" bash tests/singbox-upgrade-test.sh
           sudo env PATH="$RUNNER_TEMP/mawk-bin:$PATH" bash tests/hardening-test.sh
           PATH="$RUNNER_TEMP/mawk-bin:$PATH" bash tests/qemu-guest-agent-test.sh
           PATH="$RUNNER_TEMP/mawk-bin:$PATH" bash tests/dns-precheck-test.sh
@@ -224,7 +223,6 @@ jobs:
             tests/gg-status-container-test.sh \
             tests/fail2ban-test.sh \
             tests/gg-status-test.sh \
-            tests/node-config-wizard-test.sh \
             tests/smartdns-test.sh \
             tests/ssh-public-key-test.sh \
             tests/swap-test.sh \
@@ -232,6 +230,7 @@ jobs:
             tests/ufw-sync-test.sh \
             tests/system-update-test.sh \
             tests/init-flow-test.sh \
+            tests/singbox-upgrade-test.sh \
             tests/ipv6-boot-state-test.sh \
             tests/hardening-test.sh \
             tests/qemu-guest-agent-test.sh \
@@ -240,6 +239,5 @@ jobs:
             tests/sysctl-dir-container-test.sh \
             .github/scripts/ci-fetch.sh \
             .github/scripts/ci-required-checks.sh \
-            /tmp/node-wizard.sh \
             /tmp/update-cloudflare-ufw
           shellcheck -s sh yt-region gg-status alpine-init.sh

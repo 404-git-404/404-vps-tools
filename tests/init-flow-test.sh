@@ -26,7 +26,7 @@ fail() { echo "FAIL: $*" >&2; exit 1; }
 errexit_probe() { echo 'errexit probe'; false; echo 'unexpected continuation'; }
 expect_bash_failure 'errexit probe' errexit_probe
 
-for scenario in port22 default state-fail custom-port preserve reuse missing-keygen existing-swap no-swap low-memory multi multi-cancel ipv6-guard cancel custom-full custom-base custom-remove cli base ipv6-restore ipv6-keep; do
+for scenario in port22 default custom-port preserve reuse missing-keygen existing-swap no-swap low-memory multi multi-cancel ipv6-guard cancel custom-full custom-base custom-remove cli base ipv6-restore ipv6-keep; do
   trace="$work/$scenario.trace"
   : >"$trace"
   set +e
@@ -149,7 +149,7 @@ for scenario in port22 default state-fail custom-port preserve reuse missing-key
     configure_ufw() { if [[ "$PRESERVE_SSH" == false ]]; then execute ufw; fi; }
     configure_cf8443() { :; }
     configure_fail2ban() { execute fail2ban; }
-    persist_network_stack() { execute "state=$NETWORK_STACK"; [[ "$scenario" != state-fail ]]; }
+    remove_legacy_network_stack_state() { execute legacy-state; }
     run_safe_cleanup() { execute cleanup; }
     print_report() { execute report; }
     if [[ "$scenario" == ipv6-guard ]]; then SSH_CONNECTION='2001:db8::1 12345 2001:db8::2 22'; else unset SSH_CONNECTION; fi
@@ -191,14 +191,13 @@ for scenario in port22 default state-fail custom-port preserve reuse missing-key
       esac ;;
   esac
   if [[ "$scenario" == custom-base || "$scenario" == base ]]; then
-    if grep -Eq '^execute (ssh|ufw|key|network|smartdns|singbox|cleanup|state=.*)$' "$trace"; then fail 'base-only changed components'; fi
+    if grep -Eq '^execute (ssh|ufw|key|network|smartdns|singbox|cleanup|legacy-state)$' "$trace"; then fail 'base-only changed components'; fi
   fi
   case "$scenario" in
     base|custom-base|multi-cancel|ipv6-guard|cancel) ;;
     *)
       grep -Fxq 'execute cleanup' "$trace"
-      tail -n 4 "$trace" | grep -Eq '^execute state=(ipv4|dual)$'
-      [[ "$(tail -n 3 "$trace")" == $'execute cleanup\nexecute boot-check\nexecute report' ]] || fail 'cleanup, boot check, report order'
+      [[ "$(tail -n 4 "$trace")" == $'execute legacy-state\nexecute cleanup\nexecute boot-check\nexecute report' ]] || fail 'legacy-state, cleanup, boot check, report order'
       ;;
   esac
   if grep -Fq 'prompt 是否卸载 QEMU Guest Agent？' "$trace"; then fail "$scenario asked about QGA"; fi

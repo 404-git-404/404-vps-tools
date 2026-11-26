@@ -62,7 +62,7 @@ quick_fixture() {
   configure_ssh() { :; }
   configure_ufw() { :; }
   configure_cf8443() { :; }
-  persist_network_stack() { :; }
+  remove_legacy_network_stack_state() { :; }
   run_safe_cleanup() { :; }
   verify_ipv4_policy() { :; }
 }

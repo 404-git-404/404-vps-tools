@@ -209,7 +209,7 @@ check_preserved_ssh_network_mode() (
   ipv6_https_works() { [[ "$connection" == ipv6 ]]; }
   install_and_configure_smartdns() { echo "smartdns=$NETWORK_STACK" >>"$phase_trace"; }
   configure_system_dns() { DNS_TX=false; }
-  persist_network_stack() { :; }
+  remove_legacy_network_stack_state() { :; }
   run_safe_cleanup() { :; }
   print_report() { :; }
   (main) >"$TEST_TMP/preserve-network.log" 2>&1 || result=$?
@@ -535,10 +535,8 @@ for mode in smartdns singbox; do
     ensure_system_dns() { record dns; }
     acquire_lock() { record lock; }
     install_component_dependencies() { record dependencies; }
-    install_sing_box() { record singbox; }
-    run_node_config_wizard() { record wizard; }
-    # Avoid /dev/tty in this offline test; check the actual dispatch independently.
-    run_singbox_only() { install_component_dependencies; install_sing_box; run_node_config_wizard; }
+    remove_legacy_network_stack_state() { record legacy-state; }
+    upgrade_sing_box() { record upgrade; }
     NETWORK_REQUEST=auto
     ipv6_global_present() { return 1; }
     ipv6_route_present() { return 1; }
@@ -552,7 +550,7 @@ for mode in smartdns singbox; do
       assert_eq $'preflight\nlock\ndns\ndependencies\ndns-backup\nsmartdns\nresolver' "$(cat "$TRACE")" 'SmartDNS scope/order'
       assert_eq ipv4 "$NETWORK_STACK" 'auto DNS family'
     else
-      assert_eq $'preflight\nlock\ndns\ndependencies\nsingbox\nwizard' "$(cat "$TRACE")" 'sing-box scope/order'
+      assert_eq $'preflight\nlock\ndns\ndependencies\nlegacy-state\nupgrade' "$(cat "$TRACE")" 'sing-box scope/order'
     fi
   )
 done

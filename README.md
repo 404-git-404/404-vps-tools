@@ -10,7 +10,7 @@ wget -qO alpine-init.sh https://raw.githubusercontent.com/404-git-404/404-vps-to
 curl -fsSL https://raw.githubusercontent.com/404-git-404/404-vps-tools/main/gg-status -o gg-status && chmod +x gg-status && ./gg-status
 ```
 
-第一条命令以 root 在 Debian 12/13（amd64/arm64、systemd）运行，菜单：1 快速初始化、2 自定义初始化、3 SmartDNS、4 sing-box 节点、5 Fail2ban、6 系统更新、7 清理、8 安全加固、0 退出；9 预留。本地运行 `bash debian-init.sh`。
+第一条命令以 root 在 Debian 12/13（amd64/arm64、systemd）运行，菜单：1 快速初始化、2 自定义初始化、3 SmartDNS、4 安装/升级 sing-box、5 Fail2ban、6 系统更新、7 清理、8 安全加固、0 退出；9 预留。本地运行 `bash debian-init.sh`。
 
 快速安装选择 SSH 单端口和网络策略，直接回车默认使用 53651 与 Auto。`--ssh-port PORT` 和 `--network-stack auto|ipv4|dual` 分别跳过对应菜单。使用 `--ssh-port PORT --keep-22` 可兼容旧部署的备用 22。
 
@@ -34,7 +34,7 @@ Debian 初始化要求根分区至少有 2048MiB 可用空间。低内存且已�
 
 选项 1、2 默认执行 `apt update` 和 `apt full-upgrade -y`，不再单独询问升级。选项 6（或 `bash debian-init.sh --update-only`）仅执行系统更新并报告重启提示，不安装初始化工具或修改组件配置。升级时临时保护已安装的 sing-box、SmartDNS，成功、失败或中断均恢复临时 hold，保留用户原有永久 hold。`--skip-upgrade` 跳过 full-upgrade；`--full-upgrade` 和 `--base-only` 保持可用。
 
-Debian 完整初始化包含系统更新、SSH 公钥与端口、UFW、SmartDNS、sing-box 安装及基础调优；sing-box 向导默认沿用 `/var/lib/404-vps-tools/network-stack` 保存的初始化网络栈；无状态时仅检查本地全局 IPv6 地址和默认路由，提供 IPv4、Dual-stack 两项。节点通过选项 4 单独配置，预览并确认后才应用和启动。选项 3 仅处理 SmartDNS 与系统 DNS。覆盖已有配置前备份，失败时查看输出中的备份路径。修改 SSH 后保持当前会话，并从另一终端验证新端口。
+Debian 完整初始化包含系统更新、SSH 公钥与端口、UFW、SmartDNS、sing-box 安装及基础调优，不创建节点配置。选项 3 仅处理 SmartDNS 与系统 DNS。旧版遗留的 `/var/lib/404-vps-tools/network-stack` 在快速/自定义初始化和选项 4 运行时删除。覆盖已有配置前备份，失败时查看输出中的备份路径。修改 SSH 后保持当前会话，并从另一终端验证新端口。
 
 第二条命令以 root 在 Alpine/OpenRC 环境下载并运行独立初始化脚本，暂不融合 Debian 菜单。本地运行 `sh alpine-init.sh`。
 
@@ -45,3 +45,5 @@ Debian 完整初始化包含系统更新、SSH 公钥与端口、UFW、SmartDNS�
 选项 8 先只读体检并分三级显示（A 建议删除、B 需要你看一眼、C 严重异常），A 级有项时先显示风险提示并确认，再逐项确认（默认 N），先备份后执行，结尾给出报告和恢复方式；没有 A 级项时不创建备份。QEMU Guest Agent 只在这里卸载，初始化不再涉及。初始化把用户提供或确认复用的公钥指纹保存在 /var/lib/404-vps-tools/trusted-key-fingerprints；无法确定当前 SSH 会话所用公钥、公钥只剩一把、当前会话公钥，均禁止删除。商家 agent 按进程名、服务名或安装路径识别，仅软件包安装且不在 Debian 官方源的才可 purge，其余只报告并提示手动卸载。exim4 可选卸载，先模拟 `apt-get -s purge 'exim4*'`，连带删除非 exim4 包时列出名单并额外确认，卸载后 cron 邮件将无法投递。
 
 运行 `bash debian-init.sh --audit` 只读体检，完整报告输出到终端，不创建备份、锁或临时文件。cloud-init 仅在网络配置已写在 /etc 的普通文件（ifupdown、netplan、systemd-networkd，DHCP 或静态均可）且未配置每次开机重新生成网络时才可关闭；否则只跳过这一项。关闭方式是创建 /etc/cloud/cloud-init.disabled，恢复时删除该文件。
+
+选项 4（或 `--sing-box-only`，可加 `--sing-box-version VER`）安装或升级 sing-box，不需要交互终端，sing-box 只通过选项 4 升级。流程：配置 SagerNet 软件源（固定密钥指纹）并 `apt update`，记录当前版本、运行状态、`/etc/sing-box/config.json` 是否存在和永久 hold，然后安装稳定版或升级到仓库最新稳定版。安装/升级期间临时写入 `/usr/sbin/policy-rc.d`（exit 101）阻止软件包自动重启服务，结束或中断后还原原有文件。已被 `apt-mark hold` 的 sing-box 跳过升级。有配置时，按 `sing-box.service` 实际的 ExecStart（`-c` 或 `-C` 及路径）运行 `sing-box check`：通过且服务原本在运行才重启，等待 5 秒确认 active，没有变成 active 则降级回原版本并重新启动；检查不通过则降级回原版本，原进程不动；仓库里找不到原版本无法降级时显示警告，不重启服务。首次安装或没有配置不检查、不启动。最后设为开机自启（没有配置文件时开机跳过），输出版本变化、hold、检查、重启、降级及服务状态报告。
