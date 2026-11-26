@@ -1,8 +1,11 @@
 name: Shell checks
 
+# Tag pushes are checked through release.yml, which calls this workflow before publishing.
 on:
   push:
+    branches: ['**']
   pull_request:
+  workflow_call:
 
 permissions:
   contents: read
@@ -43,8 +46,15 @@ jobs:
             tests/ci-workflow-test.sh
             tests/dns-precheck-test.sh
             tests/sysctl-dir-container-test.sh
+            tests/cloudflare-ips-test.sh
+            tests/version-test.sh
+            tests/release-checks-test.sh
+            tests/readme-commands-test.sh
             .github/scripts/ci-fetch.sh
             .github/scripts/ci-required-checks.sh
+            .github/scripts/release-checks.sh
+            .github/scripts/readme-commands.sh
+            .github/scripts/release-notes.sh
           )
           for script in "${scripts[@]}"; do
             test -s "$script"
@@ -71,6 +81,13 @@ jobs:
             tests/qemu-guest-agent-test.sh \
             tests/dns-precheck-test.sh \
             tests/sysctl-dir-container-test.sh \
+            tests/cloudflare-ips-test.sh \
+            tests/version-test.sh \
+            tests/release-checks-test.sh \
+            tests/readme-commands-test.sh \
+            .github/scripts/release-checks.sh \
+            .github/scripts/readme-commands.sh \
+            .github/scripts/release-notes.sh \
             tests/ci-workflow-test.sh; do
             test -x "$executable_script"
           done
@@ -120,8 +137,8 @@ jobs:
       - name: Check README and entry points
         run: |
           test "$(head -n 1 README.md)" = '```bash'
-          grep -Fxq 'bash <(curl -fsSL https://raw.githubusercontent.com/404-git-404/404-vps-tools/main/debian-init.sh)' README.md
-          grep -Fxq 'wget -qO alpine-init.sh https://raw.githubusercontent.com/404-git-404/404-vps-tools/main/alpine-init.sh && sh alpine-init.sh' README.md
+          test "$(bash .github/scripts/readme-commands.sh README.md | wc -l)" -eq 3
+          if grep -n 'raw.githubusercontent.com' README.md; then exit 1; fi
           test ! -e 404notfound.sh
           test ! -e node-config-wizard.sh
           test ! -e scripts/update-smartdns.sh
@@ -152,6 +169,9 @@ jobs:
           PATH="$RUNNER_TEMP/mawk-bin:$PATH" bash tests/qemu-guest-agent-test.sh
           PATH="$RUNNER_TEMP/mawk-bin:$PATH" bash tests/dns-precheck-test.sh
           PATH="$RUNNER_TEMP/mawk-bin:$PATH" bash tests/ci-workflow-test.sh
+          PATH="$RUNNER_TEMP/mawk-bin:$PATH" bash tests/cloudflare-ips-test.sh
+          PATH="$RUNNER_TEMP/mawk-bin:$PATH" bash tests/version-test.sh
+          PATH="$RUNNER_TEMP/mawk-bin:$PATH" bash tests/release-checks-test.sh
 
       - name: Validate Actions workflows and inline shell
         timeout-minutes: 3
@@ -178,6 +198,9 @@ jobs:
       - name: Run Debian and Alpine containers
         run: |
           bash tests/gg-status-container-test.sh
+
+      - name: Run the README commands on Debian 12, Debian 13 and Alpine
+        run: bash tests/readme-commands-test.sh
 
       - name: Verify QEMU Guest Agent removal on Debian 12 and 13
         run: |
@@ -237,7 +260,14 @@ jobs:
             tests/ci-workflow-test.sh \
             tests/dns-precheck-test.sh \
             tests/sysctl-dir-container-test.sh \
+            tests/cloudflare-ips-test.sh \
+            tests/version-test.sh \
+            tests/release-checks-test.sh \
+            tests/readme-commands-test.sh \
             .github/scripts/ci-fetch.sh \
             .github/scripts/ci-required-checks.sh \
+            .github/scripts/release-checks.sh \
+            .github/scripts/readme-commands.sh \
+            .github/scripts/release-notes.sh \
             /tmp/update-cloudflare-ufw
           shellcheck -s sh yt-region gg-status alpine-init.sh

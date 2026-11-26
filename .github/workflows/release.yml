@@ -1,0 +1,101 @@
+name: Release
+
+# A vMAJOR.MINOR.PATCH tag on a commit that is already on main publishes the three scripts and
+# SHA256SUMS. Everything is built from the repository itself; nothing external is downloaded.
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  verify-tag:
+    name: Verify tag, main ancestry, versions and absence of a Release
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository with full history
+        # actions/checkout v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          fetch-depth: 0
+
+      - name: Tag is a plain vMAJOR.MINOR.PATCH version
+        env:
+          TAG: ${{ github.ref_name }}
+        run: bash .github/scripts/release-checks.sh tag-format "$TAG"
+
+      - name: Tagged commit is on main
+        env:
+          TAG: ${{ github.ref_name }}
+        run: bash .github/scripts/release-checks.sh on-main "refs/tags/$TAG" origin/main
+
+      - name: Tag matches the version constant of every script
+        env:
+          TAG: ${{ github.ref_name }}
+        run: bash .github/scripts/release-checks.sh versions "$TAG"
+
+      - name: Release does not exist yet
+        env:
+          TAG: ${{ github.ref_name }}
+          GH_TOKEN: ${{ github.token }}
+        run: bash .github/scripts/release-checks.sh release-absent "$TAG"
+
+  shell-checks:
+    name: Shell checks
+    uses: ./.github/workflows/shellcheck.yml
+
+  smartdns-checks:
+    name: Pinned SmartDNS validation
+    uses: ./.github/workflows/smartdns-pinned.yml
+
+  publish:
+    name: Publish Release
+    needs: [verify-tag, shell-checks, smartdns-checks]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Check out the tagged commit
+        # actions/checkout v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+
+      - name: Package scripts and checksums
+        run: |
+          mkdir dist
+          cp debian-init.sh alpine-init.sh gg-status dist/
+          cd dist
+          sha256sum debian-init.sh alpine-init.sh gg-status > SHA256SUMS
+          sha256sum --check SHA256SUMS
+          cd ..
+          ls -l dist
+
+      - name: Packaged files still carry the tag version
+        env:
+          TAG: ${{ github.ref_name }}
+        run: bash .github/scripts/release-checks.sh versions "$TAG" dist
+
+      - name: Write Release notes
+        env:
+          TAG: ${{ github.ref_name }}
+        run: bash .github/scripts/release-notes.sh "$TAG" README.md > release-notes.md
+
+      - name: Create Release
+        env:
+          TAG: ${{ github.ref_name }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$TAG" \
+            dist/debian-init.sh dist/alpine-init.sh dist/gg-status dist/SHA256SUMS \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --title "$TAG" \
+            --notes-file release-notes.md \
+            --latest

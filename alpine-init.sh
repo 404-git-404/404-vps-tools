@@ -6,6 +6,7 @@ umask 077
 export PATH='/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
 
 SCRIPT_NAME='alpine-init.sh'
+SCRIPT_VERSION='0.1.0'
 TARGET_ALPINE_MINOR=24
 TARGET_ALPINE_BRANCH='v3.24'
 ALPINE_MIRROR='https://dl-cdn.alpinelinux.org/alpine'
@@ -420,6 +421,10 @@ summary() {
 }
 
 main() {
+    case "${1:-}" in
+        --version|-V) printf '%s %s\n' "$SCRIPT_NAME" "$SCRIPT_VERSION"; exit 0 ;;
+    esac
+
     require_root_alpine
 
     # 按用户要求：脚本一开始即询问公钥，之后不再询问任何内容。

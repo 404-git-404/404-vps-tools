@@ -12,3 +12,8 @@
 - 修改普通 Bash 脚本后必须运行 `bash -n` 和 ShellCheck；`yt-region` / `gg-status` / `alpine-init.sh` 使用 `sh -n` 和 `shellcheck -s sh`。
 - README 内容保持极简命令式风格：可复制命令置顶，后附简要说明，不添加标题。
 - 不得无理由增加依赖，也不要过早拆分大量文件。
+- 整个仓库只有一个版本号，写在 `debian-init.sh`、`alpine-init.sh`、`gg-status` 的 `SCRIPT_VERSION` 常量里，三处必须一致；`yt-region` 不带版本号，不得为此修改。
+- 发布流程：修改三个脚本里的版本号 → PR → 合并 → 在 main 上打 `vX.Y.Z` 标签 → `release.yml` 自动检查并发布 Release。README 一键命令始终下载最新 Release 并校验 `SHA256SUMS`。
+- AI 不得自行打标签或创建 Release，除非用户在对话里明确要求打哪个版本。
+- 已发布的版本不得修改或删除，有问题就发新的版本号。
+- 对外下载必须先校验再使用：固定哈希或指纹，或严格的格式与数量检查；校验失败时保留现状并警告。新增下载地址要同步更新校验和测试。
