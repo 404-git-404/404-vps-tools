@@ -296,23 +296,114 @@ ui_box_top() {
   fi
 }
 
-ui_box_line() {
-  local plain=$1 rendered=${2-$1} b_color=$C_CYAN r_color=$C_RESET
-  local w inner pad
+declare -A UI_CHAR_WIDTH_CACHE=()
+UI_CHAR_WIDTH=1
+declare -a UI_WRAP_SEGS=() UI_WRAP_WIDTHS=()
+
+# Display width of one character into UI_CHAR_WIDTH. Printable ASCII is 1; anything else is
+# measured once with wc -L and cached, so wrapping never spawns a process per character.
+# Callers must already run under a UTF-8 LC_ALL (see ui_wrap_text).
+ui_char_width() {
+  local ch=$1 code=0 w
+  printf -v code '%d' "'$ch" 2>/dev/null || code=0
+  if (( code >= 32 && code <= 126 )); then
+    UI_CHAR_WIDTH=1
+    return 0
+  fi
+  if [[ -z "${UI_CHAR_WIDTH_CACHE[$ch]+x}" ]]; then
+    w=$(LC_ALL=C.UTF-8 wc -L <<<"$ch")
+    UI_CHAR_WIDTH_CACHE[$ch]=${w//[[:space:]]/}
+  fi
+  UI_CHAR_WIDTH=${UI_CHAR_WIDTH_CACHE[$ch]}
+}
+
+# Split plain text into segments no wider than $2 display columns (UI_WRAP_SEGS, with each segment's
+# width in UI_WRAP_WIDTHS). Break after a space or Chinese punctuation found in the latter half of a
+# segment, else hard-break; no character is dropped. Continuation segments are indented by the
+# original leading spaces + 2 (capped at half the inner width so progress is always possible).
+ui_wrap_text() {
+  local text=$1 inner=$2
+  local LC_ALL=C.UTF-8
+  local punct='，。；、：' lead cont indent n=${#text} i j k start=0 avail cum brk seg first=true
+  local -a ch=() cw=()
+  UI_WRAP_SEGS=() UI_WRAP_WIDTHS=()
+  lead=${text%%[! ]*}
+  cont=$(( ${#lead} + 2 ))
+  if (( cont > inner / 2 )); then cont=$(( inner / 2 )); fi
+  printf -v indent '%*s' "$cont" ''
+  for (( i = 0; i < n; i++ )); do
+    ch[i]=${text:i:1}
+    ui_char_width "${ch[i]}"
+    cw[i]=$UI_CHAR_WIDTH
+  done
+  while (( start < n )); do
+    if [[ "$first" == true ]]; then avail=$inner; else avail=$(( inner - cont )); fi
+    cum=0 j=$start brk=-1
+    while (( j < n && cum + cw[j] <= avail )); do
+      cum=$(( cum + cw[j] ))
+      if (( cum * 2 > avail )) && [[ "${ch[j]}" == ' ' || "$punct" == *"${ch[j]}"* ]]; then brk=$j; fi
+      j=$(( j + 1 ))
+    done
+    if (( j == start )); then
+      j=$(( start + 1 ))  # a character wider than the box still makes progress
+      cum=${cw[start]}
+    elif (( j < n && brk >= 0 )); then
+      j=$(( brk + 1 ))
+      cum=0
+      for (( k = start; k < j; k++ )); do cum=$(( cum + cw[k] )); done
+    fi
+    seg=''
+    for (( k = start; k < j; k++ )); do seg+=${ch[k]}; done
+    if [[ "$first" == true ]]; then
+      UI_WRAP_SEGS+=("$seg")
+      UI_WRAP_WIDTHS+=("$cum")
+    else
+      UI_WRAP_SEGS+=("${indent}${seg}")
+      UI_WRAP_WIDTHS+=("$(( cont + cum ))")
+    fi
+    first=false
+    start=$j
+  done
+}
+
+# Internal: $1 plain text, $2 rendered text (used only when the line fits), $3 optional whole-line color.
+ui_box_emit() {
+  local plain=$1 rendered=$2 color=$3 b_color=$C_CYAN r_color=$C_RESET
+  local w inner pad i text
   if [[ "$UI_TARGET" == out && ! -t 1 ]]; then
-    b_color='' r_color='' rendered=$plain
+    b_color='' r_color='' rendered=$plain color=''
   fi
   w=$(ui_display_width "$plain")
   inner=$((UI_WIDTH - 4))
   if (( w <= inner )); then
+    if [[ -n "$color" ]]; then rendered="${color}${plain}${r_color}"; fi
     pad=$((inner - w))
     printf '%s%s%s %s%s %s%s%s\n' \
       "$b_color" "$UI_V" "$r_color" \
       "$rendered" "$(ui_repeat ' ' "$pad")" \
       "$b_color" "$UI_V" "$r_color"
-  else
-    printf '%s%s%s %s\n' "$b_color" "$UI_V" "$r_color" "$rendered"
+    return 0
   fi
+  ui_wrap_text "$plain" "$inner"
+  for i in "${!UI_WRAP_SEGS[@]}"; do
+    text=${UI_WRAP_SEGS[i]}
+    if [[ -n "$color" ]]; then text="${color}${text}${r_color}"; fi
+    pad=$((inner - UI_WRAP_WIDTHS[i]))
+    printf '%s%s%s %s%s %s%s%s\n' \
+      "$b_color" "$UI_V" "$r_color" \
+      "$text" "$(ui_repeat ' ' "$pad")" \
+      "$b_color" "$UI_V" "$r_color"
+  done
+}
+
+# ui_box_line <plain> [rendered]: rendered may color part of the line; a wrapped line is uncolored.
+ui_box_line() {
+  ui_box_emit "$1" "${2-$1}" ''
+}
+
+# ui_box_line_color <color> <text>: color the whole line, every wrapped segment included.
+ui_box_line_color() {
+  ui_box_emit "$2" "$2" "$1"
 }
 
 ui_box_sep() {
@@ -4453,7 +4544,7 @@ print_security_audit() {
     esac
     count=0
     for row in "${AUDIT_FINDINGS[@]}"; do [[ "$row" != "$level"$'\t'* ]] || count=$((count + 1)); done
-    ui_box_line "[${title}]（${count} 项）" "${level_color}[${title}]（${count} 项）${C_RESET}"
+    ui_box_line_color "$level_color" "[${title}]（${count} 项）"
     if [[ "$mode" == full ]]; then
       seen=$'\n'
       for row in "${AUDIT_FINDINGS[@]}"; do
@@ -4753,7 +4844,7 @@ print_report() {
   if [[ "$PRESERVE_SSH" == true ]]; then ssh_display+='（保留现有配置）'; fi
   if [[ -z "$ssh_listeners" ]]; then ssh_warn=true; fi
   ufw_status=$(ufw status 2>/dev/null | sed -n '1p' || echo unavailable)
-  if [[ "$ufw_status" == unavailable || "$ufw_status" != *active* ]]; then ufw_warn=true; fi
+  if [[ "$ufw_status" != 'Status: active' ]]; then ufw_warn=true; fi
   smartdns_ver=$(smartdns -v 2>/dev/null | head -1 || echo unavailable)
   if [[ "$smartdns_ver" == unavailable ]]; then smartdns_warn=true; fi
   smartdns_mode="$([[ "$NETWORK_REQUEST" == ipv4 ]] && echo 'A only' || echo 'A + AAAA') / $SMARTDNS_TRANSPORT"

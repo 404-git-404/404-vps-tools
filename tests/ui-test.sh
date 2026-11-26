@@ -141,19 +141,79 @@ grep -Eq '^\| 1\. 快速初始化 +\|$' "$work/ascii.out" || fail 'TERM=linux co
 grep -Eq '^\+-+\+$' "$work/ascii.out" || fail 'TERM=linux separator/bottom border wrong'
 check_uniform_width "$work/ascii.out" 72
 
-# 4. Overlong lines are printed intact without truncation, without wrapping, and without right border.
-long_text='1. 恢复 IPv6：写入脚本管理的 /etc/sysctl.d/99-vps-init-network.conf 覆盖上述设置（不修改原有文件）TAIL_MARKER_END'
+# 4. Overlong lines wrap inside the box: every row has the same display width, no segment exceeds the
+#    inner width, and no character is lost. Cases: Chinese, English, mixed, an unbroken hash, and an
+#    indented line (continuation indent = leading spaces + 2).
+long_zh='重启后恢复网络配置：写入脚本管理的覆盖文件，不修改原有文件；先备份再覆盖，验证失败时保留现状并给出警告，需要时请自行重启后再次检查。'
+long_en='This is a deliberately long English status line that has to be wrapped inside the box without losing a single character at all.'
+long_mix='1. 恢复 IPv6：写入脚本管理的 /etc/sysctl.d/99-vps-init-network.conf 覆盖上述设置（不修改原有文件）TAIL_MARKER_END'
+long_hash='SHA256:0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcdefghijklmnopqrstuvwxyz'
+long_indent='      - /root/.ssh/authorized_keys — 这是一条带缩进的很长的明细说明，用来检查续行缩进是否等于开头空格数加二，并且不会丢字。'
+for width in 72 44; do
+  (
+    export NO_COLOR=1 TERM=xterm-256color
+    # shellcheck disable=SC1091
+    source "$repo/debian-init.sh"
+    trap - EXIT ERR HUP INT TERM
+    ui_init
+    UI_WIDTH=$width
+    inner=$((UI_WIDTH - 4))
+    : >"$work/wrap-$width.out"
+    for text in "$long_zh" "$long_en" "$long_mix" "$long_hash" "$long_indent"; do
+      # Function level: exact reassembly (trailing spaces included), widths within inner, indent.
+      ui_wrap_text "$text" "$inner"
+      (( ${#UI_WRAP_SEGS[@]} > 1 )) || fail "line did not wrap at width $width: $text"
+      lead=${text%%[! ]*}
+      indent=$(printf '%*s' $(( ${#lead} + 2 )) '')
+      joined=''
+      for idx in "${!UI_WRAP_SEGS[@]}"; do
+        seg=${UI_WRAP_SEGS[idx]}
+        (( UI_WRAP_WIDTHS[idx] <= inner )) || fail "segment wider than inner at width $width: [$seg]"
+        [[ "$(ui_display_width "$seg")" == "${UI_WRAP_WIDTHS[idx]}" ]] || fail "segment width bookkeeping wrong: [$seg]"
+        if (( idx > 0 )); then
+          [[ "$seg" == "$indent"* ]] || fail "continuation indent wrong at width $width: [$seg]"
+          seg=${seg#"$indent"}
+        fi
+        joined+=$seg
+      done
+      [[ "$joined" == "$text" ]] || fail "wrapped segments lost or changed characters at width $width: [$joined]"
+      # Rendered level.
+      ui_box_line "$text" >>"$work/wrap-$width.out"
+    done
+  )
+  check_uniform_width "$work/wrap-$width.out" "$width"
+  if has_escape "$work/wrap-$width.out"; then fail 'NO_COLOR wrapped box contained ANSI escapes'; fi
+  # Padding and break spaces are indistinguishable once rendered, so compare with spaces removed.
+  rendered=$(sed -e 's/^│ //' -e 's/ │$//' "$work/wrap-$width.out" | tr -d ' \n')
+  expected=$(printf '%s' "$long_zh$long_en$long_mix$long_hash$long_indent" | tr -d ' ')
+  [[ "$rendered" == "$expected" ]] || fail "rendered wrapped box lost characters at width $width"
+done
+
+# ui_box_line_color colors every wrapped segment; ui_box_line with partial color wraps without color.
 (
-  export NO_COLOR=1 TERM=xterm-256color
+  export TERM=xterm-256color
+  unset NO_COLOR
   # shellcheck disable=SC1091
   source "$repo/debian-init.sh"
   trap - EXIT ERR HUP INT TERM
   ui_init
-  UI_WIDTH=72
-  ui_box_line "$long_text"
-) >"$work/overflow.out"
-[[ "$(wc -l <"$work/overflow.out")" -eq 1 ]] || fail 'overflow line wrapped'
-grep -Fxq "│ $long_text" "$work/overflow.out" || fail 'overflow line truncated or kept right border'
+  UI_WIDTH=44
+  UI_TARGET='tty'
+  C_CYAN=$'\033[36m' C_RESET=$'\033[0m' C_YELLOW=$'\033[33m'
+  ui_box_line_color "$C_YELLOW" "$long_zh" >"$work/color-line.out"
+  ui_box_line "$long_zh" "${C_YELLOW}${long_zh}${C_RESET}" >"$work/partial-line.out"
+  ui_box_line_color "$C_YELLOW" '短行' >"$work/color-short.out"
+)
+rows=$(grep -c '' "$work/color-line.out")
+(( rows > 1 )) || fail 'colored long line did not wrap'
+[[ "$(grep -c $'\033\\[33m.*\033\\[0m' "$work/color-line.out")" -eq "$rows" ]] || fail 'not every wrapped segment was colored and reset'
+strip_ansi <"$work/color-line.out" >"$work/color-line.plain"
+check_uniform_width "$work/color-line.plain" 44
+# Borders keep their own color; the text itself must not be yellow when it had to wrap.
+if grep -Fq $'\033[33m' "$work/partial-line.out"; then fail 'wrapped partial-color line kept its text color'; fi
+strip_ansi <"$work/partial-line.out" >"$work/partial-line.plain"
+check_uniform_width "$work/partial-line.plain" 44
+grep -Fq $'\033[33m' "$work/color-short.out" || fail 'short colored line lost its color'
 
 # 5. Real PTY checks: color enabled by default, disabled by NO_COLOR and TERM=dumb,
 #    and colored box lines still align uniformly after stripping ANSI codes.
@@ -185,6 +245,32 @@ if [[ "$(uname -s)" == Linux ]] && command -v script >/dev/null 2>&1; then
   [[ -s "$work/pty-menu-box.txt" ]] || fail 'PTY menu box missing'
   check_uniform_width "$work/pty-menu-box.txt" 72
 
+  # The UFW row is yellow unless the first ufw status line is exactly "Status: active".
+  cat >"$work/report-probe.sh" <<PROBE
+source "$repo/debian-init.sh"
+trap - EXIT ERR HUP INT TERM
+ssh_listener_addresses() { echo '0.0.0.0:53651'; }
+fail2ban_package_installed() { return 0; }
+ufw() { printf '%s\n' "\$UFW_OUT"; echo 'second line'; }
+smartdns() { echo 'smartdns fixture'; }
+sing-box() { echo 'sing-box fixture'; }
+sysctl() { echo bbr; }
+security_updates_enabled() { return 0; }
+BOOT_REPORT=''
+BACKUP_DIR=/fixture NETWORK_STACK=dual NETWORK_REQUEST=auto SMARTDNS_TRANSPORT=h2 SAFE_CLEANUP_RESULT=ok
+print_report
+PROBE
+  for ufw_out in 'Status: active' 'Status: inactive' 'Status: active (logging)' 'unavailable' ''; do
+    UFW_OUT=$ufw_out env -u NO_COLOR TERM=xterm-256color script -qec "bash \"$work/report-probe.sh\"" /dev/null >"$work/pty-ufw.out"
+    ufw_row=$(tr -d '\r' <"$work/pty-ufw.out" | grep 'UFW           :' || true)
+    [[ -n "$ufw_row" ]] || fail "UFW row missing for [$ufw_out]"
+    if [[ "$ufw_out" == 'Status: active' ]]; then
+      [[ "$ufw_row" != *$'\033[33m'* ]] || fail 'UFW active row was marked yellow'
+    else
+      [[ "$ufw_row" == *$'\033[33m'* ]] || fail "UFW row not yellow for [$ufw_out]"
+    fi
+  done
+
   # Redirecting print_security_audit to a file from inside a PTY must emit zero \033 escapes.
   env -u NO_COLOR TERM=xterm-256color script -qec \
     "bash -c 'source \"$repo/debian-init.sh\"; AUDIT_FINDINGS=(); print_security_audit full >\"$work/pty-redir.txt\"'" \
@@ -198,4 +284,4 @@ if [[ "$(uname -s)" == Linux ]] && command -v script >/dev/null 2>&1; then
   if grep -Eq '[╭╮╰╯│─├┤]' "$work/pty-help.out"; then fail '--help drew box borders'; fi
 fi
 
-echo 'PASS: UI color gates, NO_COLOR/TERM=dumb, Unicode/ASCII box widths, overflow and PTY checks'
+echo 'PASS: UI color gates, NO_COLOR/TERM=dumb, Unicode/ASCII box widths, wrapping and PTY checks'

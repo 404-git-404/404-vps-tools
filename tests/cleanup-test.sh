@@ -146,7 +146,7 @@ done
   sing-box() { echo fixture; }
   print_report >"$test_dir/init-report" 2>/dev/null
   grep -Fq "安全清理      : $SAFE_CLEANUP_RESULT" "$test_dir/init-report"
-  grep -Fq '重启后可运行 [7] 清理旧内核和无用包' "$test_dir/init-report"
+  grep -Eq '^(│|\|) 重启后可运行 \[7\] 清理旧内核和无用包 +(│|\|)$' "$test_dir/init-report"
 )
 
 # A leftover network-stack state file from older versions is removed (with a backup); a symlink,

@@ -56,6 +56,9 @@ for scenario in port22 default custom-port preserve reuse missing-keygen existin
     }
     read_tty() {
       [[ "$CONFIG_CONFIRMED" == false ]] || fail "late prompt: $1"
+      # The menu box printed just before this prompt; cleared so each prompt sees only its own menu.
+      shown_menu=$(<"$work/tty")
+      : >"$work/tty"
       printf 'prompt %s\n' "$1" >>"$trace"
       case "$1" in
         *'请选择 SSH 端口'*)
@@ -72,7 +75,7 @@ for scenario in port22 default custom-port preserve reuse missing-keygen existin
         *'Swap'*'？'*) printf -v "$2" y ;;
         '请选择 [1-2]: ')
           if [[ "$scenario" == ipv6-* ]]; then
-            grep -Fq '恢复 IPv6' "$work/tty" || fail 'missing IPv6 boot policy menu'
+            [[ "$shown_menu" == *'重启后 IPv6'* && "$shown_menu" == *'恢复 IPv6'* ]] || fail 'missing IPv6 boot policy menu'
             printf 'prompt 恢复 IPv6\n' >>"$trace"
             if [[ "$scenario" == ipv6-restore ]]; then printf -v "$2" 1; else printf -v "$2" ''; fi
           elif [[ "$scenario" == custom-base ]]; then printf -v "$2" 2
