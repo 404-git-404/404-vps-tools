@@ -38,6 +38,7 @@ jobs:
             tests/init-flow-test.sh
             tests/process-helper.sh
             tests/ipv6-boot-state-test.sh
+            tests/hardening-test.sh
             tests/qemu-guest-agent-test.sh
             tests/ci-workflow-test.sh
             tests/dns-precheck-test.sh
@@ -66,6 +67,7 @@ jobs:
             tests/system-update-test.sh \
             tests/init-flow-test.sh \
             tests/ipv6-boot-state-test.sh \
+            tests/hardening-test.sh \
             tests/qemu-guest-agent-test.sh \
             tests/dns-precheck-test.sh \
             tests/sysctl-dir-container-test.sh \
@@ -147,6 +149,7 @@ jobs:
           PATH="$RUNNER_TEMP/mawk-bin:$PATH" bash tests/ufw-sync-test.sh
           PATH="$RUNNER_TEMP/mawk-bin:$PATH" bash tests/system-update-test.sh
           PATH="$RUNNER_TEMP/mawk-bin:$PATH" bash tests/init-flow-test.sh
+          sudo env PATH="$RUNNER_TEMP/mawk-bin:$PATH" bash tests/hardening-test.sh
           PATH="$RUNNER_TEMP/mawk-bin:$PATH" bash tests/qemu-guest-agent-test.sh
           PATH="$RUNNER_TEMP/mawk-bin:$PATH" bash tests/dns-precheck-test.sh
           PATH="$RUNNER_TEMP/mawk-bin:$PATH" bash tests/ci-workflow-test.sh
@@ -184,6 +187,20 @@ jobs:
               bash /repo/tests/qemu-guest-agent-test.sh --package-manager
           done
 
+      - name: Verify read-only audit on Debian 12 and 13
+        run: |
+          for debian_version in 12 13; do
+            docker run --rm --read-only --network none --volume "$PWD:/repo:ro" "debian:$debian_version" \
+              bash /repo/debian-init.sh --audit
+          done
+
+      - name: Verify Exim purge and collateral confirmation on Debian 12 and 13
+        run: |
+          for debian_version in 12 13; do
+            docker run --rm --network none --volume "$PWD:/repo:ro" "debian:$debian_version" \
+              bash /repo/tests/hardening-test.sh --exim4-package-manager
+          done
+
       - name: Verify TCP tuning and IPv6 override without /etc/sysctl.d on Debian 12 and 13
         run: |
           for debian_version in 12 13; do
@@ -216,6 +233,7 @@ jobs:
             tests/system-update-test.sh \
             tests/init-flow-test.sh \
             tests/ipv6-boot-state-test.sh \
+            tests/hardening-test.sh \
             tests/qemu-guest-agent-test.sh \
             tests/ci-workflow-test.sh \
             tests/dns-precheck-test.sh \

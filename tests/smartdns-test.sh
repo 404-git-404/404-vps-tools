@@ -194,6 +194,8 @@ check_preserved_ssh_network_mode() (
   configure_swap() { :; }
   collect_swap_choice() { :; }
   update_system_and_tools() { :; }
+  configure_security_updates() { :; }
+  check_boot_services() { :; }
   ipv4_https_works() { :; }
   configure_chrony() { :; }
   configure_tcp_tuning() { :; }
