@@ -149,32 +149,43 @@ done
   grep -Fxq '重启后可运行 [7] 清理旧内核和无用包' "$test_dir/init-report"
 )
 
-# State is written only by the complete flow (covered in init-flow-test), and
-# overwritten with a readable mode while retaining the original backup.
-sed "s|^readonly NETWORK_STACK_STATE=.*|readonly NETWORK_STACK_STATE='$test_dir/state/network-stack'|" "$repo/debian-init.sh" >"$test_dir/installer"
+# A leftover network-stack state file from older versions is removed (with a backup); a symlink,
+# a directory or a missing file is left alone.
+sed "s|^readonly LEGACY_NETWORK_STACK_STATE=.*|readonly LEGACY_NETWORK_STACK_STATE='$test_dir/state/network-stack'|" "$repo/debian-init.sh" >"$test_dir/installer"
 bash -Eeuo pipefail -s "$test_dir" <<'TEST'
 source "$1/installer"
 trap - EXIT ERR HUP INT TERM
 BACKUP_DIR="$1/backups"
-mkdir -p "$BACKUP_DIR"
-NETWORK_STACK=dual
-persist_network_stack
-[[ "$(cat "$NETWORK_STACK_STATE")" == dual && "$(stat -c %a "$NETWORK_STACK_STATE")" == 644 ]]
-chmod 0600 "$NETWORK_STACK_STATE"
-NETWORK_STACK=ipv4
-persist_network_stack
-[[ "$(cat "$NETWORK_STACK_STATE")" == ipv4 && "$(stat -c %a "$NETWORK_STACK_STATE")" == 644 ]]
-[[ "$(cat "$BACKUP_DIR/files$NETWORK_STACK_STATE")" == dual ]]
-# A failed state write only warns (returns 1) and never aborts before the final report.
-NETWORK_STACK=unknown
-if persist_network_stack 2>"$BACKUP_DIR/warn"; then exit 1; fi
-grep -Fq '无法保存网络栈' "$BACKUP_DIR/warn"
-NETWORK_STACK=dual
-rm -f "$NETWORK_STACK_STATE"
-ln -s "$BACKUP_DIR/elsewhere" "$NETWORK_STACK_STATE"
-if persist_network_stack 2>"$BACKUP_DIR/warn"; then exit 1; fi
-grep -Fq '符号链接' "$BACKUP_DIR/warn"
-[[ ! -e "$BACKUP_DIR/elsewhere" ]]
+mkdir -p "$BACKUP_DIR" "$(dirname "$LEGACY_NETWORK_STACK_STATE")"
+remove_legacy_network_stack_state
+printf 'dual\n' >"$LEGACY_NETWORK_STACK_STATE"
+remove_legacy_network_stack_state 2>"$BACKUP_DIR/log"
+[[ ! -e "$LEGACY_NETWORK_STACK_STATE" ]]
+[[ "$(cat "$BACKUP_DIR/files$LEGACY_NETWORK_STACK_STATE")" == dual ]]
+[[ -d "$(dirname "$LEGACY_NETWORK_STACK_STATE")" ]]
+printf 'keep\n' >"$BACKUP_DIR/elsewhere"
+ln -s "$BACKUP_DIR/elsewhere" "$LEGACY_NETWORK_STACK_STATE"
+remove_legacy_network_stack_state
+[[ -L "$LEGACY_NETWORK_STACK_STATE" && "$(cat "$BACKUP_DIR/elsewhere")" == keep ]]
+rm -f "$LEGACY_NETWORK_STACK_STATE"
+mkdir "$LEGACY_NETWORK_STACK_STATE"
+remove_legacy_network_stack_state
+[[ -d "$LEGACY_NETWORK_STACK_STATE" ]]
+# A file that cannot be made mutable or backed up is only reported: the run (and its report) goes on.
+rmdir "$LEGACY_NETWORK_STACK_STATE"
+printf 'dual\n' >"$LEGACY_NETWORK_STACK_STATE"
+lsattr() { echo '----i---------e------- x'; }
+chattr() { return 1; }
+make_mutable() { echo 'make_mutable must not be used' >&2; return 1; }
+remove_legacy_network_stack_state 2>"$BACKUP_DIR/warn"
+[[ -f "$LEGACY_NETWORK_STACK_STATE" ]]
+grep -Fq '保留' "$BACKUP_DIR/warn"
+unset -f lsattr chattr
+BACKUP_DIR=/dev/null/none
+remove_legacy_network_stack_state 2>"$1/warn2"
+[[ -f "$LEGACY_NETWORK_STACK_STATE" ]]
+grep -Fq '无法备份' "$1/warn2"
+echo report-still-printed >"$1/report"
 TEST
 
 if [[ "$(uname -s)" == Linux ]] && command -v script >/dev/null; then
@@ -184,6 +195,7 @@ if [[ "$(uname -s)" == Linux ]] && command -v script >/dev/null; then
       { cat "$test_dir/menu"; fail "menu option $option failed"; }
     grep -Fq '7. 系统清理' "$test_dir/menu" || fail 'cleanup menu label missing'
     grep -Fq '6. 仅更新系统' "$test_dir/menu" || fail 'update menu label missing'
+    grep -Fq '4. 安装/升级 sing-box' "$test_dir/menu" || fail 'sing-box menu label missing'
     if [[ "$mode" == exit ]]; then
       if grep -Fq 'selected=' "$test_dir/menu"; then fail 'exit continued to dispatch'; fi
     else
