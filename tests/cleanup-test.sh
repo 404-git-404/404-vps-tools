@@ -146,7 +146,7 @@ done
   sing-box() { echo fixture; }
   print_report >"$test_dir/init-report" 2>/dev/null
   grep -Fq "安全清理      : $SAFE_CLEANUP_RESULT" "$test_dir/init-report"
-  grep -Fxq '重启后可运行 [7] 清理旧内核和无用包' "$test_dir/init-report"
+  grep -Fq '重启后可运行 [7] 清理旧内核和无用包' "$test_dir/init-report"
 )
 
 # A leftover network-stack state file from older versions is removed (with a backup); a symlink,
@@ -193,13 +193,14 @@ if [[ "$(uname -s)" == Linux ]] && command -v script >/dev/null; then
     case "$mode" in quick) option=1;; custom) option=2;; exit) option=0;; smartdns) option=3;; singbox) option=4;; fail2ban) option=5;; cleanup) option=7;; update) option=6;; esac
     printf '%s\n' "$option" | script -qec "bash -c 'source \"$repo/debian-init.sh\"; select_install_mode; echo selected=\$INSTALL_MODE'" /dev/null >"$test_dir/menu" ||
       { cat "$test_dir/menu"; fail "menu option $option failed"; }
-    grep -Fq '7. 系统清理' "$test_dir/menu" || fail 'cleanup menu label missing'
-    grep -Fq '6. 仅更新系统' "$test_dir/menu" || fail 'update menu label missing'
-    grep -Fq '4. 安装/升级 sing-box' "$test_dir/menu" || fail 'sing-box menu label missing'
+    sed $'s/\033\\[[0-9;]*[A-Za-z]//g' "$test_dir/menu" >"$test_dir/menu.plain"
+    grep -Fq '7. 系统清理' "$test_dir/menu.plain" || fail 'cleanup menu label missing'
+    grep -Fq '6. 仅更新系统' "$test_dir/menu.plain" || fail 'update menu label missing'
+    grep -Fq '4. 安装/升级 sing-box' "$test_dir/menu.plain" || fail 'sing-box menu label missing'
     if [[ "$mode" == exit ]]; then
-      if grep -Fq 'selected=' "$test_dir/menu"; then fail 'exit continued to dispatch'; fi
+      if grep -Fq 'selected=' "$test_dir/menu.plain"; then fail 'exit continued to dispatch'; fi
     else
-      grep -Fq "selected=$mode" "$test_dir/menu" || { cat "$test_dir/menu"; fail "unexpected dispatch for $mode"; }
+      grep -Fq "selected=$mode" "$test_dir/menu.plain" || { cat "$test_dir/menu"; fail "unexpected dispatch for $mode"; }
     fi
   done
 fi

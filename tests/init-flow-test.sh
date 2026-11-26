@@ -29,6 +29,7 @@ expect_bash_failure 'errexit probe' errexit_probe
 for scenario in port22 default custom-port preserve reuse missing-keygen existing-swap no-swap low-memory multi multi-cancel ipv6-guard cancel custom-full custom-base custom-remove cli base ipv6-restore ipv6-keep; do
   trace="$work/$scenario.trace"
   : >"$trace"
+  : >"$work/tty"
   set +e
   (
     set -Ee
@@ -70,7 +71,12 @@ for scenario in port22 default custom-port preserve reuse missing-keygen existin
           if [[ "$scenario" == multi-cancel ]]; then printf -v "$2" n; else printf -v "$2" y; fi ;;
         *'Swap'*'？'*) printf -v "$2" y ;;
         '请选择 [1-2]: ')
-          if [[ "$scenario" == custom-base ]]; then printf -v "$2" 2; else printf -v "$2" 1; fi ;;
+          if [[ "$scenario" == ipv6-* ]]; then
+            grep -Fq '恢复 IPv6' "$work/tty" || fail 'missing IPv6 boot policy menu'
+            printf 'prompt 恢复 IPv6\n' >>"$trace"
+            if [[ "$scenario" == ipv6-restore ]]; then printf -v "$2" 1; else printf -v "$2" ''; fi
+          elif [[ "$scenario" == custom-base ]]; then printf -v "$2" 2
+          else printf -v "$2" 1; fi ;;
         '是否开启 Debian 自动安全更新？ [Y/n] ') printf -v "$2" '' ;;
         '确认以上配置并开始自动安装？'*)
           if grep -q '^execute ' "$trace"; then fail 'mutation before final confirmation'; fi
