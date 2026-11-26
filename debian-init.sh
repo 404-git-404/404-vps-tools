@@ -2291,15 +2291,15 @@ singbox_repo_has_version() {
 # Anything else sets SINGBOX_CHECK_REASON and fails, and the caller does not upgrade.
 singbox_resolve_check() {
   local exec_out line argv path_field tok value kind wd env_value env_files cfg_path re n i have_config=false
-  local -a toks=() lines=()
+  local -a toks=() exec_lines=()
   SINGBOX_CHECK_BIN=''
   SINGBOX_CHECK_CWD='/'
   SINGBOX_CHECK_REASON=''
   SINGBOX_CHECK_ARGS=()
   exec_out=$(systemctl show -p ExecStart --value sing-box.service 2>/dev/null) || exec_out=''
-  mapfile -t lines < <(printf '%s\n' "$exec_out" | sed '/^[[:space:]]*$/d')
-  if (( ${#lines[@]} != 1 )); then SINGBOX_CHECK_REASON="ExecStart 有 ${#lines[@]} 条，只支持 1 条"; return 1; fi
-  line=${lines[0]}
+  mapfile -t exec_lines < <(printf '%s\n' "$exec_out" | sed '/^[[:space:]]*$/d')
+  if (( ${#exec_lines[@]} != 1 )); then SINGBOX_CHECK_REASON="ExecStart 有 ${#exec_lines[@]} 条，只支持 1 条"; return 1; fi
+  line=${exec_lines[0]}
   re='^\{ path=([^;]*) ; argv\[\]=(.*) ; ignore_errors='
   if [[ ! "$line" =~ $re ]]; then SINGBOX_CHECK_REASON='无法解析 systemctl show 的 ExecStart 输出'; return 1; fi
   path_field=${BASH_REMATCH[1]}
