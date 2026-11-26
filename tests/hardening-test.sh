@@ -671,7 +671,7 @@ systemctl() {
       if grep -Fxq "${@: -1}" "$enabled_file"; then [[ "$*" == *--quiet* ]] || echo enabled
       else [[ "$*" == *--quiet* ]] || echo disabled; return 1; fi ;;
     enable)
-      [[ "$2" != sing-box.service ]] || grep -Fxq 'ConditionPathExists=/etc/sing-box/config.json' "$SINGBOX_DROPIN" || fail 'enable before gate'
+      [[ "$2" != sing-box.service ]] || grep -Fxq 'ConditionPathExistsGlob=/etc/sing-box/*.json' "$SINGBOX_DROPIN" || fail 'enable before gate'
       printf '%s\n' "${@:2}" >>"$enabled_file" ;;
     is-active) echo inactive; return 3 ;;
     daemon-reload) : ;;

@@ -81,7 +81,10 @@ case "$cmd" in
       sing-box=*) echo "${last#sing-box=}" >"$c/version" ;;
       sing-box)
         if [ ! -s "$c/version" ]; then
-          mkdir -p "$(dirname "$SB_CONFIG")"; echo '{"default":true}' >"$SB_CONFIG"; cp "$c/latest" "$c/version"
+          mkdir -p "$(dirname "$SB_CONFIG")"
+          # dpkg keeps a config.json that is already there (--force-confold).
+          [ -e "$SB_CONFIG" ] || echo '{"default":true}' >"$SB_CONFIG"
+          cp "$c/latest" "$c/version"
         else
           case " $* " in *' --only-upgrade '*) cp "$c/latest" "$c/version" ;; esac
         fi ;;
@@ -89,6 +92,7 @@ case "$cmd" in
     # The package's own maintainer script restarts a running service unless policy-rc.d refuses.
     if [ -e "$c/pkg-restart" ] && [ "$(cat "$c/active")" = yes ]; then
       mode=$(cat "$c/pkg-restart")
+      case "$mode:$last" in bypass-upgrade:sing-box=*) mode=honor ;; esac
       if [ "$mode" != honor ] || [ "$policy" = open ]; then
         echo $(( $(cat "$c/pid") + 1 )) >"$c/pid"; echo 'package restarted service' >>"$c/trace"
         if [ "$mode" = bypass-down ]; then echo no >"$c/active"; fi
@@ -226,6 +230,7 @@ expect_rc() { [[ "$(rc_of)" == "$1" ]] || { cat "$c/output"; fail "rc=$(rc_of), 
 expect_fail() { [[ "$(rc_of)" != 0 ]] || { cat "$c/output"; fail "rc=0, expected failure in $c"; }; }
 no_install() { [[ "$(trace_count '^apt-get install')" == 0 ]] || fail "unexpected package operation in $c"; }
 check_args() { cat "$c/check-args"; }
+gate_is_new() { grep -Fxq 'ConditionPathExistsGlob=/etc/sing-box/*.json' "$root/etc/sing-box.service.d/10-gate.conf"; }
 
 # 1. First install: stable package, no check, never started, boot-enabled behind the config gate.
 setup_case fresh
@@ -238,6 +243,7 @@ trace_has 'apt-get install -y sing-box'
 [[ "$(trace_count '^restart')" == 0 && "$(trace_count '^start')" == 0 ]]
 [[ ! -e "$root/etc/sing-box/config.json" ]] || fail 'default config left behind'
 [[ -s "$root/etc/sing-box.service.d/10-gate.conf" && -s "$root/var/sing-box-managed" ]]
+gate_is_new
 [[ "$(cat "$c/enabled")" == yes && "$(cat "$c/active")" == no ]]
 out_has '未安装 → 1.13.0'
 out_has '未检查（首次安装）'
@@ -260,6 +266,8 @@ out_has '配置检查：通过'
 out_has '已重启：是'
 out_has '已降级：否'
 out_has '软件包自行重启服务：否'
+# The units are reloaded before the restart (the gate is not written in this unmanaged case).
+awk '/^daemon-reload$/ && !d {d=NR} /^restart policy=open$/ && !r {r=NR} END{exit !(d && r && d < r)}' "$c/trace" || { cat "$c/trace"; fail 'daemon-reload before restart'; }
 policy_clean
 
 # 3. Check fails: downgrade, running process untouched, no restart.
@@ -441,6 +449,95 @@ env_wrapper
 run_case
 out_has '不是名为 sing-box 的可执行文件'
 
+# 8b. The whitelist: only -c/-C/-D (and long forms) with an existing target, plus "run" exactly once.
+spaced_c_existing() { mkdir -p "$root/etc/sing"; exec_line "$bin/sing-box" "$bin/sing-box -C $root/etc/sing box run" >"$c/execstart"; }
+spaced_d_existing() { mkdir -p "$root/var/lib/sing"; exec_line "$bin/sing-box" "$bin/sing-box -D $root/var/lib/sing box -C $root/etc/sing-box run" >"$c/execstart"; }
+unknown_flag() { set_exec --foo -C "$root/etc/sing-box" run; }
+missing_run() { set_exec -D "$root/var/lib/sing-box" -C "$root/etc/sing-box"; }
+run_twice() { set_exec -C "$root/etc/sing-box" run run; }
+missing_dir_d() { set_exec -D "$root/var/lib/nowhere" -C "$root/etc/sing-box" run; }
+trailing_space() { exec_line "$bin/sing-box" "$bin/sing-box -C $root/etc/sing-box run " >"$c/execstart"; }
+tab_separated() { exec_line "$bin/sing-box" "$bin/sing-box -C $root/etc/sing-box"$'\t'"run" >"$c/execstart"; }
+undetermined spaced-config-dir-existing spaced_c_existing
+undetermined spaced-working-dir-existing spaced_d_existing
+undetermined unknown-flag unknown_flag
+undetermined missing-run missing_run
+undetermined run-twice run_twice
+undetermined working-dir-missing missing_dir_d
+undetermined trailing-space trailing_space
+undetermined tab-separated tab_separated
+setup_case reason-spaced-c; spaced_c_existing; run_case; out_has '不在白名单内的参数：box'
+setup_case reason-spaced-d; spaced_d_existing; run_case; out_has '不在白名单内的参数：box'
+setup_case reason-flag; unknown_flag; run_case; out_has '不在白名单内的参数：--foo'
+setup_case reason-run; run_twice; run_case; out_has '子命令 run 出现 2 次'
+setup_case reason-no-run; missing_run; run_case; out_has '子命令 run 出现 0 次'
+
+# The stock unit has no WorkingDirectory: it must pass, and check runs from /.
+setup_case empty-workdir
+: >"$c/wd"
+run_case
+expect_rc 0
+[[ "$(check_args)" == "/|check -D $root/var/lib/sing-box -C $root/etc/sing-box" ]]
+[[ "$(trace_count '^restart')" == 1 ]]
+
+# 8c. Directory mode: any *.json is a config, and the boot gate is a glob.
+setup_case dir-mode
+rm -f "$root/etc/sing-box/config.json"; printf '{}\n' >"$root/etc/sing-box/00-main.json"
+run_case
+expect_rc 0
+[[ "$(check_args)" == "$root/var/lib/sing-box|check -D $root/var/lib/sing-box -C $root/etc/sing-box" ]]
+[[ "$(trace_count '^restart')" == 1 && "$(cat "$c/version")" == 1.13.0 ]]
+[[ -f "$root/etc/sing-box/00-main.json" && ! -e "$root/etc/sing-box/config.json" ]]
+gate_is_new
+
+setup_case dir-mode-stopped
+rm -f "$root/etc/sing-box/config.json"; printf '{}\n' >"$root/etc/sing-box/00-main.json"; echo no >"$c/active"
+run_case
+expect_rc 0
+[[ -e "$c/check-args" && "$(trace_count '^restart')" == 0 && "$(trace_count '^start')" == 0 ]]
+
+# A running service counts as configured even when its config is not in /etc/sing-box.
+setup_case config-elsewhere
+rm -f "$root/etc/sing-box/config.json"; printf '{}\n' >"$root/elsewhere.json"
+set_exec run -c "$root/elsewhere.json"
+run_case
+expect_rc 0
+[[ "$(check_args)" == "$root/var/lib/sing-box|check -c $root/elsewhere.json" && "$(trace_count '^restart')" == 1 ]]
+
+# No *.json at all and not running: nothing to check.
+setup_case no-json-stopped
+rm -f "$root/etc/sing-box/config.json"; echo no >"$c/active"; printf 'garbage\n' >"$c/execstart"
+run_case
+expect_rc 0
+[[ ! -e "$c/check-args" ]]
+out_has '未检查（没有配置）'
+
+# An old managed drop-in is rewritten with the glob; split files and a user's config.json survive.
+setup_case old-gate
+printf '[Unit]\nConditionPathExists=/etc/sing-box/config.json\n' >"$root/etc/sing-box.service.d/10-gate.conf"
+echo managed-by-vps-init >"$root/var/sing-box-managed"
+run_case
+expect_rc 0
+gate_is_new
+if grep -Fq 'config.json' "$root/etc/sing-box.service.d/10-gate.conf"; then fail 'old gate text left behind'; fi
+
+setup_case fresh-split-config
+: >"$c/version"; echo no >"$c/active"; echo no >"$c/enabled"
+rm -f "$root/etc/sing-box/config.json"; printf '{"user":"split"}\n' >"$root/etc/sing-box/00-main.json"
+run_case
+expect_rc 0
+[[ ! -e "$root/etc/sing-box/config.json" ]] || fail 'package default config.json left behind'
+[[ "$(cat "$root/etc/sing-box/00-main.json")" == '{"user":"split"}' ]] || fail 'split config touched'
+gate_is_new
+out_has '未检查（首次安装）'
+
+setup_case fresh-user-config
+: >"$c/version"; echo no >"$c/active"; echo no >"$c/enabled"
+printf '{"user":"own"}\n' >"$root/etc/sing-box/config.json"
+run_case
+expect_rc 0
+[[ "$(cat "$root/etc/sing-box/config.json")" == '{"user":"own"}' ]] || fail 'user config.json removed'
+
 # 9. --sing-box-version: exact version (even older), must exist in the repository.
 setup_case pinned
 SB_VERSION=1.11.0 run_case
@@ -465,20 +562,27 @@ out_has '软件包自行重启服务：是（MainPID 100 → 101）'
 [[ -e "$c/check-args" ]]
 [[ "$(cat "$c/active")" == yes && "$(cat "$c/version")" == 1.13.0 ]]
 
+# The upgrade bypasses policy-rc.d and restarts the service; the downgrade obeys it. The old
+# version must still be started explicitly, so it is not left running the new binary.
 setup_case pkg-restarts-check-fail
-echo bypass >"$c/pkg-restart"; echo fail >"$c/check"
+echo bypass-upgrade >"$c/pkg-restart"; echo fail >"$c/check"
 run_case
 expect_rc 0
 out_has '软件包自行重启了服务'
 out_has '已回退到 1.12.0'
-[[ "$(cat "$c/version")" == 1.12.0 ]]
+out_has '软件包重启了服务，已回退并重新启动'
+out_lacks '原进程未动'
+awk '/^stop$/ && !s {s=NR} s && /^daemon-reload$/ && !d {d=NR} d && /^reset-failed$/ && !r {r=NR} r && /^start policy=open$/ && !t {t=NR} END{exit !t}' "$c/trace" ||
+  { cat "$c/trace"; fail 'stop, daemon-reload, reset-failed, start after a package restart'; }
+[[ "$(trace_count 'package restarted')" == 1 ]]
+[[ "$(cat "$c/version")" == 1.12.0 && "$(cat "$c/active")" == yes && "$(cat "$c/pid")" == 102 ]]
 
 setup_case pkg-restarts-and-dies
 echo bypass-down >"$c/pkg-restart"; echo fail >"$c/check"
 run_case
 expect_rc 0
 out_has '软件包自行重启了服务'
-out_has '服务曾中断，已回退并重新启动'
+out_has '软件包重启了服务，已回退并重新启动'
 [[ "$(cat "$c/version")" == 1.12.0 && "$(cat "$c/active")" == yes ]]
 
 # A package that honours policy-rc.d is never restarted by the install itself.

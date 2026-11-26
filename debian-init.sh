@@ -2094,6 +2094,11 @@ Signed-By: /etc/apt/keyrings/sagernet.gpg
 EOF
 }
 
+# Any *.json counts: the stock unit starts "-C /etc/sing-box", which merges every file in it.
+singbox_has_config() {
+  compgen -G "${SINGBOX_CONFIG%/*}/*.json" >/dev/null
+}
+
 capture_singbox_state() {
   if [[ -e "$SINGBOX_CONFIG" || -L "$SINGBOX_CONFIG" ]]; then
     SINGBOX_CONFIG_PREEXISTED=true
@@ -2121,7 +2126,7 @@ configure_singbox_boot_gate() {
   make_mutable "$SINGBOX_DROPIN"
   cat >"$TMP_DIR/sing-box-config-gate.conf" <<'EOF'
 [Unit]
-ConditionPathExists=/etc/sing-box/config.json
+ConditionPathExistsGlob=/etc/sing-box/*.json
 EOF
   install -m 0644 "$TMP_DIR/sing-box-config-gate.conf" "$SINGBOX_DROPIN"
   systemctl daemon-reload
@@ -2132,6 +2137,8 @@ mark_singbox_managed() {
   printf 'managed-by-vps-init\n' >"$SINGBOX_MANAGED_MARKER"
 }
 
+# Only the config.json the package itself drops on a first install goes away: it did not exist
+# before the install, so it cannot be the user's. Split files such as 00-main.json are never touched.
 remove_fresh_singbox_default_config() {
   if [[ "$SINGBOX_WAS_INSTALLED" == false && "$SINGBOX_CONFIG_PREEXISTED" == false && -e "$SINGBOX_CONFIG" ]]; then
     [[ ! -L "$SINGBOX_CONFIG" ]] || die "拒绝删除符号链接形式的 sing-box 默认配置：$SINGBOX_CONFIG"
@@ -2162,7 +2169,7 @@ install_sing_box() {
     if [[ "$SINGBOX_WAS_MANAGED" == true ]]; then
       configure_singbox_boot_gate
       mark_singbox_managed
-      if [[ ! -e "$SINGBOX_CONFIG" ]]; then
+      if ! singbox_has_config; then
         systemctl stop sing-box.service >/dev/null 2>&1 || true
       fi
       log "sing-box 重跑不升级；已启用开机自启，未启动：$(sing-box version 2>/dev/null | head -1 || true)"
@@ -2290,7 +2297,7 @@ singbox_repo_has_version() {
 # named sing-box, no quoting or escapes, standard -c/-C/-D arguments, no Environment/EnvironmentFile.
 # Anything else sets SINGBOX_CHECK_REASON and fails, and the caller does not upgrade.
 singbox_resolve_check() {
-  local exec_out line argv path_field tok value kind wd env_value env_files cfg_path re n i have_config=false
+  local exec_out line argv path_field tok value wd env_value env_files cfg_path re n i run_count=0 have_config=false
   local -a toks=() exec_lines=()
   SINGBOX_CHECK_BIN=''
   SINGBOX_CHECK_CWD='/'
@@ -2305,7 +2312,10 @@ singbox_resolve_check() {
   path_field=${BASH_REMATCH[1]}
   argv=${BASH_REMATCH[2]}
   if [[ "$argv" == *[\"\'\\\$]* ]]; then SINGBOX_CHECK_REASON='ExecStart 含引号、反斜杠或变量'; return 1; fi
-  if [[ "$argv" == *'  '* || "$argv" == ' '* ]]; then SINGBOX_CHECK_REASON='ExecStart 含空参数'; return 1; fi
+  if [[ "$argv" == *'  '* || "$argv" == ' '* || "$argv" == *' ' || "$argv" == *$'\t'* ]]; then
+    SINGBOX_CHECK_REASON='ExecStart 含空参数、首尾空格或制表符'
+    return 1
+  fi
   IFS=' ' read -r -a toks <<<"$argv"
   n=${#toks[@]}
   if (( n == 0 )) || [[ "${toks[0]}" != /* || "${toks[0]}" != "$path_field" || "${toks[0]##*/}" != sing-box ||
@@ -2328,27 +2338,30 @@ singbox_resolve_check() {
   for ((i = 1; i < n; i++)); do
     tok=${toks[i]}
     case "$tok" in
+      run) run_count=$((run_count + 1)) ;;
       -c|-C|-D|--config|--config-directory|--directory)
         if (( i + 1 >= n )) || [[ "${toks[i + 1]}" == -* ]]; then SINGBOX_CHECK_REASON="ExecStart 参数 $tok 缺少值"; return 1; fi
         value=${toks[i + 1]}
         i=$((i + 1))
-        kind=dir
-        case "$tok" in -c|--config) kind=cfgfile ;; esac
-        if [[ "$tok" != -D && "$tok" != --directory ]]; then
-          have_config=true
-          cfg_path=$value
-          if [[ "$cfg_path" != /* ]]; then cfg_path=$SINGBOX_CHECK_CWD/$cfg_path; fi
-          if [[ "$kind" == cfgfile && ! -f "$cfg_path" ]] || [[ "$kind" == dir && ! -d "$cfg_path" ]]; then
-            SINGBOX_CHECK_REASON="ExecStart 指向的配置不存在或类型不符：$cfg_path"
-            return 1
-          fi
-        fi
+        cfg_path=$value
+        if [[ "$cfg_path" != /* ]]; then cfg_path=$SINGBOX_CHECK_CWD/$cfg_path; fi
+        case "$tok" in
+          -c|--config)
+            have_config=true
+            if [[ ! -f "$cfg_path" ]]; then SINGBOX_CHECK_REASON="ExecStart 指向的配置文件不存在：$cfg_path"; return 1; fi ;;
+          -C|--config-directory)
+            have_config=true
+            if [[ ! -d "$cfg_path" ]]; then SINGBOX_CHECK_REASON="ExecStart 指向的配置目录不存在：$cfg_path"; return 1; fi ;;
+          *)
+            if [[ ! -d "$cfg_path" ]]; then SINGBOX_CHECK_REASON="ExecStart 的工作目录（$tok）不存在：$cfg_path"; return 1; fi ;;
+        esac
         SINGBOX_CHECK_ARGS+=("$tok" "$value") ;;
-      -c?*|-C?*|-D?*|--config=*|--config-directory=*|--directory=*)
-        SINGBOX_CHECK_REASON="ExecStart 参数 $tok 不是标准写法"
+      *)
+        SINGBOX_CHECK_REASON="ExecStart 含不在白名单内的参数：$tok"
         return 1 ;;
     esac
   done
+  if (( run_count != 1 )); then SINGBOX_CHECK_REASON="ExecStart 中子命令 run 出现 $run_count 次，必须恰好 1 次"; return 1; fi
   if [[ "$have_config" == false ]]; then SINGBOX_CHECK_REASON='ExecStart 中没有 -c/-C 配置参数'; return 1; fi
 }
 
@@ -2384,7 +2397,7 @@ upgrade_sing_box() {
   CURRENT_STEP='安装/升级 sing-box'
   local old_ver='' new_ver='' final_ver='' held_list='' held=false was_active=false has_config=false
   local hold_note='否' check_note='未检查' restart_note='否' downgrade_note='否' pkg_note='否' fail_reason=''
-  local pid_before='' pid_after='' rollback=false args_known=true a
+  local pid_before='' pid_after='' rollback=false pkg_restarted=false args_known=true a
   local -a target=() alerts=()
 
   capture_singbox_state
@@ -2395,7 +2408,7 @@ upgrade_sing_box() {
   SINGBOX_WAS_INSTALLED=false
   if [[ -n "$old_ver" ]]; then SINGBOX_WAS_INSTALLED=true; fi
   if systemctl is-active --quiet sing-box.service; then was_active=true; fi
-  if [[ -e "$SINGBOX_CONFIG" ]]; then has_config=true; fi
+  if singbox_has_config || [[ "$was_active" == true ]]; then has_config=true; fi
   held_list=$(apt-mark showhold) || die '无法读取 APT hold 状态。'
   if grep -Fxq sing-box <<<"$held_list"; then held=true; fi
   if [[ "$was_active" == true ]]; then pid_before=$(systemctl show -p MainPID --value sing-box.service 2>/dev/null) || pid_before=''; fi
@@ -2423,6 +2436,7 @@ upgrade_sing_box() {
     if [[ "$was_active" == true ]]; then
       pid_after=$(systemctl show -p MainPID --value sing-box.service 2>/dev/null) || pid_after=''
       if [[ "$pid_after" != "$pid_before" ]]; then
+        pkg_restarted=true
         pkg_note="是（MainPID $pid_before → ${pid_after:-无}）"
         warn "软件包自行重启了服务（MainPID $pid_before → ${pid_after:-无}），policy-rc.d 没能拦住；立即检查配置。"
       fi
@@ -2442,6 +2456,7 @@ upgrade_sing_box() {
     elif singbox_run_check; then
       check_note='通过'
       if [[ "$was_active" == true ]]; then
+        systemctl daemon-reload || true
         systemctl restart sing-box.service || true
         sleep 5
         if systemctl is-active --quiet sing-box.service; then
@@ -2464,9 +2479,10 @@ upgrade_sing_box() {
       if singbox_downgrade "$old_ver"; then
         downgrade_note="是（$new_ver → $old_ver）"
         warn "新版本 $new_ver 与现有配置不兼容，已回退到 $old_ver。"
-        if [[ "$was_active" == true ]] && ! systemctl is-active --quiet sing-box.service; then
+        # A service the package restarted (or that is down) must be started again so the old version runs.
+        if [[ "$was_active" == true ]] && { [[ "$pkg_restarted" == true ]] || ! systemctl is-active --quiet sing-box.service; }; then
           if singbox_start_after_downgrade; then
-            restart_note='服务曾中断，已回退并重新启动'
+            if [[ "$pkg_restarted" == true ]]; then restart_note='软件包重启了服务，已回退并重新启动'; else restart_note='服务曾中断，已回退并重新启动'; fi
           else
             restart_note='服务中断，回退后仍未能启动'
           fi
@@ -2477,6 +2493,8 @@ upgrade_sing_box() {
         downgrade_note="失败（仓库中找不到 $old_ver 或降级未成功）"
         if [[ "$was_active" == true ]] && ! systemctl is-active --quiet sing-box.service; then
           alerts+=("服务已中断，当前未运行；无法回退到 $old_ver，请先修改配置")
+        elif [[ "$pkg_restarted" == true ]]; then
+          alerts+=("软件包已自行重启服务，当前运行的是不兼容的新版本 $new_ver，且无法回退到 $old_ver，请先修改配置")
         else
           alerts+=("未重启，但下次开机将无法启动：重启后 sing-box 将无法启动，请先修改配置（新版本 $new_ver 与现有配置不兼容，无法回退到 $old_ver）")
         fi
@@ -3726,7 +3744,7 @@ check_boot_services() {
       extra="；$(ufw status 2>/dev/null | head -1 || true)"
       if [[ "$PRESERVE_SSH" == false && "$extra" != *'Status: active'* ]]; then result="${result}；ufw 状态不是 active，请检查"; fi
     fi
-    if [[ "$unit" == sing-box.service && "$enabled" == enabled && ! -e "$SINGBOX_CONFIG" ]]; then extra='；已启用，等待配置'; fi
+    if [[ "$unit" == sing-box.service && "$enabled" == enabled ]] && ! singbox_has_config; then extra='；已启用，等待配置'; fi
     BOOT_REPORT+="$unit: ${enabled:-未知} / ${active:-未知}${extra} ${result}"$'\n'
   done
 }
