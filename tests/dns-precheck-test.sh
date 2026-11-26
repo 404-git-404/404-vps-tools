@@ -396,14 +396,17 @@ reset_case
 [[ ! -e "$work/missing" ]] || fail 'precondition: directory exists'
 ok configure_tcp_tuning
 tcp_file="$work/missing/etc/sysctl.d/99-vps-init-tcp.conf"
+eq 644 "$(stat -c %a "$tcp_file")" 'TCP file mode'
 has 'net.core.rmem_max = 33554432' "$tcp_file" 'TCP settings'
 has 'net.ipv4.tcp_congestion_control = bbr' "$tcp_file" 'BBR setting'
 eq tcp_bbr "$(command cat "$work/missing/etc/modules-load.d/vps-init-bbr.conf")" 'BBR module file'
 for d in "$work/missing/etc" "$work/missing/etc/sysctl.d" "$work/missing/etc/modules-load.d"; do
   eq 755 "$(stat -c %a "$d")" "mode of $d"
 done
-# Second run is idempotent and keeps the directory.
+# Second run also migrates the old restrictive mode.
+chmod 0600 "$tcp_file"
 ok configure_tcp_tuning
+eq 644 "$(stat -c %a "$tcp_file")" 'TCP rerun file mode'
 eq 1 "$(grep -c '^net.core.rmem_max' "$tcp_file")" 'no duplicate settings after a rerun'
 
 reset_case

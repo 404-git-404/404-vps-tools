@@ -27,6 +27,7 @@ readonly IPV4_POLICY_TIMER='/etc/systemd/system/vps-init-ipv4-only.timer'
 readonly IPV4_POLICY_IFUP='/etc/network/if-pre-up.d/vps-init-ipv4-only'
 readonly -a IPV4_POLICY_FILES=("$IPV4_POLICY_HELPER" "$IPV4_POLICY_SERVICE" "$IPV4_POLICY_TIMER" "$IPV4_POLICY_IFUP")
 readonly TCP_SYSCTL='/etc/sysctl.d/99-vps-init-tcp.conf'
+readonly NETWORK_STACK_STATE='/var/lib/404-vps-tools/network-stack'
 readonly BBR_MODULES='/etc/modules-load.d/vps-init-bbr.conf'
 readonly SMARTDNS_CONF='/etc/smartdns/smartdns.conf'
 readonly SMARTDNS_CACHE='/var/cache/smartdns/smartdns.cache'
@@ -81,6 +82,7 @@ SINGBOX_RUNTIME_MASK=false
 NETWORK_REQUEST='auto'
 NETWORK_REQUEST_SET=false
 NETWORK_STACK='unknown'
+SAFE_CLEANUP_RESULT='未执行'
 IPV6_BOOT_STATE='unknown'
 IPV6_RESTORE_CHOICE=''
 IPV6_BOOT_RESULT=''
@@ -2013,6 +2015,7 @@ net.ipv4.tcp_window_scaling = 1
 net.ipv4.tcp_moderate_rcvbuf = 1
 EOF
   } >"$TCP_SYSCTL"
+  chmod 0644 "$TCP_SYSCTL"
   sysctl_try net.core.rmem_max 33554432 || true
   sysctl_try net.core.wmem_max 33554432 || true
   sysctl_try net.ipv4.tcp_rmem '4096 131072 33554432' || true
@@ -3296,6 +3299,8 @@ Swap          : $(awk '/SwapTotal:/ {printf "%.0f MiB", $2/1024}' /proc/meminfo)
 系统 DNS      : $(if [[ "$EARLY_DNS_FIXED" == true ]]; then printf '已提前修复系统 DNS，原文件备份在 %s' "$EARLY_DNS_BACKUP"; else printf '未提前修复（系统 DNS 原本可用）'; fi)
 备份目录      : $BACKUP_DIR
 需要重启      : $([[ -e /var/run/reboot-required ]] && echo yes || echo no)
+安全清理      : $SAFE_CLEANUP_RESULT
+重启后可运行 [7] 清理旧内核和无用包
 ============================================================
 请保持当前 SSH 会话，并从另一终端验证所需的 SSH 监听地址和端口。
 EOF
@@ -3389,7 +3394,7 @@ collect_initialization_config() {
   print_initialization_summary
   # --base-only historically supports automation without a terminal confirmation.
   if [[ "$INSTALL_MODE" != base ]]; then
-    ask_yes_no '确认以上配置并开始自动安装？' false || die '用户取消，未开始初始化。'
+    ask_yes_no '确认以上配置并开始自动安装？' true || die '用户取消，未开始初始化。'
   fi
   CONFIG_CONFIRMED=true
 }
@@ -3771,10 +3776,37 @@ cleanup_old_kernels() {
   cleanup_remove_packages 旧内核 "$versions" "${packages[@]}"
 }
 
+run_safe_cleanup() {
+  SAFE_CLEANUP_APT='跳过（缺少 apt-get）'
+  SAFE_CLEANUP_JOURNAL='跳过（缺少 journalctl）'
+  SAFE_CLEANUP_TMPFILES='跳过（缺少 systemd-tmpfiles）'
+  local -a exclusions=()
+  if [[ -n "$TMP_DIR" ]]; then exclusions+=("--exclude-prefix=$TMP_DIR"); fi
+  if [[ -n "$BACKUP_DIR" ]]; then exclusions+=("--exclude-prefix=$BACKUP_DIR"); fi
+  if command -v apt-get >/dev/null; then
+    if apt-get clean; then SAFE_CLEANUP_APT='完成'; else SAFE_CLEANUP_APT='失败'; fi
+  fi
+  if command -v journalctl >/dev/null; then
+    if journalctl --vacuum-size=50M; then SAFE_CLEANUP_JOURNAL='完成（归档日志，目标 50MiB）'; else SAFE_CLEANUP_JOURNAL='失败'; fi
+  fi
+  if command -v systemd-tmpfiles >/dev/null; then
+    if systemd-tmpfiles --clean --prefix=/tmp --prefix=/var/tmp \
+      --exclude-prefix=/tmp/smartdns --exclude-prefix=/tmp/sing-box --exclude-prefix=/tmp/fail2ban \
+      --exclude-prefix=/var/tmp/smartdns --exclude-prefix=/var/tmp/sing-box --exclude-prefix=/var/tmp/fail2ban "${exclusions[@]}"; then
+      SAFE_CLEANUP_TMPFILES='完成'
+    else
+      SAFE_CLEANUP_TMPFILES='失败'
+    fi
+  fi
+  SAFE_CLEANUP_RESULT="APT 缓存：$SAFE_CLEANUP_APT；Journal：$SAFE_CLEANUP_JOURNAL；临时文件：$SAFE_CLEANUP_TMPFILES"
+  if [[ "$SAFE_CLEANUP_RESULT" == *失败* || "$SAFE_CLEANUP_RESULT" == *跳过* ]]; then
+    warn "安全清理未全部完成：$SAFE_CLEANUP_RESULT"
+  fi
+}
+
 run_system_cleanup() {
   CURRENT_STEP='系统清理'
-  local before after total used apt='跳过（缺少 apt-get）' journal='跳过（缺少 journalctl）'
-  local tmpfiles='跳过（缺少 systemd-tmpfiles）' orphans kernels swaps=''
+  local before after total used orphans kernels swaps=''
   local CLEANUP_RESULT
   before=$(root_free_kib) || die '无法读取清理前的根分区空间。'
   IFS=' ' read -r total used < <(df -Pk / | awk 'NR == 2 { print $2, $3 }') || die '无法读取根分区容量。'
@@ -3785,21 +3817,7 @@ run_system_cleanup() {
     warn '无法读取活动 Swap。'
   fi
   if [[ -e "$SWAPFILE" || -L "$SWAPFILE" ]]; then log "检测到脚本 Swap 路径：$SWAPFILE"; fi
-  if command -v apt-get >/dev/null; then
-    if apt-get clean; then apt='完成'; else apt='失败'; fi
-  fi
-  if command -v journalctl >/dev/null; then
-    if journalctl --vacuum-size=50M; then journal='完成（归档日志，目标 50MiB）'; else journal='失败'; fi
-  fi
-  if command -v systemd-tmpfiles >/dev/null; then
-    if systemd-tmpfiles --clean --prefix=/tmp --prefix=/var/tmp \
-      --exclude-prefix=/tmp/smartdns --exclude-prefix=/tmp/sing-box --exclude-prefix=/tmp/fail2ban \
-      --exclude-prefix=/var/tmp/smartdns --exclude-prefix=/var/tmp/sing-box --exclude-prefix=/var/tmp/fail2ban; then
-      tmpfiles='完成'
-    else
-      tmpfiles='失败'
-    fi
-  fi
+  run_safe_cleanup
   if ( : </dev/tty ) 2>/dev/null; then
     cleanup_orphan_packages; orphans=$CLEANUP_RESULT
     cleanup_old_kernels; kernels=$CLEANUP_RESULT
@@ -3818,7 +3836,22 @@ run_system_cleanup() {
     warn '无法读取清理后的根分区空间。'
   fi
   printf 'APT 缓存：%s\nJournal：%s\n临时文件：%s\n无用软件包：%s\n旧内核：%s\nSwap：未修改\n' \
-    "$apt" "$journal" "$tmpfiles" "$orphans" "$kernels"
+    "$SAFE_CLEANUP_APT" "$SAFE_CLEANUP_JOURNAL" "$SAFE_CLEANUP_TMPFILES" "$orphans" "$kernels"
+}
+
+# Best-effort bookkeeping that runs after every system change: a failure only warns, so the final
+# report (with the new SSH port) is never lost. The sing-box wizard falls back to a local probe.
+persist_network_stack() {
+  local dir=${NETWORK_STACK_STATE%/*}
+  case "$NETWORK_STACK" in ipv4|dual) ;; *) warn "无法保存网络栈：$NETWORK_STACK"; return 1 ;; esac
+  if [[ -L "$dir" || -L "$NETWORK_STACK_STATE" ]]; then warn "$NETWORK_STACK_STATE 或其目录是符号链接，未保存网络栈。"; return 1; fi
+  if ensure_dir "$dir" && make_mutable "$NETWORK_STACK_STATE" &&
+    printf '%s\n' "$NETWORK_STACK" >"$NETWORK_STACK_STATE" && chmod 0644 "$NETWORK_STACK_STATE" &&
+    [[ "$(cat "$NETWORK_STACK_STATE")" == "$NETWORK_STACK" ]]; then
+    return 0
+  fi
+  warn "网络栈状态保存失败：$NETWORK_STACK_STATE"
+  return 1
 }
 
 main() {
@@ -3879,6 +3912,8 @@ main() {
   else
     configure_fail2ban
   fi
+  persist_network_stack || warn '网络栈状态未保存；sing-box 向导将按本地 IPv6 检测给出默认值。'
+  run_safe_cleanup
   print_report
 }
 
@@ -3891,6 +3926,7 @@ set -Eeuo pipefail
 
 readonly CONFIG_PATH='/etc/sing-box/config.json'
 readonly CONFIG_DIR='/etc/sing-box'
+readonly NETWORK_STACK_STATE='/var/lib/404-vps-tools/network-stack'
 readonly MODULE_CANCEL_STATUS=20
 
 TEMP_CONFIG=''
@@ -4724,18 +4760,31 @@ configure_log() {
 }
 
 select_network_stack() {
-    local choice=''
+    local choice='' default_stack='' default_choice=1 default_source='本地 IPv6 地址与默认路由检测'
+    if [[ -f "$NETWORK_STACK_STATE" ]]; then
+        read -r default_stack <"$NETWORK_STACK_STATE" || true
+    fi
+    case "$default_stack" in
+        ipv4|dual) default_source="初始化状态 $NETWORK_STACK_STATE" ;;
+        *)
+            default_stack=ipv4
+            if [[ -n "$(ip -6 -o addr show scope global 2>/dev/null)" &&
+                  -n "$(ip -6 route show default 2>/dev/null)" ]]; then
+                default_stack=dual
+            fi
+            ;;
+    esac
+    [[ "$default_stack" != dual ]] || default_choice=2
 
     printf '\n请选择网络栈：\n\n'
-    printf '1) IPv4-only [默认]\n'
-    printf '2) IPv6-only\n'
-    printf '3) Dual-stack\n'
-    prompt_numbered_choice choice 1 3 1
+    printf '1) IPv4\n'
+    printf '2) Dual-stack\n'
+    printf '默认：%s（来源：%s）\n' "$default_stack" "$default_source"
+    prompt_numbered_choice choice 1 2 "$default_choice"
 
     case "$choice" in
         1) NETWORK_STACK='ipv4' ;;
-        2) NETWORK_STACK='ipv6' ;;
-        3) NETWORK_STACK='dual' ;;
+        2) NETWORK_STACK='dual' ;;
     esac
     info "Applying application-level $NETWORK_STACK configuration."
     inspect_kernel_enforcement
@@ -4744,7 +4793,7 @@ select_network_stack() {
 get_listen_address() {
     case "$NETWORK_STACK" in
         ipv4) printf '0.0.0.0' ;;
-        ipv6|dual) printf '::' ;;
+        dual) printf '::' ;;
         *)
             error "未知网络栈：${NETWORK_STACK}"
             return 1

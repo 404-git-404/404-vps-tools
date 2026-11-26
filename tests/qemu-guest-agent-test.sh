@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # shellcheck disable=SC2329,SC2034 # Mocks and state consumed by the sourced script.
 set -Eeuo pipefail
+# shellcheck source=tests/process-helper.sh
+source "$(dirname -- "${BASH_SOURCE[0]}")/process-helper.sh"
 repo=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 work=$(mktemp -d)
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
@@ -31,7 +33,7 @@ if [[ ${1:-} == --package-manager ]]; then
 
   build_fixture qemu-guest-agent
   build_fixture qemu-agent-test-dependent qemu-guest-agent
-  if (remove_qemu_guest_agent) >"$work/blocked" 2>&1; then fail 'APT allowed removal of a reverse dependency'; fi
+  if run_in_bash 'remove_qemu_guest_agent' >"$work/blocked" 2>&1; then fail 'APT allowed removal of a reverse dependency'; fi
   grep -Fq '已阻止执行' "$work/blocked"
   [[ $(qemu_guest_agent_status) == installed ]]
   [[ $(dpkg-query -W -f='${db:Status-Status}' qemu-agent-test-dependent) == installed ]]

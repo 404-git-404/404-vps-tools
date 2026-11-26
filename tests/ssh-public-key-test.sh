@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2016 # Code strings expand in the isolated Bash fixture.
 # shellcheck disable=SC2329,SC2034 # Installer functions invoke these test doubles.
 set -Eeuo pipefail
+# shellcheck source=tests/process-helper.sh
+source "$(dirname -- "${BASH_SOURCE[0]}")/process-helper.sh"
 
 REPO_ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 TEST_TMP=$(mktemp -d)
@@ -75,7 +78,7 @@ for scenario in reuse-many reuse-one decline first empty comments corrupt duplic
     if [[ -f "$AUTHORIZED_KEYS" ]]; then cp -- "$AUTHORIZED_KEYS" "$TEST_TMP/before"; fi
     if [[ "$scenario" == unsafe ]]; then
       test_mode=777
-      if (collect_public_key); then fail 'accepted writable authorized_keys'; fi
+      expect_bash_failure '不能允许组或其他用户写入' 'collect_public_key'
       cmp "$TEST_TMP/before" "$AUTHORIZED_KEYS"
       exit 0
     fi
@@ -123,21 +126,23 @@ for scenario in reuse-many reuse-one decline first empty comments corrupt duplic
 done
 
 for arg in --pubkey --pubkey-file; do
-  if (parse_args "$arg"); then fail "accepted missing $arg"; fi
-  if (parse_args "$arg" ''); then fail "accepted empty $arg"; fi
+  expect_bash_failure '需要非空' 'parse_args "$arg"'
+  expect_bash_failure '需要非空' 'parse_args "$arg" ""'
 done
 printf '%s\n' "$key" >"$AUTHORIZED_KEYS"
 printf '# empty\n' >"$TEST_TMP/empty.pub"
 printf 'not a key\n' >"$TEST_TMP/invalid.pub"
 for value in ' ' invalid $'invalid\nsecond line'; do
-  if (parse_args --pubkey "$value"; collect_public_key); then fail 'accepted invalid explicit key'; fi
+  expect_bash_failure '显式提供的 SSH 公钥为空或无效' 'parse_args --pubkey "$value"; collect_public_key'
 done
 for file in empty.pub invalid.pub nonexistent.pub; do
-  if (parse_args --pubkey-file "$TEST_TMP/$file"; collect_public_key); then fail 'accepted invalid explicit key file'; fi
+  reason='显式提供的 SSH 公钥为空或无效'
+  if [[ "$file" == nonexistent.pub ]]; then reason='无法读取公钥文件'; fi
+  expect_bash_failure "$reason" 'parse_args --pubkey-file "$TEST_TMP/$file"; collect_public_key'
 done
 if [[ "$(uname -s)" == Linux ]]; then
   mv "$AUTHORIZED_KEYS" "$TEST_TMP/symlink-target"
   ln -s "$TEST_TMP/symlink-target" "$AUTHORIZED_KEYS"
-  if (parse_args --pubkey "$key"; collect_public_key); then fail 'accepted symlink'; fi
+  expect_bash_failure '不能是符号链接' 'parse_args --pubkey "$key"; collect_public_key'
 fi
 echo 'PASS: SSH public key reuse, validation, append and CLI inputs'
