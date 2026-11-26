@@ -10,8 +10,9 @@ on:
 permissions:
   contents: read
 
+# One repository-wide queue: releases are published one at a time, and "latest" is decided in order.
 concurrency:
-  group: release-${{ github.ref_name }}
+  group: release
   cancel-in-progress: false
 
 jobs:
@@ -31,10 +32,13 @@ jobs:
           TAG: ${{ github.ref_name }}
         run: bash .github/scripts/release-checks.sh tag-format "$TAG"
 
-      - name: Tagged commit is on main
+      - name: Tag points at the checked-out commit
         env:
           TAG: ${{ github.ref_name }}
-        run: bash .github/scripts/release-checks.sh on-main "refs/tags/$TAG" origin/main
+        run: bash .github/scripts/release-checks.sh tag-matches-head "$TAG"
+
+      - name: Checked-out commit is on main
+        run: bash .github/scripts/release-checks.sh on-main HEAD origin/main
 
       - name: Tag matches the version constant of every script
         env:
@@ -46,6 +50,12 @@ jobs:
           TAG: ${{ github.ref_name }}
           GH_TOKEN: ${{ github.token }}
         run: bash .github/scripts/release-checks.sh release-absent "$TAG"
+
+      - name: Version is newer than the latest Release
+        env:
+          TAG: ${{ github.ref_name }}
+          GH_TOKEN: ${{ github.token }}
+        run: bash .github/scripts/release-checks.sh latest-newer "$TAG"
 
   shell-checks:
     name: Shell checks

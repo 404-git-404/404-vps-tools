@@ -1,13 +1,13 @@
 ```bash
-cd "$(mktemp -d)" && B=https://github.com/404-git-404/404-vps-tools/releases/latest/download && curl -fsSLO "$B/debian-init.sh" && curl -fsSLO "$B/SHA256SUMS" && grep ' debian-init.sh$' SHA256SUMS | sha256sum -c - && bash debian-init.sh
+cd "$(mktemp -d)" && B=https://github.com/404-git-404/404-vps-tools/releases/latest/download && curl -fsSLO "$B/debian-init.sh" && curl -fsSLO "$B/SHA256SUMS" && grep '  debian-init\.sh$' SHA256SUMS | sha256sum -c - && bash debian-init.sh
 ```
 
 ```sh
-cd "$(mktemp -d)" && B=https://github.com/404-git-404/404-vps-tools/releases/latest/download && wget -qO alpine-init.sh "$B/alpine-init.sh" && wget -qO SHA256SUMS "$B/SHA256SUMS" && grep ' alpine-init.sh$' SHA256SUMS | sha256sum -c - && sh alpine-init.sh
+cd "$(mktemp -d)" && B=https://github.com/404-git-404/404-vps-tools/releases/latest/download && wget -qO alpine-init.sh "$B/alpine-init.sh" && wget -qO SHA256SUMS "$B/SHA256SUMS" && grep '  alpine-init\.sh$' SHA256SUMS | sha256sum -c - && sh alpine-init.sh
 ```
 
 ```sh
-cd "$(mktemp -d)" && B=https://github.com/404-git-404/404-vps-tools/releases/latest/download && curl -fsSLO "$B/gg-status" && curl -fsSLO "$B/SHA256SUMS" && grep ' gg-status$' SHA256SUMS | sha256sum -c - && chmod +x gg-status && ./gg-status
+cd "$(mktemp -d)" && B=https://github.com/404-git-404/404-vps-tools/releases/latest/download && curl -fsSLO "$B/gg-status" && curl -fsSLO "$B/SHA256SUMS" && grep '  gg-status$' SHA256SUMS | sha256sum -c - && sh gg-status
 ```
 
 以上命令下载最新发布的版本，校验 SHA256SUMS 通过后才运行；校验失败不会执行。想锁定版本，见对应 Release 的说明。`bash debian-init.sh --version` 查看版本。

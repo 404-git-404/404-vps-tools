@@ -80,26 +80,84 @@ for script in debian-init.sh alpine-init.sh gg-status; do
   rejects "$script defines the constant twice" bash "$checks" versions "v$current" "$work/twice-$script"
 done
 
-# (d) An existing Release of the same name fails the run, including on unexpected API errors.
+# (4) The tag must point at the checked-out commit.
+git_in git checkout -q --detach refs/tags/v0.2.0
+passes 'checked out exactly the lightweight/annotated tag' git_in bash "$checks" tag-matches-head v0.2.0
+rejects 'checked out a different commit than the tag' git_in bash "$checks" tag-matches-head v0.1.0
+rejects 'tag of a side branch' git_in bash "$checks" tag-matches-head v0.3.0
+rejects 'unknown tag is not matched' git_in bash "$checks" tag-matches-head v9.9.9
+rejects 'bad tag name is not matched' git_in bash "$checks" tag-matches-head 'v0.2'
+git_in git checkout -q --detach refs/tags/v0.1.0
+passes 'lightweight tag at HEAD' git_in bash "$checks" tag-matches-head v0.1.0
+git_in git checkout -q main
+rejects 'HEAD (main tip) is ahead of the tag' git_in bash "$checks" tag-matches-head v0.2.0
+git_in git checkout -q --detach refs/tags/v0.3.1
+rejects 'annotated side tag is at HEAD but not on main' git_in bash "$checks" on-main HEAD origin/main
+passes 'annotated side tag at HEAD matches itself' git_in bash "$checks" tag-matches-head v0.3.1
+git_in git checkout -q main
+passes 'HEAD on main' git_in bash "$checks" on-main HEAD origin/main
+
+# (d) Release absent, and the version must beat the latest Release: decided by HTTP status of the
+# GitHub API (through ci-fetch.sh), never by message text. A fake curl plays GitHub.
 mkdir "$work/bin"
-cat >"$work/bin/gh" <<'GH'
+cat >"$work/bin/curl" <<'CURL'
 #!/usr/bin/env bash
-[[ "$1 $2" == 'release view' ]] || exit 99
-case "$GH_MODE" in
-  exists) echo '{"tagName":"v0.1.0"}'; exit 0 ;;
-  absent) echo 'release not found' >&2; exit 1 ;;
-  error) echo 'HTTP 502: Bad Gateway' >&2; exit 1 ;;
-  auth) echo 'To get started with GitHub CLI, please run: gh auth login' >&2; exit 4 ;;
+set -Eeuo pipefail
+url='' output='' headers=''
+while (( $# )); do
+  case "$1" in
+    --output) output=$2; shift 2 ;;
+    --dump-header) headers=$2; shift 2 ;;
+    https://*) url=$1; shift ;;
+    *) shift ;;
+  esac
+done
+: >"$headers"
+case "$url" in
+  https://api.github.com/repos/example/fixture/releases/tags/*) status=$TAG_STATUS body=$TAG_BODY ;;
+  https://api.github.com/repos/example/fixture/releases/latest) status=$LATEST_STATUS body=$LATEST_BODY ;;
+  *) echo "unexpected URL $url" >&2; exit 91 ;;
 esac
-exit 98
-GH
-chmod +x "$work/bin/gh"
-gh_mode() { local mode=$1; shift; PATH="$work/bin:$PATH" GH_MODE=$mode "$@"; }
-passes 'Release is absent' gh_mode absent bash "$checks" release-absent v0.1.0
-rejects 'Release already exists' gh_mode exists bash "$checks" release-absent v0.1.0
-rejects 'API error is not read as absent' gh_mode error bash "$checks" release-absent v0.1.0
-rejects 'authentication error is not read as absent' gh_mode auth bash "$checks" release-absent v0.1.0
-rejects 'bad tag never reaches gh' gh_mode absent bash "$checks" release-absent 'v0.1.0;x'
+printf '%s' "$body" >"$output"
+printf '%s' "$status"
+exit "${CURL_EXIT:-0}"
+CURL
+chmod +x "$work/bin/curl"
+# api NAME-OF-SCENARIO ...: run release-checks with the fake GitHub; env VARS are passed as arguments.
+api() { env PATH="$work/bin:$PATH" GH_TOKEN=test-only GITHUB_REPOSITORY=example/fixture CI_FETCH_ATTEMPTS=1 "$@"; }
+released='{"tag_name":"v0.1.0"}'
+
+passes 'Release is absent (404)' api TAG_STATUS=404 TAG_BODY='{}' LATEST_STATUS=404 LATEST_BODY='{}' bash "$checks" release-absent v0.1.0
+rejects 'Release already exists (200)' api TAG_STATUS=200 TAG_BODY="$released" LATEST_STATUS=404 LATEST_BODY='{}' bash "$checks" release-absent v0.1.0
+rejects 'forbidden (403) is not read as absent' api TAG_STATUS=403 TAG_BODY='{"message":"Forbidden"}' LATEST_STATUS=404 LATEST_BODY='{}' bash "$checks" release-absent v0.1.0
+rejects 'server error (500) is not read as absent' api TAG_STATUS=500 TAG_BODY='' LATEST_STATUS=404 LATEST_BODY='{}' bash "$checks" release-absent v0.1.0
+rejects 'unauthenticated (401) is not read as absent' api TAG_STATUS=401 TAG_BODY='{"message":"Bad credentials"}' LATEST_STATUS=404 LATEST_BODY='{}' bash "$checks" release-absent v0.1.0
+rejects 'network failure is not read as absent' api CURL_EXIT=6 TAG_STATUS=000 TAG_BODY='' LATEST_STATUS=404 LATEST_BODY='{}' bash "$checks" release-absent v0.1.0
+rejects 'a "release not found" text with status 200 is still an existing Release' api TAG_STATUS=200 TAG_BODY='release not found' LATEST_STATUS=404 LATEST_BODY='{}' bash "$checks" release-absent v0.1.0
+rejects 'bad tag never reaches the API' api TAG_STATUS=404 TAG_BODY='{}' LATEST_STATUS=404 LATEST_BODY='{}' bash "$checks" release-absent 'v0.1.0;x'
+rejects 'missing repository' env -u GITHUB_REPOSITORY PATH="$work/bin:$PATH" GH_TOKEN=test-only TAG_STATUS=404 TAG_BODY='{}' bash "$checks" release-absent v0.1.0
+
+latest_is() { api TAG_STATUS=404 TAG_BODY='{}' LATEST_STATUS=200 "LATEST_BODY={\"tag_name\":\"$1\"}" bash "$checks" latest-newer "$2"; }
+passes 'no latest Release (404)' api TAG_STATUS=404 TAG_BODY='{}' LATEST_STATUS=404 LATEST_BODY='{}' bash "$checks" latest-newer v0.1.0
+passes 'patch bump' latest_is v0.1.0 v0.1.1
+passes 'minor bump' latest_is v0.1.9 v0.2.0
+passes 'major bump' latest_is v0.9.9 v1.0.0
+passes 'numeric, not text, comparison (v0.1.10 > v0.1.9)' latest_is v0.1.9 v0.1.10
+passes 'numeric, not text, comparison (v0.10.0 > v0.9.0)' latest_is v0.9.0 v0.10.0
+rejects 'same version as latest' latest_is v0.1.0 v0.1.0
+rejects 'older patch' latest_is v0.1.1 v0.1.0
+rejects 'older minor' latest_is v0.2.0 v0.1.9
+rejects 'older major' latest_is v1.0.0 v0.9.9
+rejects 'numeric, not text, comparison (v0.1.9 < v0.1.10)' latest_is v0.1.10 v0.1.9
+rejects 'numeric, not text, comparison (v0.9.0 < v0.10.0)' latest_is v0.10.0 v0.9.0
+passes 'latest is a pre-release tag, not vX.Y.Z' latest_is smartdns-debian-pinned-2026-07 v0.1.0
+passes 'latest is vX.Y.Z-rc1, not vX.Y.Z' latest_is v9.9.9-rc1 v0.1.0
+passes 'latest has an empty tag name' latest_is '' v0.1.0
+rejects 'latest lookup fails (500)' api TAG_STATUS=404 TAG_BODY='{}' LATEST_STATUS=500 LATEST_BODY='' bash "$checks" latest-newer v0.1.0
+rejects 'latest lookup forbidden (403)' api TAG_STATUS=404 TAG_BODY='{}' LATEST_STATUS=403 LATEST_BODY='{}' bash "$checks" latest-newer v0.1.0
+rejects 'latest lookup network failure' api CURL_EXIT=6 TAG_STATUS=404 TAG_BODY='{}' LATEST_STATUS=000 LATEST_BODY='' bash "$checks" latest-newer v0.1.0
+rejects 'latest response is not JSON' api TAG_STATUS=404 TAG_BODY='{}' LATEST_STATUS=200 LATEST_BODY='<html>' bash "$checks" latest-newer v0.1.0
+rejects 'bad tag name' latest_is v0.1.0 'v0.2'
 rejects 'unknown command' bash "$checks" publish v0.1.0
 
 # Release notes pin every README command to the tag.
@@ -127,16 +185,20 @@ grep -Fq 'uses: ./.github/workflows/shellcheck.yml' "$workflow" || fail 'release
 grep -Fq 'uses: ./.github/workflows/smartdns-pinned.yml' "$workflow" || fail 'release.yml must call smartdns-pinned.yml'
 grep -Eq '^\s+workflow_call:' "$called" || fail 'shellcheck.yml must support workflow_call'
 grep -Eq '^\s+workflow_call:' "$repo/.github/workflows/smartdns-pinned.yml" || fail 'smartdns-pinned.yml must support workflow_call'
-for gate in tag-format on-main versions release-absent; do
+for gate in tag-format tag-matches-head on-main versions release-absent latest-newer; do
   grep -Eq "release-checks.sh $gate" "$workflow" || fail "release.yml does not run the $gate gate"
 done
 grep -Fq 'release-checks.sh versions "$TAG" dist' "$workflow" || fail 'the packaged files are not version-checked'
+grep -Fq 'release-checks.sh on-main HEAD origin/main' "$workflow" || fail 'the checked-out commit must be tested for being on main'
+# One repository-wide, serial queue; nothing is ever cancelled mid-publish.
+[[ "$(awk '/^concurrency:/{getline a; getline b; print a "|" b; exit}' "$workflow")" == '  group: release|  cancel-in-progress: false' ]] ||
+  fail 'concurrency must be group release with cancel-in-progress: false'
 if grep -Eq '\b(curl|wget|pip|npm|npx|go install|go run|apt-get|apt install|docker pull|git clone|nc)\b' "$workflow"; then fail 'release.yml must not download anything'; fi
 if grep -Eq '(--clobber|--draft|--prerelease|gh release (delete|edit|upload)|--delete-tag|git push|git tag)' "$workflow"; then fail 'release.yml must never overwrite, edit or delete'; fi
 grep -Fq -- '--latest' "$workflow" || fail 'the Release must be marked latest'
 grep -Fq -- '--verify-tag' "$workflow" || fail 'gh release create must verify the tag'
 # The tag name reaches shell code only through an environment variable.
-if grep -n 'github.ref_name' "$workflow" | grep -Ev 'TAG: \$\{\{ github.ref_name \}\}|group: release-' ; then fail 'github.ref_name is used outside an env assignment'; fi
+if grep -n 'github.ref_name' "$workflow" | grep -Ev 'TAG: \$\{\{ github.ref_name \}\}' ; then fail 'github.ref_name is used outside an env assignment'; fi
 if grep -nE '^\s+run:.*\$\{\{' "$workflow"; then fail 'expression interpolated into run:'; fi
 # Third-party code is pinned to a full commit SHA.
 if grep -E '^\s+uses: [^.]' "$workflow" | grep -Ev '@[0-9a-f]{40}$'; then fail 'actions in release.yml must be pinned to a commit SHA'; fi

@@ -3327,8 +3327,9 @@ for version, path in zip((4, 6), sys.argv[1:]):
             raise SystemExit(f'IPv{version} list: wrong address family: {line}')
         if network.prefixlen < min_prefix:
             raise SystemExit(f'IPv{version} list: range too wide: {line}')
-        if (network.is_private or network.is_loopback or network.is_link_local or
-                network.is_multicast or network.is_reserved or network.is_unspecified):
+        if (not network.is_global or network.is_private or network.is_loopback or
+                network.is_link_local or network.is_multicast or network.is_reserved or
+                network.is_unspecified):
             raise SystemExit(f'IPv{version} list: non-public range: {line}')
         networks.add(network)
     if not low <= len(networks) <= high:

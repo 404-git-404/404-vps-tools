@@ -136,6 +136,8 @@ run 'IPv4 range inside the IPv6 list' fail "$good_v4" "$good_v6"$'\n104.16.0.0/1
 run 'catch-all 0.0.0.0/0' fail "$good_v4"$'\n0.0.0.0/0' "$good_v6"
 run 'catch-all ::/0' fail "$good_v4" "$good_v6"$'\n::/0'
 run 'IPv4 range wider than /8' fail "$good_v4"$'\n64.0.0.0/7' "$good_v6"
+run 'carrier-grade NAT 100.64.0.0/10 (not global)' fail "$good_v4"$'\n100.64.0.0/10' "$good_v6"
+run 'IPv6 range far too wide 2000::/15' fail "$good_v4" "$good_v6"$'\n2000::/15'
 run 'private 10.0.0.0/8' fail "$good_v4"$'\n10.0.0.0/8' "$good_v6"
 run 'private 192.168.0.0/16' fail "$good_v4"$'\n192.168.0.0/16' "$good_v6"
 run 'loopback 127.0.0.0/8' fail "$good_v4"$'\n127.0.0.0/8' "$good_v6"

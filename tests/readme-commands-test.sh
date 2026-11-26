@@ -11,11 +11,11 @@ set -Eeuo pipefail
 repo=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 readonly OFFICIAL_BASE='https://github.com/404-git-404/404-vps-tools/releases/latest/download'
 readonly -a NAMES=(debian-init.sh alpine-init.sh gg-status)
-readonly -a FINALS=('bash debian-init.sh' 'sh alpine-init.sh' './gg-status')
+readonly -a FINALS=('bash debian-init.sh' 'sh alpine-init.sh' 'sh gg-status')
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
 
 run_commands() {
-  local base=$1 mode=$2 line lang command verified scenario index shell_name out err rc scenarios
+  local base=$1 mode=$2 line lang command verified scenario index shell_name out err rc scenarios strict_name
   local -a lines=()
   mapfile -t lines < <(bash "$repo/.github/scripts/readme-commands.sh" "$repo/README.md")
   [[ ${#lines[@]} -eq 3 ]] || fail "README must contain exactly three commands, found ${#lines[@]}"
@@ -24,7 +24,10 @@ run_commands() {
     lang=${line%%$'\t'*}
     command=${line#*$'\t'}
     [[ "$command" == "cd \"\$(mktemp -d)\" && B=$OFFICIAL_BASE && "* ]] || fail "command $index does not start with the temp dir and the official base URL"
-    [[ "$command" == *"grep ' ${NAMES[$index]}\$' SHA256SUMS | sha256sum -c - && "* ]] || fail "command $index does not verify ${NAMES[$index]}"
+    # Two spaces (the sha256sum text format) and the file name with its dots escaped, anchored at the end.
+    strict_name=${NAMES[$index]//./\\.}
+    [[ "$command" == *"grep '  ${strict_name}\$' SHA256SUMS | sha256sum -c - && "* ]] || fail "command $index does not strictly verify ${NAMES[$index]}"
+    if [[ "$command" == *chmod* || "$command" == *'&& ./'* ]]; then fail "command $index must run the script with its interpreter, not chmod and ./"; fi
     [[ "$command" == *" && ${FINALS[$index]}" ]] || fail "command $index does not end by running ${NAMES[$index]}"
     # Each verification must come before the final run step.
     [[ "${command%% && "${FINALS[$index]}"}" == *'sha256sum -c -'* ]] || fail "command $index runs the script before verifying it"
