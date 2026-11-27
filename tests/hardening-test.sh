@@ -337,14 +337,23 @@ dpkg-query() {
     *) return 1 ;;
   esac
 }
+check_audit_apt_cache_args() {
+  [[ "$1" == -o && "$2" == Dir::Cache::pkgcache= && "$3" == -o &&
+     "$4" == Dir::Cache::srcpkgcache= && "$5" == policy ]] || {
+    echo 'audit apt-cache must disable both disk caches' >>"$work/unexpected-apt-cache"
+    return 1
+  }
+}
 apt-cache() {
   local IFS=' '
+  check_audit_apt_cache_args "$@" || return 1
+  shift 4
   if [[ "$*" == policy ]]; then
-    printf ' 500 https://deb.debian.org/debian stable/main amd64 Packages\n     release o=Debian,a=stable\n'
+    printf '1001 https://deb.debian.org/debian trixie/main amd64 Packages\n     release o=Debian,a=stable,n=trixie\n'
   elif [[ "$*" == *'external'* || "$*" == *'vendor-barad'* ]]; then
-    printf ' *** 1.0 100\n        500 https://vendor.invalid stable/main amd64 Packages\n'
+    printf '  Version table:\n *** 1.0 100\n        500 https://vendor.invalid stable/main amd64 Packages\n        100 /var/lib/dpkg/status\n     0.9 1001 (phased 50%%)\n       1001 https://deb.debian.org/debian trixie/main amd64 Packages\n'
   else
-    printf ' *** 1.0 100\n        500 https://deb.debian.org/debian stable/main amd64 Packages\n'
+    printf '  Version table:\n *** 1.0 1001 (phased 50%%)\n       1001 https://deb.debian.org/debian trixie/main amd64 Packages\n        100 /var/lib/dpkg/status\n'
   fi
 }
 systemctl() {
@@ -461,10 +470,91 @@ touch "$root/etc/cloud/cloud-init.disabled"
 rm -r "$root/usr/local/aegis"
 collect_security_audit
 [[ ${#AUDIT_FINDINGS[@]} == 0 ]] || { print_security_audit full; fail 'negative fixture has findings'; }
+audit_debian_package official || fail 'seven-space Debian origin at priority 1001 was rejected'
 
 # --audit dispatch has no writes, even to lock/backup/DNS; compare content + metadata
 # across the entire fixture, including hidden files and symlinks. Audit emits to stdout.
 snapshot() { find "$root" -printf '%P %y %m %U %G %s %T@ %l\n'; find "$root" -type f -exec sha256sum {} +; }
+(
+  eval "fixture_$(declare -f dpkg-query)"
+  eval "fixture_$(declare -f apt-cache)"
+  dpkg-query() {
+    if [[ "$1" == -W && "$2" == '-f=${binary:Package}\t${db:Status-Status}\n' ]]; then
+      printf 'sing-box\tinstalled\nexternal\tinstalled\n'
+    else
+      fixture_dpkg-query "$@"
+    fi
+  }
+  apt-cache() {
+    if [[ "$*" == *'sing-box' ]]; then
+      check_audit_apt_cache_args "$@" || return 1
+      printf '  Version table:\n *** 1.0 100\n        100 /var/lib/dpkg/status\n'
+      if [[ -n "$installed_origin" ]]; then printf '       1001 %s * Packages\n' "$installed_origin"; fi
+      printf '     1e0 500 (phased 50%%)\n        500 https://deb.sagernet.org/ * Packages\n'
+    else
+      fixture_apt-cache "$@"
+    fi
+  }
+  curl() { fail 'audit attempted a download'; }
+  gpg() { fail 'audit invoked gpg'; }
+  mktemp() { fail 'audit created a temporary file'; }
+  source_path="$root/etc/apt/sources.list.d/sagernet.sources"
+  key_path="$root/etc/apt/keyrings/sagernet.gpg"
+  mkdir -p "${source_path%/*}" "${key_path%/*}"
+  sagernet_repo_source >"$source_path"
+  printf 'key fixture\n' >"$key_path"
+  generic='本地缓存不能证明已安装版本来自 Debian 官方源'
+  foreign='sing-box 来自 deb.sagernet.org，但源配置或密钥文件不是本工具写入的版本，请核实'
+  package_finding() { has_finding $'^B\tpackage\t'"$1"$'\t'"$2"; }
+
+  # Exercise an unmarked version too. An unrelated line terminates its source rows.
+  apt_policy_fixture=$'        500 before-table\n  Version table:\n     1.0 1001 (phased 50%)\n       1001 https://deb.debian.org/debian trixie/main amd64 Packages\n        500 repo-one\n       -100 repo-two\n       unexpected text\n        100 after-unknown-line\n'
+  [[ "$(audit_apt_version_sources 1.0 "$apt_policy_fixture")" == \
+    $'       1001 https://deb.debian.org/debian trixie/main amd64 Packages\n        500 repo-one\n       -100 repo-two' ]]
+
+  snapshot >"$work/sager-before"
+  for installed_origin in 'https://deb.sagernet.org' 'https://deb.sagernet.org/'; do
+    audit_singbox_sagernet_origin || fail 'seven-space SagerNet origin at priority 1001 was rejected'
+    collect_security_audit
+    if package_finding sing-box ''; then fail 'managed sing-box was reported'; fi
+    package_finding external "$generic" || fail 'other third-party package was omitted'
+  done
+  snapshot >"$work/sager-after"
+  cmp "$work/sager-before" "$work/sager-after"
+
+  for installed_origin in '' 'https://deb.sagernet.org.example.invalid' 'https://deb.sagernet.org/other'; do
+    collect_security_audit
+    package_finding sing-box "$generic" || fail 'unverified installed origin did not get the ordinary warning'
+  done
+
+  installed_origin='https://deb.sagernet.org/'
+  for extra_source in "$root/etc/apt/sources.list" "$root/etc/apt/sources.list.d/vendor.list" \
+    "$root/etc/apt/sources.list.d/vendor.sources"; do
+    printf 'deb https://DeB.SaGeRnEt.OrG/ stable main\n' >"$extra_source"
+    collect_security_audit
+    package_finding sing-box "$foreign" || fail "duplicate SagerNet reference was accepted: $extra_source"
+    rm "$extra_source"
+  done
+
+  printf '\n' >>"$source_path"
+  collect_security_audit
+  package_finding sing-box "$foreign" || fail 'source with extra trailing newline was accepted'
+  sagernet_repo_source >"$source_path"
+  mv "$source_path" "$source_path.real"
+  ln -s "$source_path.real" "$source_path"
+  collect_security_audit
+  package_finding sing-box "$foreign" || fail 'symlinked sources file was accepted'
+  rm "$source_path"
+  mv "$source_path.real" "$source_path"
+  : >"$key_path"
+  collect_security_audit
+  package_finding sing-box "$foreign" || fail 'empty key was accepted'
+  printf 'key fixture\n' >"$key_path"
+  mv "$key_path" "$key_path.real"
+  ln -s "$key_path.real" "$key_path"
+  collect_security_audit
+  package_finding sing-box "$foreign" || fail 'symlinked key was accepted'
+)
 snapshot >"$work/before"
 (
   preflight() { fail 'audit preflight wrote state'; }
@@ -476,6 +566,7 @@ snapshot >"$work/before"
 ) >"$work/audit-output"
 snapshot >"$work/after"
 cmp "$work/before" "$work/after"
+[[ ! -e "$work/unexpected-apt-cache" ]] || fail 'audit called apt-cache without disabling both disk caches'
 
 # [8] flow. Nothing is written before the risk notice is confirmed; with nothing to do
 # there is no backup directory; a cloud-init skip never stops the remaining items.

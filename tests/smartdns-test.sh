@@ -26,42 +26,73 @@ done
 unset -f dpkg
 
 # SmartDNS listens on IPv4 loopback only, in every mode, whether or not ::1 exists.
-for stack in ipv4 dual auto; do
-  NETWORK_STACK=$stack
-  NETWORK_REQUEST=$stack
+for pair in auto:ipv4 auto:dual ipv4:ipv4 dual:dual; do
+  NETWORK_STACK=${pair#*:}
+  NETWORK_REQUEST=${pair%:*}
   for transport in h2 dns53; do
-    write_smartdns_config "$TEST_TMP/$stack-$transport.conf" "$transport"
-    config=$(cat "$TEST_TMP/$stack-$transport.conf")
+    conf="$TEST_TMP/$pair-$transport.conf"
+    write_smartdns_config "$conf" "$transport"
+    config=$(cat "$conf")
     [[ "$config" == *'bind 127.0.0.1:53'* && "$config" == *'bind-tcp 127.0.0.1:53'* ]] || fail 'missing local UDP/TCP listener'
-    assert_eq 2 "$(grep -c '^bind' "$TEST_TMP/$stack-$transport.conf")" "$stack $transport listener count"
-    if grep -Fq '::1' "$TEST_TMP/$stack-$transport.conf"; then fail "$stack $transport config contains ::1"; fi
-    if [[ "$stack" == ipv4 ]]; then
+    assert_eq 2 "$(grep -c '^bind' "$conf")" "$pair $transport listener count"
+    if grep -Fq '::1' "$conf"; then fail "$pair $transport config contains ::1"; fi
+    if [[ "$NETWORK_STACK" == ipv4 ]]; then
       [[ "$config" == *'force-AAAA-SOA yes'* ]] || fail 'IPv4 DNS leaked IPv6'
     else
-      [[ "$config" == *'force-AAAA-SOA no'* ]] || fail "$stack DNS blocks AAAA"
+      [[ "$config" == *'force-AAAA-SOA no'* ]] || fail "$pair DNS blocks AAAA"
     fi
-    upstreams=$(grep '^server' "$TEST_TMP/$stack-$transport.conf")
+    upstreams=$(grep '^server' "$conf")
     if [[ "$transport" == h2 ]]; then
       expected=$'server-https https://cloudflare-dns.com/dns-query -host-ip 1.1.1.1\nserver-https https://dns.google/dns-query -host-ip 8.8.8.8'
     else
       expected=$'server 1.1.1.1\nserver 8.8.8.8\nserver-tcp 1.1.1.1\nserver-tcp 8.8.8.8'
     fi
-    assert_eq "$expected" "$upstreams" "$stack $transport upstreams"
+    assert_eq "$expected" "$upstreams" "$pair $transport upstreams"
   done
 done
+
+(
+  NETWORK_REQUEST=auto NETWORK_STACK=unknown
+  write_smartdns_config "$TEST_TMP/unknown.conf"
+) >"$TEST_TMP/unknown.log" 2>&1 && fail 'unknown SmartDNS stack accepted'
+grep -Fq '内部错误：写 SmartDNS 配置时网络栈未确定（unknown）。' "$TEST_TMP/unknown.log"
+[[ ! -e "$TEST_TMP/unknown.conf" ]] || fail 'unknown network stack wrote a config'
+
+(
+  dig() {
+    case " $* " in
+      *' TXT '*) echo 'status: NXDOMAIN,' ;;
+      *' AAAA '*) printf '%s\n' "$answer" ;;
+      *) echo 192.0.2.1 ;;
+    esac
+  }
+  ssh_listener_addresses() { echo '0.0.0.0:22'; }
+  verify_ipv4_policy() { :; }
+  ufw() { echo 'Status: active'; }
+  smartdns() { echo fixture; }
+  sing-box() { echo fixture; }
+  sysctl() { echo fixture; }
+  security_updates_enabled() { return 0; }
+  for pair in auto:ipv4 auto:dual ipv4:ipv4 dual:dual; do
+    NETWORK_STACK=${pair#*:}
+    NETWORK_REQUEST=${pair%:*}
+    if [[ "$NETWORK_STACK" == ipv4 ]]; then
+      answer='' wrong_answer=2001:db8::1 mode='A only'
+    else
+      answer=2001:db8::1 wrong_answer='' mode='A + AAAA'
+    fi
+    smartdns_health_check || fail "$pair rejected correct AAAA answer"
+    answer=$wrong_answer
+    if smartdns_health_check; then fail "$pair accepted wrong AAAA answer"; fi
+    print_report >"$TEST_TMP/smartdns-report"
+    grep -Fq "SmartDNS 模式 : $mode /" "$TEST_TMP/smartdns-report" || fail "$pair reported wrong mode"
+  done
+)
 
 # A CNAME alone or a broken TCP listener cannot satisfy the DNS health gate.
 (
   NETWORK_STACK=ipv4
   NETWORK_REQUEST=ipv4
-  dig() {
-    case " $* " in
-      *' TXT '*) echo 'status: NXDOMAIN,' ;;
-      *' AAAA '*) return 0 ;;
-      *) echo 192.0.2.1 ;;
-    esac
-  }
-  smartdns_health_check || fail 'valid IPv4 DNS rejected'
   dig() { if [[ " $* " == *' TXT '* ]]; then echo 'status: SERVFAIL,'; else echo 192.0.2.1; fi; }
   if smartdns_health_check; then fail 'cached addresses passed without an upstream response'; fi
   dig() { if [[ " $* " == *' TXT '* ]]; then echo 'status: NXDOMAIN,'; else echo cname.invalid.; fi; }
@@ -74,16 +105,6 @@ done
     esac
   }
   if smartdns_health_check; then fail 'broken TCP listener accepted'; fi
-  NETWORK_STACK=dual
-  NETWORK_REQUEST=dual
-  dig() {
-    case " $* " in
-      *' TXT '*) echo 'status: NXDOMAIN,' ;;
-      *' AAAA '*) echo 2001:db8::1 ;;
-      *) echo 192.0.2.1 ;;
-    esac
-  }
-  smartdns_health_check || fail 'valid dual DNS rejected'
 )
 
 NETWORK_STACK=unknown
@@ -394,9 +415,8 @@ TEST
 done
 
 (
-  # The default transport and Auto request never depend on host IPv6 state.
-  NETWORK_REQUEST=auto
-  write_smartdns_config "$TEST_TMP/auto-default.conf"
+  # The default transport keeps IPv4 loopback even on a detected dual stack.
+  NETWORK_REQUEST=auto NETWORK_STACK=dual write_smartdns_config "$TEST_TMP/auto-default.conf"
   grep -Fxq 'bind 127.0.0.1:53' "$TEST_TMP/auto-default.conf"
   grep -Fxq 'bind-tcp 127.0.0.1:53' "$TEST_TMP/auto-default.conf"
   grep -Fxq 'force-AAAA-SOA no' "$TEST_TMP/auto-default.conf"
@@ -439,8 +459,14 @@ done
     assert_eq "$expected" "$NETWORK_STACK" 'detected network stack'
     assert_eq "$count" "$(wc -l <"$TRACE" | tr -d ' ')" 'probe count'
     for label in 'Global Address' 'Default Route' 'HTTPS Cloudflare' 'HTTPS Google'; do
-      grep -Eq "IPv6 $label: (PASS|FAIL)" "$output" || fail "missing diagnostic: $label"
+      grep -Eq "^\[INFO\] IPv6 $label: (PASS|FAIL)" "$output" || fail "missing INFO diagnostic: $label"
     done
+    if [[ "$expected" == ipv4 ]]; then
+      grep -Fxq '[INFO] 未检测到可用的 IPv6，按 IPv4-only 处理（正常结果，不是错误）' "$output"
+    elif grep -Fq '按 IPv4-only 处理' "$output"; then
+      fail 'dual probe emitted IPv4-only message'
+    fi
+    if grep -Fq '[WARN]' "$output"; then fail 'normal probe produced a warning'; fi
   }
   # Model a resolver that suppresses AAAA: the fake curl only works with the
   # literal IPv6 mapping, and this path must never make a DNS query.
@@ -1023,26 +1049,18 @@ dig() {
   printf '%s\n' "$*" >>"$d/dig.log"
   case " $* " in
     *' TXT '*) echo 'status: NXDOMAIN,' ;;
-    *' AAAA '*) echo 2001:db8::1 ;;
+    *' AAAA '*) if [[ "$NETWORK_STACK" == dual ]]; then echo 2001:db8::1; fi ;;
     *) echo 192.0.2.1 ;;
   esac
 }
 for request in auto dual ipv4; do
   NETWORK_REQUEST=$request
+  NETWORK_STACK=$request
+  if [[ "$request" == auto ]]; then NETWORK_STACK=dual; fi
   for transport in h2 dns53; do
     : >"$d/systemctl.log"
     : >"$d/dig.log"
     printf 'bind 127.0.0.1:53\nbind [::1]:53\nbind-tcp [::1]:53\n' >"$SMARTDNS_CONF"
-    if [[ "$request" == ipv4 ]]; then
-      dig() {
-        printf '%s\n' "$*" >>"$d/dig.log"
-        case " $* " in
-          *' TXT '*) echo 'status: NXDOMAIN,' ;;
-          *' AAAA '*) : ;;
-          *) echo 192.0.2.1 ;;
-        esac
-      }
-    fi
     smartdns_try_transport "$transport" "$TMP_DIR/staged.conf" || fail "$request $transport rejected a healthy resolver"
     if grep -Fq '::1' "$SMARTDNS_CONF"; then fail "$request $transport kept an old ::1 listener"; fi
     eq 2 "$(grep -c '^bind' "$SMARTDNS_CONF")" "$request $transport listeners"
@@ -1067,7 +1085,7 @@ if smartdns_try_transport h2 "$TMP_DIR/staged.conf"; then fail 'fallback DNS mas
 dig() {
   case " $* " in
     *' TXT '*) echo 'status: NXDOMAIN,' ;;
-    *' AAAA '*) echo 2001:db8::1 ;;
+    *' AAAA '*) return 0 ;;
     *) echo 192.0.2.1 ;;
   esac
 }
@@ -1077,13 +1095,23 @@ configure_smartdns_apt_policy() { :; }
 smartdns() { echo 'smartdns test'; }
 journalctl() { :; }
 id() { echo root; }
+install_component_dependencies() { :; }
+ipv6_global_present() { return 1; }
+ipv6_route_present() { return 1; }
 for mode in quick smartdns; do
   INSTALL_MODE=$mode
   NETWORK_REQUEST=auto
   printf 'bind [::1]:53\n' >"$SMARTDNS_CONF"
-  install_and_configure_smartdns
+  if [[ "$mode" == smartdns ]]; then
+    NETWORK_STACK=unknown
+    run_smartdns_only
+  else
+    NETWORK_STACK=ipv4
+    install_and_configure_smartdns
+  fi
   if grep -Fq '::1' "$SMARTDNS_CONF"; then fail "$mode install kept ::1"; fi
   grep -Fxq 'bind-tcp 127.0.0.1:53' "$SMARTDNS_CONF" || fail "$mode install lacks the IPv4 TCP listener"
+  grep -Fxq 'force-AAAA-SOA yes' "$SMARTDNS_CONF" || fail "$mode install did not suppress AAAA"
 done
 
 # A failure while the DNS transaction is open restores the previous state, including

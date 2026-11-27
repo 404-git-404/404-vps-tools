@@ -924,7 +924,13 @@ root_free_kib() {
 }
 
 format_mib() {
-  awk -v kib="$1" 'BEGIN { value=sprintf("%.10f", kib/1024); sub(/0+$/, "", value); sub(/\.$/, "", value); print value "MiB" }'
+  LC_ALL=C awk -v kib="$1" 'BEGIN {
+    mib=int(kib/1024 + 0.5)
+    if (kib <= 0) print "0 MiB"
+    else if (kib < 512) print "<1 MiB"
+    else if (mib < 1024) printf "%.0f MiB\n", mib
+    else printf "%.1f GiB\n", int(kib*10/1048576 + 0.5)/10
+  }'
 }
 
 check_root_space() {
@@ -1675,10 +1681,10 @@ ipv6_https_probe() {
       log "IPv6 HTTPS $provider: PASS (HTTP $result)"
       return 0
     fi
-    warn "IPv6 HTTPS $provider: FAIL (no HTTP response: $result)"
+    log "IPv6 HTTPS $provider: FAIL (no HTTP response: $result)"
   else
     rc=$?
-    warn "IPv6 HTTPS $provider: FAIL (curl $rc: $result)"
+    log "IPv6 HTTPS $provider: FAIL (curl $rc: $result)"
   fi
   return 1
 }
@@ -1697,19 +1703,22 @@ detect_ipv6_stack() {
     address=true
     log 'IPv6 Global Address: PASS'
   else
-    warn "IPv6 Global Address: FAIL (${detail:-no usable global unicast address})"
+    log "IPv6 Global Address: FAIL (${detail:-no usable global unicast address})"
   fi
   if detail=$(ipv6_route_present 2>&1); then
     route=true
     log 'IPv6 Default Route: PASS'
   else
-    warn "IPv6 Default Route: FAIL (${detail:-no usable default route})"
+    log "IPv6 Default Route: FAIL (${detail:-no usable default route})"
   fi
   if [[ "$address" == true && "$route" == true ]]; then
     if ipv6_https_works; then NETWORK_STACK=dual; fi
   else
-    warn 'IPv6 HTTPS Cloudflare: FAIL (skipped: address or default route unavailable)'
-    warn 'IPv6 HTTPS Google: FAIL (skipped: address or default route unavailable)'
+    log 'IPv6 HTTPS Cloudflare: FAIL (skipped: address or default route unavailable)'
+    log 'IPv6 HTTPS Google: FAIL (skipped: address or default route unavailable)'
+  fi
+  if [[ "$NETWORK_STACK" == ipv4 ]]; then
+    log '未检测到可用的 IPv6，按 IPv4-only 处理（正常结果，不是错误）'
   fi
 }
 
@@ -2426,6 +2435,15 @@ EOF
   log "TCP 实际拥塞算法：$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo unavailable) / 默认 qdisc：$(sysctl -n net.core.default_qdisc 2>/dev/null || echo unavailable)"
 }
 
+sagernet_repo_source() {
+  printf '%s\n' 'Types: deb
+URIs: https://deb.sagernet.org/
+Suites: *
+Components: *
+Enabled: yes
+Signed-By: /etc/apt/keyrings/sagernet.gpg'
+}
+
 configure_sagernet_repo() {
   CURRENT_STEP='配置 SagerNet 仓库'
   local key="$TMP_DIR/sagernet.asc" gh="$TMP_DIR/gnupg" primary='' pub_count=0
@@ -2443,14 +2461,7 @@ configure_sagernet_repo() {
   make_mutable /etc/apt/sources.list.d/sagernet.sources
   gpg --batch --homedir "$gh" --export "$SAGER_KEY_FINGERPRINT" >"$TMP_DIR/sagernet.gpg"
   install -m 0644 "$TMP_DIR/sagernet.gpg" /etc/apt/keyrings/sagernet.gpg
-  cat >/etc/apt/sources.list.d/sagernet.sources <<'EOF'
-Types: deb
-URIs: https://deb.sagernet.org/
-Suites: *
-Components: *
-Enabled: yes
-Signed-By: /etc/apt/keyrings/sagernet.gpg
-EOF
+  sagernet_repo_source >/etc/apt/sources.list.d/sagernet.sources
 }
 
 # Any *.json counts: the stock unit starts "-C /etc/sing-box", which merges every file in it.
@@ -2871,19 +2882,17 @@ upgrade_sing_box() {
     alerts+=('sing-box 服务已中断，当前未运行')
   fi
 
-  cat <<EOF
-============================================================
-sing-box 安装/升级报告
-版本：${old_ver:-未安装} → ${final_ver:-未安装}
-hold：$hold_note
-配置检查：$check_note
-软件包自行重启服务：$pkg_note
-已重启：$restart_note
-已降级：$downgrade_note
-服务状态：$(systemctl is-active sing-box.service 2>/dev/null || true)
-开机自启：$(systemctl is-enabled sing-box.service 2>/dev/null || true)
-============================================================
-EOF
+  ui_use_target out
+  ui_box_top 'sing-box 安装/升级报告'
+  ui_box_line "版本：${old_ver:-未安装} → ${final_ver:-未安装}"
+  ui_box_line "hold：$hold_note"
+  ui_box_line "配置检查：$check_note"
+  ui_box_line "软件包自行重启服务：$pkg_note"
+  ui_box_line "已重启：$restart_note"
+  ui_box_line "已降级：$downgrade_note"
+  ui_box_line "服务状态：$(systemctl is-active sing-box.service 2>/dev/null || true)"
+  ui_box_line "开机自启：$(systemctl is-enabled sing-box.service 2>/dev/null || true)"
+  ui_box_bottom
   for a in "${alerts[@]}"; do warn "!!! $a !!!"; done
   (( ${#alerts[@]} == 0 )) || die 'sing-box 升级未能恢复到可用状态，见上方告警。'
 }
@@ -2950,9 +2959,13 @@ backup_dns_state() {
 }
 
 write_smartdns_config() {
-  local out=$1 transport=${2:-h2} aaaa_soa=no
+  local out=$1 transport=${2:-h2} aaaa_soa
+  case "$NETWORK_STACK" in
+    ipv4) aaaa_soa=yes ;;
+    dual) aaaa_soa=no ;;
+    *) die "内部错误：写 SmartDNS 配置时网络栈未确定（$NETWORK_STACK）。" ;;
+  esac
   # Listen on IPv4 loopback only: it exists regardless of any later disable_ipv6 policy.
-  if [[ "$NETWORK_REQUEST" == ipv4 ]]; then aaaa_soa=yes; fi
   {
     cat <<EOF
 bind 127.0.0.1:53
@@ -3021,7 +3034,7 @@ smartdns_health_check() {
   grep -Eq '^([0-9]{1,3}\.){3}[0-9]{1,3}$' <<<"$a" || return 1
 
   aaaa=$(dig @127.0.0.1 google.com AAAA +short +time=6 +tries=2 2>/dev/null || true)
-  if [[ "$NETWORK_REQUEST" == ipv4 ]]; then
+  if [[ "$NETWORK_STACK" == ipv4 ]]; then
     [[ -z "$aaaa" ]]
   else
     grep -Eq '^[0-9a-fA-F:]*:[0-9a-fA-F:]+$' <<<"$aaaa"
@@ -4174,22 +4187,65 @@ audit_unit_fragment() {
   printf '%s\n' "$path"
 }
 
+audit_apt_policy() {
+  LC_ALL=C apt-cache -o Dir::Cache::pkgcache= -o Dir::Cache::srcpkgcache= policy "$@" 2>/dev/null
+}
+
+audit_apt_version_sources() {
+  printf '%s\n' "$2" | awk -v version="$1" '
+    /^[ ]*Version table:[ ]*$/ { in_table=1; selected=0; next }
+    !in_table { next }
+    /^ \*\*\* / || /^     [^[:space:]]/ {
+      current=($1 == "***" ? $2 : $1)
+      selected=((current "") == (version ""))
+      next
+    }
+    /^       [ ]*-?[0-9]+([[:space:]]|$)/ { if (selected) print; next }
+    { selected=0 }
+  '
+}
+
 audit_debian_package() {
   # Require the *installed version* to have an official origin in the local APT cache.
   # No network access. Unknown/obsolete versions are intentionally reported for review.
   local version policy sources
   version=$(dpkg-query -W -f='${Version}' -- "$1" 2>/dev/null) || return 1
-  policy=$(apt-cache policy -- "$1" 2>/dev/null) || return 1
+  [[ -n "$version" ]] || return 1
+  policy=$(audit_apt_policy -- "$1") || return 1
   sources=$(awk '
     /^[ ]*[0-9]+ / {source=$0; sub(/^[ ]*[0-9]+ /,"",source)}
     /release / && /(^|[, ])o=Debian([, ]|$)/ {print source}
   ' <<<"$AUDIT_APT_SOURCES")
-  awk -v version="$version" -v sources="$sources" '
+  audit_apt_version_sources "$version" "$policy" | awk -v sources="$sources" '
     BEGIN {n=split(sources,s,"\n"); for(i=1;i<=n;i++) official[s[i]]=1}
-    $1=="***" {v=$2; next}
-    NF==2 && $2 ~ /^[0-9]+$/ {v=$1; next}
-    v==version && $1 ~ /^[0-9]+$/ {line=$0; sub(/^[ ]*[0-9]+ /,"",line); if(official[line]) ok=1}
-    END {exit !ok}' <<<"$policy"
+    {sub(/^[ ]*-?[0-9]+[ ]+/,""); if(official[$0]) ok=1}
+    END {exit !ok}'
+}
+
+audit_singbox_sagernet_origin() {
+  local version policy
+  version=$(dpkg-query -W -f='${Version}' -- sing-box 2>/dev/null) || return 1
+  [[ -n "$version" ]] || return 1
+  policy=$(audit_apt_policy -- sing-box) || return 1
+  audit_apt_version_sources "$version" "$policy" | awk '
+    $2 ~ /^https:\/\/deb\.sagernet\.org\/?$/ { found=1 }
+    END { exit !found }
+  '
+}
+
+audit_sagernet_repo_matches() {
+  local source="$AUDIT_ROOT/etc/apt/sources.list.d/sagernet.sources"
+  local key="$AUDIT_ROOT/etc/apt/keyrings/sagernet.gpg"
+  local file status
+  [[ -f "$source" && ! -L "$source" && -f "$key" && ! -L "$key" && -s "$key" ]] &&
+    cmp -s -- "$source" <(sagernet_repo_source) || return 1
+  for file in "$AUDIT_ROOT/etc/apt/sources.list" \
+    "$AUDIT_ROOT/etc/apt/sources.list.d/"*.list "$AUDIT_ROOT/etc/apt/sources.list.d/"*.sources; do
+    [[ "$file" != "$source" && -f "$file" ]] || continue
+    status=0
+    LC_ALL=C grep -Fqi -- sagernet.org "$file" 2>/dev/null || status=$?
+    [[ "$status" == 1 ]] || return 1
+  done
 }
 
 audit_session_key() {
@@ -4434,7 +4490,7 @@ audit_agents() {
 collect_security_audit() {
   AUDIT_FINDINGS=()
   AUDIT_SESSION_KEY=$(audit_session_key) || AUDIT_SESSION_KEY=''
-  AUDIT_APT_SOURCES=$(apt-cache policy 2>/dev/null || true)
+  AUDIT_APT_SOURCES=$(audit_apt_policy || true)
   local file package status unit path uid user effective command keys listener pid exe cloud_detail exim4_found=false key_ok=true key_path
   local -a key_paths=()
   audit_keys
@@ -4453,7 +4509,13 @@ collect_security_audit() {
   while IFS=$'\t' read -r package status; do
     [[ "$status" == installed ]] || continue
     case "${package%%:*}" in exim4|exim4-*) exim4_found=true ;; esac
-    if ! audit_debian_package "$package"; then audit_add B package "$package" '本地缓存不能证明已安装版本来自 Debian 官方源（包括缓存缺失或旧版本），请核实'; fi
+    if audit_debian_package "$package"; then continue; fi
+    if [[ "$package" == sing-box ]] && audit_singbox_sagernet_origin; then
+      if audit_sagernet_repo_matches; then continue; fi
+      audit_add B package "$package" 'sing-box 来自 deb.sagernet.org，但源配置或密钥文件不是本工具写入的版本，请核实'
+    else
+      audit_add B package "$package" '本地缓存不能证明已安装版本来自 Debian 官方源（包括缓存缺失或旧版本），请核实'
+    fi
   done < <(dpkg-query -W -f='${binary:Package}\t${db:Status-Status}\n' 2>/dev/null || true)
   if [[ "$exim4_found" == true ]]; then
     audit_add A mail exim4 'Debian 邮件服务，VPS 上一般用不上；卸载后 cron 任务的输出邮件将无法投递。先模拟 purge，连带删除其他包时还需额外确认'
@@ -4872,7 +4934,7 @@ print_report() {
   if [[ "$ufw_status" != 'Status: active' ]]; then ufw_warn=true; fi
   smartdns_ver=$(smartdns -v 2>/dev/null | head -1 || echo unavailable)
   if [[ "$smartdns_ver" == unavailable ]]; then smartdns_warn=true; fi
-  smartdns_mode="$([[ "$NETWORK_REQUEST" == ipv4 ]] && echo 'A only' || echo 'A + AAAA') / $SMARTDNS_TRANSPORT"
+  smartdns_mode="$([[ "$NETWORK_STACK" == ipv4 ]] && echo 'A only' || echo 'A + AAAA') / $SMARTDNS_TRANSPORT"
   singbox_ver=$(sing-box version 2>/dev/null | head -1 || echo unavailable)
   if [[ "$singbox_ver" == unavailable ]]; then singbox_warn=true; fi
   if [[ "$fail2ban_status" == *未安装* ]]; then fail2ban_warn=true; fi
@@ -5324,7 +5386,14 @@ cleanup_grub_kernel() {
     /^[[:space:]]*($|#)/ { next }
     /^GRUB_DEFAULT=(0|"0"|\0470\047)[[:space:]]*$/ { defaults++; next }
     /^GRUB_[A-Z0-9_]+=/ && !/^GRUB_DEFAULT=/ && !/[`$;&|]/ { next }
-    { unsafe=1 }
+    {
+      distributor=$0
+      sub(/^[[:space:]]+/, "", distributor)
+      sub(/[[:space:]]+$/, "", distributor)
+      if (distributor == "GRUB_DISTRIBUTOR=`( . /etc/os-release && echo ${NAME} )`" ||
+          distributor == "GRUB_DISTRIBUTOR=`lsb_release -i -s 2> /dev/null || echo Debian`") next
+      unsafe=1
+    }
     END { exit (unsafe || defaults > 1) }
   ' /etc/default/grub || return 1
   grub-script-check "$boot/grub/grub.cfg" >/dev/null || return 1
@@ -5354,13 +5423,44 @@ cleanup_grub_kernel() {
 
 cleanup_parse_grub() {
   awk '
-    /^### BEGIN .*\/10_linux ###$/ { standard=1; next }
-    /^### END .*\/10_linux ###$/ { standard=0 }
+    /^### BEGIN([[:space:]]|$)/ {
+      if (section_end != "") { unsafe=1; next }
+      if ($0 ~ /^### BEGIN .*\/10_linux ###$/) {
+        standard=1
+        linux_done=0
+      } else if ($0 ~ /^### BEGIN \/etc\/grub\.d\/30_uefi-firmware ###$/) {
+        if (!linux_done) unsafe=1
+        firmware=1
+      }
+      if (standard || firmware) {
+        section_end=$0
+        sub(/^### BEGIN /, "### END ", section_end)
+      }
+      next
+    }
+    /^### END([[:space:]]|$)/ {
+      if (section_end != "") {
+        if ($0 != section_end) { unsafe=1; next }
+        if (standard) linux_done=1
+        section_end=""
+        standard=firmware=0
+      } else if ($0 ~ /^### END .*\/10_linux ###$/ ||
+                 $0 ~ /^### END \/etc\/grub\.d\/30_uefi-firmware ###$/) {
+        unsafe=1
+      }
+      next
+    }
     /^[[:space:]]*source[[:space:]]/ && $0 !~ /^[[:space:]]*source[[:space:]]+\$\{?(prefix|config_directory)\}?\/custom\.cfg[[:space:]]*$/ { unsafe=1 }
     /^[[:space:]]*(configfile|chainloader|blscfg)([[:space:]]|$)/ { unsafe=1 }
     /^[[:space:]]*set default=/ && $0 !~ /^[[:space:]]*set default="(0|\$\{next_entry\})"[[:space:]]*$/ { unsafe=1 }
     /^[[:space:]]*set default="0"[[:space:]]*$/ { fallback=1 }
+    /^[[:space:]]*(linux|linux16|linuxefi|initrd|initrd16|initrdefi)([[:space:]]|$)/ && firmware { unsafe=1 }
     /^[[:space:]]*(menuentry|submenu)[[:space:]]/ {
+      if (firmware) {
+        if (!entries || $0 !~ /^[[:space:]]*menuentry[[:space:]]+\047UEFI Firmware Settings\047([[:space:]]|$)/ ||
+            ++firmware_entries > 1) unsafe=1
+        next
+      }
       if (!standard || (!entries && $1 != "menuentry")) unsafe=1
       entries++
     }
@@ -5368,7 +5468,7 @@ cleanup_parse_grub() {
       if ($2 !~ /^\/(boot\/)?vmlinuz-[a-zA-Z0-9.+~-]+$/ || kernel != "") unsafe=1
       kernel=$2; sub(/^.*\/vmlinuz-/, "", kernel)
     }
-    END { if (unsafe || !fallback || kernel == "") exit 1; print kernel }
+    END { if (unsafe || section_end != "" || !fallback || kernel == "") exit 1; print kernel }
   ' "$1"
 }
 
@@ -5423,7 +5523,7 @@ cleanup_old_kernels() {
   command -v apt-get >/dev/null && command -v dpkg >/dev/null && command -v dpkg-query >/dev/null || return 0
   audit=$(dpkg --audit) && [[ -z "$audit" ]] || { CLEANUP_RESULT='跳过（dpkg 状态异常）'; return; }
   candidates=$(cleanup_old_kernel_candidates) || return 0
-  if [[ -z "$candidates" ]]; then CLEANUP_RESULT='无安全候选'; return; fi
+  if [[ -z "$candidates" ]]; then CLEANUP_RESULT='无需清理（仅保留当前、默认与备用内核）'; return; fi
   mapfile -t packages <<<"$candidates"
   CLEANUP_RESULT='跳过（内核删除计划涉及额外操作或无法预览）'
   plan=$(apt-get -s remove -- "${packages[@]}") && actual=$(cleanup_apt_plan "$plan") || return 0
@@ -5465,11 +5565,13 @@ run_safe_cleanup() {
 
 run_system_cleanup() {
   CURRENT_STEP='系统清理'
-  local before after total used orphans kernels swaps=''
+  local before after total used orphans kernels gained swaps=''
+  local before_display after_display='' space_status enough_space=false
   local CLEANUP_RESULT
   before=$(root_free_kib) || die '无法读取清理前的根分区空间。'
   IFS=' ' read -r total used < <(df -Pk / | awk 'NR == 2 { print $2, $3 }') || die '无法读取根分区容量。'
-  printf '磁盘总容量：%s\n已用空间：%s\n可用空间：%s\n' "$(format_mib "$total")" "$(format_mib "$used")" "$(format_mib "$before")"
+  before_display=$(format_mib "$before")
+  printf '磁盘总容量：%s\n已用空间：%s\n可用空间：%s\n' "$(format_mib "$total")" "$(format_mib "$used")" "$before_display"
   if command -v swapon >/dev/null && swaps=$(swapon --show=NAME,SIZE --bytes); then
     printf '活动 Swap（容量以字节显示）\n%s\n' "${swaps:-无}"
   else
@@ -5483,19 +5585,47 @@ run_system_cleanup() {
   else
     orphans='跳过（无交互终端）'; kernels=$orphans
   fi
-  printf '\nVPS 系统清理完成\n系统：Debian %s\n清理前可用：%s\n' "$VERSION_ID" "$(format_mib "$before")"
   if after=$(root_free_kib); then
-    printf '清理后可用：%s\n实际增加可用空间：%s\n' "$(format_mib "$after")" "$(format_mib "$((after - before))")"
-    if (( after >= MIN_ROOT_FREE_KIB )); then
-      printf '安装所需 2GiB 空间：PASS\n'
+    after_display=$(format_mib "$after")
+    if (( after > before )); then
+      gained=$(format_mib "$((after - before))")
+    elif (( after == before )); then
+      gained='0 MiB'
     else
-      printf '安装所需 2GiB 空间：FAIL，还需释放 %s\n' "$(format_mib "$((MIN_ROOT_FREE_KIB - after))")"
+      gained='约 0（清理期间有其他写入）'
+    fi
+    if (( after >= MIN_ROOT_FREE_KIB )); then
+      enough_space=true
+      space_status='PASS'
+    else
+      space_status="FAIL，还需释放 $(format_mib "$((MIN_ROOT_FREE_KIB - after))")"
+    fi
+  fi
+
+  printf '\n'
+  ui_use_target out
+  ui_box_top '系统清理报告'
+  ui_box_line "系统：Debian $VERSION_ID"
+  ui_box_line "清理前可用：$before_display"
+  if [[ -n "$after_display" ]]; then
+    ui_box_line "清理后可用：$after_display"
+    ui_box_line "实际增加可用空间：$gained"
+    if [[ "$enough_space" == true ]]; then
+      ui_box_line_color "$C_GREEN" "安装所需 2GiB 空间：$space_status"
+    else
+      ui_box_line_color "$C_RED" "安装所需 2GiB 空间：$space_status"
     fi
   else
-    warn '无法读取清理后的根分区空间。'
+    ui_box_line_color "$C_YELLOW" '清理后可用：读取失败'
   fi
-  printf 'APT 缓存：%s\nJournal：%s\n临时文件：%s\n无用软件包：%s\n旧内核：%s\nSwap：未修改\n' \
-    "$SAFE_CLEANUP_APT" "$SAFE_CLEANUP_JOURNAL" "$SAFE_CLEANUP_TMPFILES" "$orphans" "$kernels"
+  ui_box_line "APT 缓存：$SAFE_CLEANUP_APT"
+  ui_box_line "Journal：$SAFE_CLEANUP_JOURNAL"
+  ui_box_line "临时文件：$SAFE_CLEANUP_TMPFILES"
+  ui_box_line "无用软件包：$orphans"
+  ui_box_line "旧内核：$kernels"
+  ui_box_line 'Swap：未修改'
+  ui_box_bottom
+  if [[ -z "$after_display" ]]; then warn '无法读取清理后的根分区空间。'; fi
 }
 
 # ==============================================================================
