@@ -4525,7 +4525,7 @@ audit_type_help() {
 }
 
 print_security_audit() {
-  local mode=${1:-summary} level title level_color row count type target detail seen label help
+  local mode=${1:-summary} level title desc level_color row count type target detail seen label help
   ui_use_target out
   printf '\n'
   ui_box_top '安全体检报告'
@@ -4533,18 +4533,22 @@ print_security_audit() {
     if [[ "$level" != A ]]; then ui_box_sep; fi
     case "$level" in
       A)
-        title='A 建议删除：这些是登录钥匙或商家助手；确认不需要再处理，默认保留。'
+        title='A 建议删除'
+        desc='这些是登录钥匙或商家助手；确认不需要再处理，默认保留。'
         level_color="$C_YELLOW" ;;
       B)
-        title='B 需要你看一眼：这些有额外权限或后台行为；可能是你装的，只报告。'
+        title='B 需要你看一眼'
+        desc='这些有额外权限或后台行为；可能是你装的，只报告。'
         level_color="$C_CYAN" ;;
       C)
-        title='C 严重异常：这些会改变系统或登录信任；只报告，建议用官方系统重装。'
+        title='C 严重异常'
+        desc='这些会改变系统或登录信任；只报告，建议用官方系统重装。'
         level_color="${C_BOLD}${C_RED}" ;;
     esac
     count=0
     for row in "${AUDIT_FINDINGS[@]}"; do [[ "$row" != "$level"$'\t'* ]] || count=$((count + 1)); done
-    ui_box_line_color "$level_color" "[${title}]（${count} 项）"
+    ui_box_line_color "$level_color" "${title}（${count} 项）"
+    ui_box_line_color "$C_DIM" "  ${desc}"
     if [[ "$mode" == full ]]; then
       seen=$'\n'
       for row in "${AUDIT_FINDINGS[@]}"; do
@@ -4810,13 +4814,15 @@ run_security_hardening() {
           HARDENING_ACTIONS+=("已 purge exim4 邮件服务；cron 输出邮件将无法投递；恢复：apt-get install exim4；配置备份：$BACKUP_DIR/files/etc/exim4")
         fi ;;
     esac
-  done > >(tee "$BACKUP_DIR/actions.txt") 2>&1
+  done
   if (( ${#HARDENING_ACTIONS[@]} == 0 )); then
     rm -rf -- "$BACKUP_DIR"
     log '没有执行任何修改，已删除未使用的备份目录。'
     BACKUP_DIR=''
     return 0
   fi
+  install -m 0600 /dev/null "$BACKUP_DIR/actions.txt"
+  printf -- '- %s\n' "${HARDENING_ACTIONS[@]}" >"$BACKUP_DIR/actions.txt"
   collect_security_audit
   print_security_audit full >"$BACKUP_DIR/audit-after.txt"
   print_security_audit full

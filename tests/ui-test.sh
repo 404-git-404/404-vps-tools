@@ -66,6 +66,14 @@ if has_escape "$work/non-tty.out"; then fail 'non-TTY stdout contained ANSI esca
 if has_escape "$work/non-tty.err"; then fail 'non-TTY stderr contained ANSI escapes'; fi
 grep -Fxq '[INFO] info line' "$work/non-tty.out" || fail 'log prefix broken on non-TTY'
 grep -Fxq '[WARN] warn line' "$work/non-tty.err" || fail 'warn prefix broken on non-TTY'
+# Audit headings: a title row with the count, then an indented description row (no brackets, no colon).
+grep -Eq '^│ A 建议删除（1 项） +│$' "$work/non-tty.out" || fail 'A audit heading row wrong'
+grep -Eq '^│   这些是登录钥匙或商家助手；确认不需要再处理，默认保留。 +│$' "$work/non-tty.out" || fail 'A audit description row wrong'
+grep -Eq '^│ B 需要你看一眼（1 项） +│$' "$work/non-tty.out" || fail 'B audit heading row wrong'
+grep -Eq '^│   这些有额外权限或后台行为；可能是你装的，只报告。 +│$' "$work/non-tty.out" || fail 'B audit description row wrong'
+grep -Eq '^│ C 严重异常（1 项） +│$' "$work/non-tty.out" || fail 'C audit heading row wrong'
+grep -Eq '^│   这些会改变系统或登录信任；只报告，建议用官方系统重装。 +│$' "$work/non-tty.out" || fail 'C audit description row wrong'
+if grep -Fq '[A 建议删除' "$work/non-tty.out"; then fail 'audit heading still has brackets'; fi
 
 # die on non-TTY stderr must start with [ERROR] and emit no escapes.
 set +e
@@ -270,6 +278,14 @@ PROBE
       [[ "$ufw_row" == *$'\033[33m'* ]] || fail "UFW row not yellow for [$ufw_out]"
     fi
   done
+
+  # In a PTY the audit heading keeps its level color and the description row is dim.
+  env -u NO_COLOR TERM=xterm-256color script -qec \
+    "bash -c 'source \"$repo/debian-init.sh\"; AUDIT_FINDINGS=(); AUDIT_SESSION_KEY=x; print_security_audit full'" \
+    /dev/null >"$work/pty-audit.out"
+  tr -d '\r' <"$work/pty-audit.out" >"$work/pty-audit.txt"
+  grep -F 'A 建议删除（0 项）' "$work/pty-audit.txt" | grep -Fq $'\033[33mA 建议删除' || fail 'A heading lost its yellow'
+  grep -F '这些是登录钥匙或商家助手' "$work/pty-audit.txt" | grep -Fq $'\033[2m' || fail 'audit description is not dim'
 
   # Redirecting print_security_audit to a file from inside a PTY must emit zero \033 escapes.
   env -u NO_COLOR TERM=xterm-256color script -qec \
