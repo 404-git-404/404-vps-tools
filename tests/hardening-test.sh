@@ -477,7 +477,7 @@ snapshot() { find "$root" -printf '%P %y %m %U %G %s %T@ %l\n'; find "$root" -ty
   }
   apt-cache() {
     if [[ "$*" == *'sing-box' ]]; then
-      printf '  Version table:\n     2.0 500\n        500 https://deb.sagernet.org/ * Packages\n *** 1.0 100\n        100 /var/lib/dpkg/status\n'
+      printf '  Version table:\n     1e0 500\n        500 https://deb.sagernet.org/ * Packages\n *** 1.0 100\n        100 /var/lib/dpkg/status\n'
       if [[ -n "$installed_origin" ]]; then printf '        500 %s * Packages\n' "$installed_origin"; fi
     else
       fixture_apt-cache "$@"

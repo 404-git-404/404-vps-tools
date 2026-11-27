@@ -4199,7 +4199,7 @@ audit_singbox_sagernet_origin() {
   printf '%s\n' "$policy" | awk -v version="$version" '
     $1 == "***" { v=$2; next }
     NF == 2 && $2 ~ /^-?[0-9]+$/ { v=$1; next }
-    v == version && $1 ~ /^-?[0-9]+$/ && $2 ~ /^https:\/\/deb\.sagernet\.org\/?$/ { found=1 }
+    (v "") == (version "") && $1 ~ /^-?[0-9]+$/ && $2 ~ /^https:\/\/deb\.sagernet\.org\/?$/ { found=1 }
     END { exit !found }
   '
 }
