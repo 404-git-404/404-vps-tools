@@ -416,8 +416,7 @@ done
 
 (
   # The default transport keeps IPv4 loopback even on a detected dual stack.
-  NETWORK_REQUEST=auto NETWORK_STACK=dual
-  write_smartdns_config "$TEST_TMP/auto-default.conf"
+  NETWORK_REQUEST=auto NETWORK_STACK=dual write_smartdns_config "$TEST_TMP/auto-default.conf"
   grep -Fxq 'bind 127.0.0.1:53' "$TEST_TMP/auto-default.conf"
   grep -Fxq 'bind-tcp 127.0.0.1:53' "$TEST_TMP/auto-default.conf"
   grep -Fxq 'force-AAAA-SOA no' "$TEST_TMP/auto-default.conf"
