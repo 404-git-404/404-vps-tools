@@ -6,7 +6,7 @@ umask 077
 export PATH='/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
 
 SCRIPT_NAME='alpine-init.sh'
-SCRIPT_VERSION='0.1.0'
+SCRIPT_VERSION='0.2.0'
 TARGET_ALPINE_MINOR=24
 TARGET_ALPINE_BRANCH='v3.24'
 ALPINE_MIRROR='https://dl-cdn.alpinelinux.org/alpine'
