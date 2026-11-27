@@ -5412,16 +5412,45 @@ cleanup_grub_kernel() {
 
 cleanup_parse_grub() {
   awk '
-    /^### (BEGIN|END) / { firmware=0 }
-    /^### BEGIN .*\/10_linux ###$/ { standard=1; linux_done=0; next }
-    /^### END .*\/10_linux ###$/ { linux_done=standard; standard=0 }
-    /^### BEGIN \/etc\/grub.d\/30_uefi-firmware ###$/ { firmware=linux_done }
+    /^### BEGIN([[:space:]]|$)/ {
+      if (section_end != "") { unsafe=1; next }
+      if ($0 ~ /^### BEGIN .*\/10_linux ###$/) {
+        standard=1
+        linux_done=0
+      } else if ($0 ~ /^### BEGIN \/etc\/grub\.d\/30_uefi-firmware ###$/) {
+        if (!linux_done) unsafe=1
+        firmware=1
+        firmware_entries=0
+      }
+      if (standard || firmware) {
+        section_end=$0
+        sub(/^### BEGIN /, "### END ", section_end)
+      }
+      next
+    }
+    /^### END([[:space:]]|$)/ {
+      if (section_end != "") {
+        if ($0 != section_end) { unsafe=1; next }
+        if (standard) linux_done=1
+        section_end=""
+        standard=firmware=0
+      } else if ($0 ~ /^### END .*\/10_linux ###$/ ||
+                 $0 ~ /^### END \/etc\/grub\.d\/30_uefi-firmware ###$/) {
+        unsafe=1
+      }
+      next
+    }
     /^[[:space:]]*source[[:space:]]/ && $0 !~ /^[[:space:]]*source[[:space:]]+\$\{?(prefix|config_directory)\}?\/custom\.cfg[[:space:]]*$/ { unsafe=1 }
     /^[[:space:]]*(configfile|chainloader|blscfg)([[:space:]]|$)/ { unsafe=1 }
     /^[[:space:]]*set default=/ && $0 !~ /^[[:space:]]*set default="(0|\$\{next_entry\})"[[:space:]]*$/ { unsafe=1 }
     /^[[:space:]]*set default="0"[[:space:]]*$/ { fallback=1 }
+    /^[[:space:]]*(linux|linux16|linuxefi|initrd|initrd16|initrdefi)([[:space:]]|$)/ && firmware { unsafe=1 }
     /^[[:space:]]*(menuentry|submenu)[[:space:]]/ {
-      if (!standard && firmware && entries && $1 == "menuentry") next
+      if (firmware) {
+        if (!entries || $0 !~ /^[[:space:]]*menuentry[[:space:]]+\047UEFI Firmware Settings\047([[:space:]]|$)/ ||
+            ++firmware_entries > 1) unsafe=1
+        next
+      }
       if (!standard || (!entries && $1 != "menuentry")) unsafe=1
       entries++
     }
@@ -5429,7 +5458,7 @@ cleanup_parse_grub() {
       if ($2 !~ /^\/(boot\/)?vmlinuz-[a-zA-Z0-9.+~-]+$/ || kernel != "") unsafe=1
       kernel=$2; sub(/^.*\/vmlinuz-/, "", kernel)
     }
-    END { if (unsafe || !fallback || kernel == "") exit 1; print kernel }
+    END { if (unsafe || section_end != "" || !fallback || kernel == "") exit 1; print kernel }
   ' "$1"
 }
 

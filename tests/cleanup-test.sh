@@ -135,6 +135,25 @@ GRUB
     cat "$root/grub.cfg.orig"
   } >"$boot/grub/grub.cfg"
   if cleanup_old_kernel_candidates; then fail 'accepted firmware entry before 10_linux'; fi
+
+  expect_unsafe_grub() {
+    local scenario=$1 edit=$2
+    sed "$edit" "$root/grub.cfg.orig" >"$boot/grub/grub.cfg"
+    cleanup_old_kernels
+    [[ "$CLEANUP_RESULT" == '跳过（无法可靠确认当前、默认或备用内核）' ]] || fail "accepted $scenario"
+  }
+  expect_unsafe_grub 'firmware submenu' "/UEFI Firmware Settings/s/menuentry/submenu/"
+  expect_unsafe_grub 'empty 10_linux' '/^### BEGIN .*\/10_linux ###$/,/^### END .*\/10_linux ###$/ { /^### /!d; }'
+  expect_unsafe_grub 'missing firmware END before another section' '/^### END .*\/30_uefi-firmware ###$/d'
+  expect_unsafe_grub 'missing firmware END at EOF' '/^### END .*\/30_uefi-firmware ###$/,$d'
+  expect_unsafe_grub 'mismatched firmware END' 's|^### END /etc/grub\.d/30_uefi-firmware ###$|### END /etc/grub.d/30_other ###|'
+  expect_unsafe_grub 'two firmware entries' "/menuentry 'UEFI Firmware Settings'/i\\    menuentry 'UEFI Firmware Settings' { fwsetup; }"
+  for directive in linux linux16 linuxefi initrd initrd16 initrdefi; do
+    expect_unsafe_grub "$directive in firmware" "/^[[:space:]]*fwsetup$/i\\    $directive /boot/fixture"
+  done
+  expect_unsafe_grub 'different firmware title' 's/UEFI Firmware Settings/Custom Firmware Settings/'
+  expect_unsafe_grub 'wrong firmware directory marker' '/30_uefi-firmware/s/grub\.d/grubXd/'
+  expect_unsafe_grub 'missing 10_linux END' '/^### END .*\/10_linux ###$/d'
 TEST
 )
 
