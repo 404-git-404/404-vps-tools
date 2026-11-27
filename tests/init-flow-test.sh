@@ -228,9 +228,42 @@ if (
   SSH_LISTENERS_CONFIRMED=true SSH_CONFIRMED_LISTENERS='0.0.0.0:22'
   configure_ssh
 ); then fail 'accepted listeners changed after confirmation'; fi
-# Enter at the split-listener prompt must mean "no" (default N), not override the listeners.
+# Enter at the split-listener prompt has no default: it asks again, and only n cancels.
 # shellcheck disable=SC2016 # Evaluated inside the isolated fixture.
-expect_bash_failure '已取消 SSH 切换' 'ssh_listener_addresses() { printf "0.0.0.0:22\n[::]:2222\n"; }; read_tty() { printf -v "$2" ""; }; confirm_ssh_listener_change'
+expect_bash_failure '已取消 SSH 切换' 'ssh_listener_addresses() { printf "0.0.0.0:22\n[::]:2222\n"; }; asks=0; read_tty() { [[ "$1" == *" [y/n] " ]] || fail "not [y/n]: $1"; asks=$((asks + 1)); if (( asks == 1 )); then printf -v "$2" ""; else grep -Fq "请输入 y 确认，或 n 跳过/取消（Ctrl+C 退出）" "$work/tty" || fail "no re-ask hint"; printf -v "$2" n; fi; }; confirm_ssh_listener_change'
+
+# ask_yes_no default=false: Enter, blanks and other words ask again; y/yes/n/no in any case answer.
+# shellcheck disable=SC2016 # Evaluated inside the isolated fixture.
+yes_no_case() {
+  local expected=$1 replies=$2
+  run_in_bash "
+    replies=($replies) asks=0
+    read_tty() { printf -v \"\$2\" '%s' \"\${replies[asks]}\"; asks=\$((asks + 1)); printf '%s\n' \"\$1\" >>\"\$work/yes-no.prompts\"; }
+    : >\"\$work/yes-no.prompts\"
+    if ask_yes_no '确认删除 fixture？' false; then rc=0; else rc=1; fi
+    [[ \$rc == $expected ]] || fail \"ask_yes_no [$replies] returned \$rc\"
+    [[ \$asks == \${#replies[@]} ]] || fail \"ask_yes_no [$replies] asked \$asks times\"
+    [[ \$(sort -u \"\$work/yes-no.prompts\") == '确认删除 fixture？ [y/n] ' ]] || fail 'prompt text'
+  " || fail "yes/no case [$replies]"
+}
+yes_no_case 1 "'' n"
+yes_no_case 0 "'' y"
+yes_no_case 0 "'   ' maybe ' YES '"
+yes_no_case 1 "'是' 'N '"
+yes_no_case 1 "No"
+# The re-ask hint goes to the terminal after a non-answer.
+: >"$work/tty"
+yes_no_case 1 "'' n"
+grep -Fxq '请输入 y 确认，或 n 跳过/取消（Ctrl+C 退出）' "$work/tty" || fail 'default=false re-ask hint'
+# default=true is unchanged: Enter means yes.
+# shellcheck disable=SC2016 # Evaluated inside the isolated fixture.
+run_in_bash 'read_tty() { [[ "$1" == "保留？ [Y/n] " ]] || fail "prompt: $1"; printf -v "$2" ""; }; ask_yes_no "保留？" true' || fail '[Y/n] Enter is not yes'
+# End of input dies instead of asking forever: the real read_tty reads the (exhausted) terminal file.
+# shellcheck disable=SC2016 # Evaluated inside the isolated fixture.
+expect_bash_failure '读取交互输入失败' ': >"$work/tty"; CONFIG_CONFIRMED=false; ask_yes_no "确认删除 fixture？" false'
+# shellcheck disable=SC2016 # Evaluated inside the isolated fixture.
+expect_bash_failure '需要交互输入，但当前没有可用' 'rm -f -- "$work/tty"; CONFIG_CONFIRMED=false; ask_yes_no "确认删除 fixture？" false'
+: >"$work/tty"
 expect_bash_failure '执行阶段出现未预收集的交互' 'CONFIG_CONFIRMED=true; read_tty unexpected response'
 # shellcheck disable=SC2016 # Evaluated inside the isolated fixture.
 expect_bash_failure '需要交互输入，但当前没有可用' 'rm -f -- "$work/tty"; CONFIG_CONFIRMED=false; ask_yes_no "确认以上配置并开始自动安装？" true'
