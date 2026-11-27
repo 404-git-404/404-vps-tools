@@ -674,10 +674,11 @@ for scenario in family multiarch collateral collateral-cancel cancel absent malf
     BACKUP_DIR="$exim_dir/backup"
     wait_for_package_manager() { :; }
     read_tty() {
-      [[ "$1" == *'[y/N] '* ]] || fail 'Exim confirmation not default N'
+      [[ "$1" == *'[y/n] '* ]] || fail 'Exim confirmation has a default'
       printf '%s\n' "$1" >>"$exim_dir/trace"
+      # A cancelling user first presses Enter (asked again, no default), then answers n.
       if [[ "$scenario" == cancel || ( "$scenario" == collateral-cancel && "$1" == '额外确认：'* ) ]]; then
-        printf -v "$2" ''
+        if [[ "$(grep -Fxc -- "$1" "$exim_dir/trace")" == 1 ]]; then printf -v "$2" ''; else printf -v "$2" n; fi
       else printf -v "$2" y; fi
     }
     apt_get() {

@@ -503,15 +503,17 @@ usage() {
 EOF
 }
 
+# read_tty <prompt> <var> [warn]: a prompt ending in ' [y/n] ', or any prompt with the third
+# argument warn, is shown entirely in bold yellow when the terminal allows color.
 read_tty() {
-  local prompt=$1 var=$2
+  local prompt=$1 var=$2 style=${3:-}
   [[ "$CONFIG_CONFIRMED" == false ]] || die "执行阶段出现未预收集的交互：$prompt"
-  [[ -r /dev/tty && -w /dev/tty ]] || die '需要交互输入，但当前没有可用 /dev/tty。'
+  { : </dev/tty && : >>/dev/tty; } 2>/dev/null || die '需要交互输入，但当前没有可用 /dev/tty。'
   if [[ -n "$C_TTY_BOLD" ]]; then
     if [[ "$prompt" == *' [Y/n] ' ]]; then
       printf '%s%s%s [%sY%s/n] ' "$C_TTY_BOLD" "${prompt%' [Y/n] '}" "$C_TTY_RESET" "${C_TTY_BOLD}${C_TTY_CYAN}" "$C_TTY_RESET" >/dev/tty
-    elif [[ "$prompt" == *' [y/N] ' ]]; then
-      printf '%s%s%s [y/%sN%s] ' "$C_TTY_BOLD" "${prompt%' [y/N] '}" "$C_TTY_RESET" "${C_TTY_BOLD}${C_TTY_CYAN}" "$C_TTY_RESET" >/dev/tty
+    elif [[ "$prompt" == *' [y/n] ' || "$style" == warn ]]; then
+      printf '%s%s%s' "${C_TTY_BOLD}${C_TTY_YELLOW}" "$prompt" "$C_TTY_RESET" >/dev/tty
     else
       printf '%s%s%s' "$C_TTY_BOLD" "$prompt" "$C_TTY_RESET" >/dev/tty
     fi
@@ -521,21 +523,29 @@ read_tty() {
   IFS= read -r "${var?}" </dev/tty || die '读取交互输入失败。'
 }
 
+# Answers are compared without surrounding blanks. default=true: [Y/n], an empty answer means yes.
+# default=false: [y/n] without a default; an empty or any other answer asks again. EOF or a
+# missing /dev/tty still dies inside read_tty.
 ask_yes_no() {
   local prompt=$1 default=$2 answer=''
   while true; do
     if [[ "$default" == true ]]; then
       read_tty "$prompt [Y/n] " answer
-      answer=${answer:-Y}
     else
-      read_tty "$prompt [y/N] " answer
-      answer=${answer:-N}
+      read_tty "$prompt [y/n] " answer
     fi
+    answer=${answer#"${answer%%[![:space:]]*}"}
+    answer=${answer%"${answer##*[![:space:]]}"}
+    if [[ "$default" == true ]]; then answer=${answer:-Y}; fi
     case "${answer,,}" in
       y|yes) return 0 ;;
       n|no) return 1 ;;
-      *) printf '请输入 y 或 n。\n' >/dev/tty ;;
     esac
+    if [[ "$default" == true ]]; then
+      printf '请输入 y 或 n。\n' >/dev/tty
+    else
+      printf '请输入 y 确认，或 n 跳过/取消（Ctrl+C 退出）\n' >/dev/tty
+    fi
   done
 }
 
@@ -1777,8 +1787,9 @@ detect_network_stack() {
   log "网络模式：$NETWORK_STACK（请求：$NETWORK_REQUEST）"
 }
 
+# Open /dev/tty for real: the permission bits say nothing about a controlling terminal.
 tty_available() {
-  [[ -r /dev/tty && -w /dev/tty ]]
+  { : </dev/tty && : >>/dev/tty; } 2>/dev/null
 }
 
 systemd_sysctl_path() {
@@ -4843,7 +4854,7 @@ run_security_hardening() {
         fp=${detail%%；*}
         if [[ -z "$AUDIT_SESSION_KEY" || "$fp" == "$AUDIT_SESSION_KEY" ]]; then log '当前会话的钥匙或会话无法确定，禁止删除。'; continue; fi
         if ask_yes_no "保留 $target 的 $fp？" true; then continue; fi
-        ask_yes_no "确认删除 $fp（默认不删除）？" false || continue
+        ask_yes_no "确认删除 $fp？" false || continue
         HARDENING_KEY_DELETED=false
         hardening_delete_key "$target" "$fp"
         if [[ "$HARDENING_KEY_DELETED" == true ]]; then
@@ -5627,6 +5638,9 @@ run_system_cleanup() {
 #   selfcheck-fail  预期扇区数故意加 1，安装器分区前自检失败，等待 SELFCHECK_DELAY（120 秒）后重启回旧系统
 #   no-reboot       完成全部准备（包括 GRUB 一次性启动项），但不重启
 #   为空或未设置时正常运行；其他取值直接 die。
+# 测试专用开关：只读环境变量 VPS_INIT_REINSTALL_KEYS_FILE（不写进 --help 和 README）
+#   非空时改读这个路径作为 root 的 authorized_keys（可以不存在，用来模拟没有公钥）；
+#   只能与 VPS_INIT_REINSTALL_TEST=dry-run 一起使用（dry-run 不改 GRUB、不重启），否则直接 die。
 # ==============================================================================
 readonly REINSTALL_SUITE='trixie'
 readonly REINSTALL_ARCH='amd64'
@@ -5676,6 +5690,12 @@ REINSTALL_V6_GW=''
 REINSTALL_V6_EXTRA=''
 REINSTALL_V6_MAC=''
 REINSTALL_KEYS_DISCARDED=0
+# Set by reinstall_check_keys when no usable key exists; the key is then pasted after all
+# read-only checks. REINSTALL_KEY_PASTED_INDEX is the REINSTALL_KEYS index of that key (-1: none).
+REINSTALL_KEYS_NEED_PASTE=false
+REINSTALL_KEYS_PASTE_REASON=''
+REINSTALL_KEY_PASTED_INDEX=-1
+REINSTALL_KEYS_FILE_OVERRIDE=''
 REINSTALL_ROOT_PASS=''
 REINSTALL_ROOT_HASH=''
 declare -a REINSTALL_KEYS=() REINSTALL_KEY_FPS=() REINSTALL_KEY_HAS_OPTS=() REINSTALL_LEFTOVERS=() REINSTALL_CUSTOM_TMPS=()
@@ -5714,6 +5734,12 @@ reinstall_parse_test_mode() {
     dry-run|selfcheck-fail|no-reboot) REINSTALL_TEST_MODE=$VPS_INIT_REINSTALL_TEST ;;
     *) die "VPS_INIT_REINSTALL_TEST 取值无效：${VPS_INIT_REINSTALL_TEST}（仅支持 dry-run、selfcheck-fail、no-reboot）。" ;;
   esac
+  REINSTALL_KEYS_FILE_OVERRIDE=''
+  if [[ -n "${VPS_INIT_REINSTALL_KEYS_FILE:-}" ]]; then
+    [[ "${VPS_INIT_REINSTALL_TEST:-}" == dry-run ]] || die 'VPS_INIT_REINSTALL_KEYS_FILE 只能与 VPS_INIT_REINSTALL_TEST=dry-run 一起使用。'
+    REINSTALL_KEYS_FILE_OVERRIDE=$VPS_INIT_REINSTALL_KEYS_FILE
+    REINSTALL_AUTHORIZED_KEYS=$VPS_INIT_REINSTALL_KEYS_FILE
+  fi
 }
 
 # ---- 遗留检测与清理 ----------------------------------------------------------
@@ -6029,11 +6055,45 @@ reinstall_key_options_restricted() {
   return 1
 }
 
-# 10. root 的 authorized_keys：有效行原样保留（含 options），且至少一把不带 command=/restrict
+# Print the key type of an authorized_keys line: the first field after the options field.
+reinstall_key_type() {
+  local line=$1 opts rest
+  line=${line#"${line%%[![:space:]]*}"}
+  opts=$(reinstall_key_options "$line")
+  rest=${line:${#opts}}
+  rest=${rest#"${rest%%[![:space:]]*}"}
+  printf '%s' "${rest%%[[:space:]]*}"
+}
+
+# Key types the new Debian 13 sshd accepts for login (ssh-dss is gone).
+reinstall_key_type_allowed() {
+  case "$1" in
+    ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp256|ecdsa-sha2-nistp384|ecdsa-sha2-nistp521|sk-ssh-ed25519@openssh.com|sk-ecdsa-sha2-nistp256@openssh.com) return 0 ;;
+  esac
+  return 1
+}
+
+# A line can log in to the new system: no command=/restrict option and an allowed key type.
+reinstall_key_loginable() {
+  local line=$1 opts
+  opts=$(reinstall_key_options "$line")
+  if [[ -n "$opts" ]] && reinstall_key_options_restricted "$opts"; then return 1; fi
+  reinstall_key_type_allowed "$(reinstall_key_type "$line")"
+}
+
+# 10. root 的 authorized_keys：有效行原样保留（含 options），可登录行在前、其余行在后（各自保持原顺序），
+# 因为 sshd 按文件顺序使用第一条匹配的行。没有可读文件、没有有效公钥或没有可登录行时不再失败，只记录
+# 原因，由 reinstall_collect_pasted_key 在全部只读检查后当场粘贴。
 reinstall_check_keys() {
-  local line fp opts usable=0
+  local line='' fp has_opts usable=0
+  local -a other_keys=() other_fps=() other_opts=()
   REINSTALL_KEYS=() REINSTALL_KEY_FPS=() REINSTALL_KEY_HAS_OPTS=() REINSTALL_KEYS_DISCARDED=0
-  [[ -r "$REINSTALL_AUTHORIZED_KEYS" ]] || reinstall_fail "不存在可读的 $REINSTALL_AUTHORIZED_KEYS"
+  REINSTALL_KEYS_NEED_PASTE=false REINSTALL_KEYS_PASTE_REASON='' REINSTALL_KEY_PASTED_INDEX=-1
+  if [[ ! -r "$REINSTALL_AUTHORIZED_KEYS" || -d "$REINSTALL_AUTHORIZED_KEYS" ]]; then
+    REINSTALL_KEYS_NEED_PASTE=true
+    REINSTALL_KEYS_PASTE_REASON="不存在可读的 $REINSTALL_AUTHORIZED_KEYS"
+    return 0
+  fi
   while IFS= read -r line || [[ -n "$line" ]]; do
     line=${line%$'\r'}
     if [[ -z "${line//[[:space:]]/}" || "$line" =~ ^[[:space:]]*# ]]; then
@@ -6041,18 +6101,110 @@ reinstall_check_keys() {
       continue
     fi
     if fp=$(printf '%s\n' "$line" | ssh-keygen -l -f - 2>/dev/null) && [[ -n "$fp" ]]; then
-      opts=$(reinstall_key_options "$line")
-      REINSTALL_KEYS+=("$line")
-      REINSTALL_KEY_FPS+=("$fp")
-      if [[ -n "$opts" ]]; then REINSTALL_KEY_HAS_OPTS+=(true); else REINSTALL_KEY_HAS_OPTS+=(false); fi
-      if [[ -z "$opts" ]] || ! reinstall_key_options_restricted "$opts"; then usable=$((usable + 1)); fi
+      if [[ -n "$(reinstall_key_options "$line")" ]]; then has_opts=true; else has_opts=false; fi
+      if reinstall_key_loginable "$line"; then
+        REINSTALL_KEYS+=("$line") REINSTALL_KEY_FPS+=("$fp") REINSTALL_KEY_HAS_OPTS+=("$has_opts")
+        usable=$((usable + 1))
+      else
+        other_keys+=("$line") other_fps+=("$fp") other_opts+=("$has_opts")
+      fi
     else
       REINSTALL_KEYS_DISCARDED=$((REINSTALL_KEYS_DISCARDED + 1))
     fi
   done <"$REINSTALL_AUTHORIZED_KEYS"
+  REINSTALL_KEYS+=("${other_keys[@]}") REINSTALL_KEY_FPS+=("${other_fps[@]}") REINSTALL_KEY_HAS_OPTS+=("${other_opts[@]}")
   log "公钥检查：有效 ${#REINSTALL_KEYS[@]} 把（可交互登录 $usable 把），丢弃空行/注释/无效行 $REINSTALL_KEYS_DISCARDED 行"
-  (( ${#REINSTALL_KEYS[@]} > 0 )) || reinstall_fail "$REINSTALL_AUTHORIZED_KEYS 中没有有效的 SSH 公钥"
-  (( usable > 0 )) || reinstall_fail '没有可用于交互登录的公钥（全部带有 command= 或 restrict 限制）'
+  if (( ${#REINSTALL_KEYS[@]} == 0 )); then
+    REINSTALL_KEYS_NEED_PASTE=true
+    REINSTALL_KEYS_PASTE_REASON="$REINSTALL_AUTHORIZED_KEYS 中没有有效的 SSH 公钥"
+  elif (( usable == 0 )); then
+    REINSTALL_KEYS_NEED_PASTE=true
+    REINSTALL_KEYS_PASTE_REASON='已有公钥都不能用于新系统登录（带 command=/restrict 限制，或是 Debian 13 不再支持的 ssh-dss）'
+  fi
+}
+
+# Discard whatever is still buffered on /dev/tty after the pasted line, so the rest of an
+# accidental multi-line paste (a private key, say) never answers a later question. read -N
+# switches the terminal to non-canonical mode for that read and bash restores it afterwards, so
+# a last line without a newline is read too. At most 64 reads of up to 4096 bytes, each waiting
+# at most 0.2 s; more than 256 KiB counts as multi-line straight away. Succeeds only when the
+# discarded input holds more than blanks: extra Enter presses and CRLF line ends just vanish.
+reinstall_drain_tty() {
+  local LC_ALL=C chunk buf='' i
+  for (( i = 0; i < 64; i++ )); do
+    chunk=''
+    IFS= read -r -t 0.2 -N 4096 chunk </dev/tty || true
+    buf+=$chunk
+    if (( ${#buf} > 262144 )); then return 0; fi
+    [[ -n "$chunk" ]] || break
+  done
+  buf=${buf//[$' \t\r\n']/}
+  [[ -n "$buf" ]]
+}
+
+# No usable key on this machine: ask for one pasted line. Nothing is written anywhere here; an
+# empty answer exits 0 like the hostname confirmation.
+reinstall_collect_pasted_key() {
+  local line='' first fps fp
+  if ! tty_available; then
+    reinstall_fail "${REINSTALL_KEYS_PASTE_REASON}，且没有交互终端可粘贴公钥"
+  fi
+  printf '本机 root 没有可用的 SSH 公钥（%s）。\n' "$REINSTALL_KEYS_PASTE_REASON"
+  printf '重装后新系统只允许公钥登录，请粘贴一把公钥（一整行，例如 ssh-ed25519 AAAA... 备注）。\n'
+  printf '直接回车放弃，不会做任何改动。\n'
+  while true; do
+    line=''
+    read_tty '粘贴 SSH 公钥（直接回车放弃）: ' line
+    line=${line%$'\r'}
+    line=${line#"${line%%[![:space:]]*}"}
+    line=${line%"${line##*[![:space:]]}"}
+    if reinstall_drain_tty; then
+      if [[ "$line" == -----BEGIN* ]]; then
+        warn '这是私钥，不是公钥！请粘贴 .pub 文件的内容；这把私钥已经显示在屏幕上，建议更换'
+      fi
+      warn '检测到多行内容，请只粘贴一行公钥'
+      continue
+    fi
+    if [[ -z "$line" ]]; then
+      log '已放弃，未做任何修改'
+      exit 0
+    fi
+    if [[ "$line" == -----BEGIN* ]]; then
+      warn '这是私钥，不是公钥！请粘贴 .pub 文件的内容；这把私钥已经显示在屏幕上，建议更换'
+      continue
+    fi
+    # Only a bare public key line: its first field must be an allowed key type, no options.
+    first=${line%%[[:space:]]*}
+    if [[ "$first" == ssh-dss ]]; then
+      warn 'ssh-dss（DSA）公钥在 Debian 13 上已不能使用，请换一把 ed25519 或 RSA 公钥'
+      continue
+    fi
+    fps=$(ssh_public_key_fingerprints <<<"$line" 2>/dev/null || true)
+    if ! reinstall_key_type_allowed "$first"; then
+      if [[ -n "$fps" && -n "$(reinstall_key_options "$line")" ]]; then
+        warn '请只粘贴 .pub 文件里的公钥，不要带 from=、command= 等选项'
+      else
+        warn '公钥无效，请重新粘贴（直接回车放弃）'
+      fi
+      continue
+    fi
+    fp=$(printf '%s\n' "$line" | ssh-keygen -l -f - 2>/dev/null || true)
+    if [[ -z "$fps" || "$fps" == *$'\n'* || -z "$fp" || "$fp" == *$'\n'* ]]; then
+      warn '公钥无效，请重新粘贴（直接回车放弃）'
+      continue
+    fi
+    printf '%s\n' "$fp"
+    printf '请在你的电脑上运行 ssh-keygen -lf ~/.ssh/id_ed25519.pub（换成你的公钥文件），确认指纹一致\n'
+    if ask_yes_no '是否使用这把公钥？' false; then
+      # First line of the new authorized_keys: sshd uses the first matching line, so a restricted
+      # copy of the same key further down can no longer win.
+      REINSTALL_KEYS=("$line" "${REINSTALL_KEYS[@]}")
+      REINSTALL_KEY_FPS=("$fp" "${REINSTALL_KEY_FPS[@]}")
+      REINSTALL_KEY_HAS_OPTS=(false "${REINSTALL_KEY_HAS_OPTS[@]}")
+      REINSTALL_KEY_PASTED_INDEX=0
+      return 0
+    fi
+  done
 }
 
 # 11. IPv4（必须有）：恰好 1 条默认路由、默认网卡上恰好 1 个全局地址
@@ -6192,6 +6344,7 @@ reinstall_preflight() {
   reinstall_check_ipv4
   reinstall_check_ipv6
   reinstall_check_identity
+  if [[ "$REINSTALL_KEYS_NEED_PASTE" == true ]]; then reinstall_collect_pasted_key; fi
   log '重装环境检查全部通过。'
 }
 
@@ -6218,6 +6371,9 @@ reinstall_print_summary() {
   if [[ -n "$REINSTALL_TEST_MODE" ]]; then
     ui_box_line_color "$C_YELLOW" "测试模式：$REINSTALL_TEST_MODE"
   fi
+  if [[ -n "$REINSTALL_KEYS_FILE_OVERRIDE" ]]; then
+    ui_box_line_color "$C_YELLOW" "测试：公钥文件改读 $REINSTALL_KEYS_FILE_OVERRIDE"
+  fi
   if [[ "$REINSTALL_HOST_VALID" == true ]]; then
     ui_box_line "主机名：$REINSTALL_NEW_HOST"
   else
@@ -6233,10 +6389,13 @@ reinstall_print_summary() {
     *) ui_box_line "IPv6：静态 $REINSTALL_V6_ADDR，网关 $REINSTALL_V6_GW；MAC $REINSTALL_V6_MAC（当前网卡 $REINSTALL_V6_IFACE）" ;;
   esac
   if [[ -n "$REINSTALL_V6_EXTRA" ]]; then ui_box_line "IPv6 附加地址：$REINSTALL_V6_EXTRA"; fi
-  ui_box_line "重装后 SSH：端口 22，root 仅公钥登录；公钥 ${#REINSTALL_KEYS[@]} 把（丢弃 $REINSTALL_KEYS_DISCARDED 行）"
+  ui_box_line_color "${C_BOLD}${C_YELLOW}" '重装后 SSH 只允许公钥登录（密码登录已关闭）'
+  ui_box_line "SSH 端口 22；公钥 ${#REINSTALL_KEYS[@]} 把（丢弃 $REINSTALL_KEYS_DISCARDED 行）"
   for i in "${!REINSTALL_KEY_FPS[@]}"; do
     fp=${REINSTALL_KEY_FPS[i]}
+    if [[ "$(reinstall_key_type "${REINSTALL_KEYS[i]}")" == ssh-dss ]]; then fp+='（ssh-dss，新系统不支持）'; fi
     if [[ "${REINSTALL_KEY_HAS_OPTS[i]:-false}" == true ]]; then fp+='（带限制选项）'; fi
+    if (( i == REINSTALL_KEY_PASTED_INDEX )); then fp+='（当场粘贴）'; fi
     ui_box_line "  $fp"
   done
   ui_box_line "root 密码：$REINSTALL_ROOT_PASS" "root 密码：${C_BOLD}${C_YELLOW}${REINSTALL_ROOT_PASS}${C_RESET}"
@@ -6249,7 +6408,11 @@ reinstall_confirm() {
   CURRENT_STEP='重装确认'
   reinstall_generate_password
   reinstall_print_summary
-  read_tty "请输入本机主机名 $REINSTALL_HOST 以确认清空整机并重装：" answer
+  while true; do
+    read_tty "请输入本机主机名 $REINSTALL_HOST 以确认清空整机并重装：" answer warn
+    if [[ -n "${answer//[[:space:]]/}" ]]; then break; fi
+    printf '请输入主机名 %s 以确认，或 Ctrl+C 退出（输错将取消）\n' "$REINSTALL_HOST" >/dev/tty
+  done
   if [[ "$answer" != "$REINSTALL_HOST" ]]; then
     log '已取消，未做任何修改'
     exit 0
@@ -6830,6 +6993,8 @@ reinstall_build_overlay() {
     cat -- "$stage/404/net.env"
     log '==================== 网卡配置预览（按当前网卡名示意，安装时按 MAC 定位） ===================='
     reinstall_render_interfaces_preview "$stage/404/net.env" "$REINSTALL_V4_IFACE" "${REINSTALL_V6_IFACE:-$REINSTALL_V4_IFACE}"
+    log '==================== 404/authorized_keys（将写入新系统） ===================='
+    ssh-keygen -l -f "$stage/404/authorized_keys"
     log '====================================================='
     printf '\n'
   fi
@@ -6889,16 +7054,33 @@ reinstall_configure_grub() {
   log "已设置 GRUB next_entry=$REINSTALL_GRUB_ENTRY_ID"
 }
 
+# Print the server port of the current SSH session (field 4 of SSH_CONNECTION) when it is an
+# integer in 1-65535; print nothing otherwise.
+reinstall_current_ssh_port() {
+  local port=''
+  IFS=' ' read -r _ _ _ port _ <<<"${SSH_CONNECTION:-}" || true
+  if [[ "$port" =~ ^[1-9][0-9]{0,4}$ ]] && (( 10#$port <= 65535 )); then printf '%s\n' "$port"; fi
+}
+
 reinstall_print_ready() {
+  local port
+  port=$(reinstall_current_ssh_port)
   ui_use_target out
   printf '\n'
   ui_box_top '准备就绪'
   ui_box_line "重装完成后登录：ssh -p 22 root@$REINSTALL_V4_ADDR"
+  ui_box_line_color "${C_BOLD}${C_YELLOW}" '请用私钥连接（如 Termius 需在主机设置里绑定私钥）；密码登录已关闭'
   ui_box_line "root 密码：$REINSTALL_ROOT_PASS" "root 密码：${C_BOLD}${C_YELLOW}${REINSTALL_ROOT_PASS}${C_RESET}"
-  ui_box_line 'root 密码仅用于 VNC 控制台登录；商家面板显示的旧密码会失效'
+  ui_box_line 'root 密码只在 VNC 控制台有效；商家面板显示的旧密码会失效'
   ui_box_line "清除旧主机指纹：ssh-keygen -R $REINSTALL_V4_ADDR"
   ui_box_line '下一步：用 README 的一键命令运行 [1] 快速初始化'
-  ui_box_line '安装大约需要 5～20 分钟，安装期间 SSH 连不上属于正常现象'
+  ui_box_line '安装通常需要 2～10 分钟，期间 SSH 连不上属正常现象'
+  ui_box_line '超过 30 分钟仍连不上，再用 VNC 查看'
+  if [[ -n "$port" && "$port" != 22 ]]; then
+    ui_box_line "若用旧端口 $port 又能连上：说明安装器自检未通过、已自动回到旧系统，磁盘未改动"
+  else
+    ui_box_line '若连上后发现仍是旧系统：说明安装器自检未通过、已自动回到旧系统，磁盘未改动'
+  fi
   ui_box_bottom
 }
 

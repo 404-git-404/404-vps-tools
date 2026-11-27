@@ -12,6 +12,21 @@ trap 'rm -rf -- "$work"' EXIT
 
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
 
+# Terminal output (prompts and re-ask hints) goes to a plain file instead of the real /dev/tty;
+# every reply comes from a read_tty double. Removing the file simulates a missing terminal.
+sed "s|/dev/tty|$work/tty|g" "$repo/debian-init.sh" >"$work/installer"
+: >"$work/tty"
+
+# Real keys: the dry-run preview and the paste flow run ssh-keygen on them.
+command -v ssh-keygen >/dev/null 2>&1 || fail 'ssh-keygen is required'
+ssh-keygen -q -t ed25519 -N '' -C fixture -f "$work/fixture-key" >/dev/null
+pub=$(cat "$work/fixture-key.pub")
+ssh-keygen -q -t ed25519 -N '' -C pasted -f "$work/paste-key" >/dev/null
+paste_pub=$(cat "$work/paste-key.pub")
+paste_fp=$(ssh-keygen -l -f "$work/paste-key.pub")
+ssh-keygen -q -t ed25519 -N '' -C second -f "$work/second-key" >/dev/null
+second_pub=$(cat "$work/second-key.pub")
+
 declare -A FAKE_ADDR4=() FAKE_ADDR6=()
 FAKE_V4_ROUTE='' FAKE_V6_ROUTE='' FAKE_V6_GET=''
 FAKE_GRUBENV="$work/grubenv"
@@ -58,7 +73,7 @@ use_host() {
   REINSTALL_V4_NETMASK='255.255.255.255' REINSTALL_V4_GW='198.51.100.1' REINSTALL_V4_MAC='02:00:00:00:00:01'
   REINSTALL_V6_MODE='static' REINSTALL_V6_IFACE='eth1' REINSTALL_V6_ADDR='2001:db8:1::a/64'
   REINSTALL_V6_GW='2001:db8:ff::1' REINSTALL_V6_EXTRA='' REINSTALL_V6_MAC='02:00:00:00:00:02'
-  REINSTALL_KEYS=('ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFixtureFixtureFixtureFixtureFixtureFixture test')
+  REINSTALL_KEYS=("$pub")
   REINSTALL_ROOT_HASH='$6$fixture$hash'
   REINSTALL_ROOT_PASS='FixturePassword12345'
 }
@@ -68,7 +83,7 @@ expect_ok() {
   local name=$1 out rc
   shift
   set +e
-  out=$( (source "$repo/debian-init.sh"; trap - EXIT ERR HUP INT TERM; install_fakes; "$@") 2>&1 )
+  out=$( (source "$work/installer"; trap - EXIT ERR HUP INT TERM; install_fakes; "$@") 2>&1 )
   rc=$?
   set -e
   (( rc == 0 )) || { printf '%s\n' "$out" >&2; fail "$name (rc=$rc)"; }
@@ -80,7 +95,7 @@ expect_die() {
   local name=$1 msg=$2 out rc
   shift 2
   set +e
-  out=$( (source "$repo/debian-init.sh"; trap - EXIT ERR HUP INT TERM; install_fakes; "$@") 2>&1 )
+  out=$( (source "$work/installer"; trap - EXIT ERR HUP INT TERM; install_fakes; "$@") 2>&1 )
   rc=$?
   set -e
   (( rc != 0 )) || { printf '%s\n' "$out" >&2; fail "$name: expected failure"; }
@@ -736,6 +751,7 @@ t_dry_run() {
   printf '# user custom\n' >"$REINSTALL_CUSTOM_CFG"
   printf 'saved_entry=0\n' >"$FAKE_GRUBENV"
   REINSTALL_TEST_MODE='dry-run'
+  REINSTALL_KEYS=("command=\"/bin/false\" $pub" "$paste_pub")
   reinstall_confirm() { :; }
   run_reinstall
   [[ ! -e "$REINSTALL_BOOT_DIR" && ! -e "$REINSTALL_BOOT_TMP_DIR" ]] || fail 'dry-run left files in /boot'
@@ -745,6 +761,13 @@ t_dry_run() {
 }
 rm -f "$fix/curl.log"
 expect_ok 'dry-run downloads, prints and cleans up' t_dry_run
+# The authorized_keys preview follows the interfaces preview and lists one ssh-keygen -l line per key.
+awk '/网卡配置预览/ {n=NR} /404\/authorized_keys（将写入新系统）/ {k=NR} /dry-run 完成/ {d=NR} END {exit !(n && k && d && n < k && k < d)}' "$work/last.out" ||
+  fail 'dry-run authorized_keys preview missing or out of order'
+grep -Fxq "$(ssh-keygen -l -f "$work/fixture-key.pub")" "$work/last.out" || fail 'dry-run preview lacks the file key fingerprint'
+grep -Fxq "$paste_fp" "$work/last.out" || fail 'dry-run preview lacks the second key fingerprint'
+[[ "$(sed -n '/404\/authorized_keys（将写入新系统）/,/^\[INFO\] =====/p' "$work/last.out" | grep -c 'SHA256:')" == 2 ]] ||
+  fail 'dry-run preview does not list exactly one line per key'
 for line in 'd-i pkgsel/upgrade select safe-upgrade' "IPV4_ADDR='203.0.113.10'" 'auto eth1' 'dry-run 完成'; do
   grep -Fq -- "$line" "$work/last.out" || fail "dry-run output lacks [$line]"
 done
@@ -875,7 +898,7 @@ grep -Eq '^-rwxr-xr-x +1 root +root .* usr/lib/finish-install\.d/50404-reinstall
 for dir in usr usr/lib usr/lib/finish-install.d; do
   grep -Eq "^drwxr-xr-x +[0-9]+ root +root .* ${dir//./\\.}\$" "$work/overlay/list" || fail "archive dir $dir must be 0755 root"
 done
-grep -Fxq 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFixtureFixtureFixtureFixtureFixtureFixture test' "$x/404/authorized_keys" || fail 'authorized_keys content'
+grep -Fxq "$pub" "$x/404/authorized_keys" || fail 'authorized_keys content'
 
 # ---- 11. embedded POSIX scripts ----------------------------------------------
 
@@ -1011,32 +1034,92 @@ for variant in 'LOAD_KEXEC=false' '# LOAD_KEXEC=true' "LOAD_KEXEC='false'"; do
 done
 expect_ok 'kexec config missing' t_kexec "$work/no-such-kexec"
 
-# authorized_keys: options kept verbatim, at least one key without command=/restrict.
-command -v ssh-keygen >/dev/null 2>&1 || fail 'ssh-keygen is required'
-ssh-keygen -q -t ed25519 -N '' -C fixture -f "$work/fixture-key" >/dev/null
-pub=$(cat "$work/fixture-key.pub")
+# authorized_keys: options kept verbatim. Without a usable key the check only records why, so the
+# key can be pasted after all read-only checks.
 t_keys() {
   REINSTALL_AUTHORIZED_KEYS=$1
   reinstall_check_keys
   printf 'keys=%s opts=%s\n' "${#REINSTALL_KEYS[@]}" "$(reinstall_join "${REINSTALL_KEY_HAS_OPTS[@]}")"
   printf 'line=%s\n' "${REINSTALL_KEYS[@]}"
+  printf 'paste=%s reason=%s\n' "$REINSTALL_KEYS_NEED_PASTE" "$REINSTALL_KEYS_PASTE_REASON"
+}
+unusable_reason='已有公钥都不能用于新系统登录（带 command=/restrict 限制，或是 Debian 13 不再支持的 ssh-dss）'
+pub_fp=$(ssh-keygen -l -f "$work/fixture-key.pub")
+# OpenSSH 10 (Debian 13) can neither generate nor read DSA keys, so ssh-dss lines get a stand-in
+# fingerprint; every other key still goes to the real ssh-keygen.
+dss_line='ssh-dss AAAAB3NzaC1kc3M= old-dsa'
+dss_fakes() {
+  ssh-keygen() {
+    local input
+    input=$(cat)
+    if [[ "$input" == *'ssh-dss '* ]]; then printf '1024 SHA256:dssFixture old-dsa (DSA)\n'; return 0; fi
+    printf '%s\n' "$input" | command ssh-keygen "$@"
+  }
 }
 printf 'from="198.51.100.0/24,restrict.example",no-agent-forwarding %s\r\n' "$pub" >"$work/ak-from"
 expect_ok 'key with from= is usable' t_keys "$work/ak-from"
 grep -Fxq "line=from=\"198.51.100.0/24,restrict.example\",no-agent-forwarding $pub" "$work/last.out" || fail 'options line not kept verbatim (or CR kept)'
 grep -Fq 'keys=1 opts=true' "$work/last.out" || fail 'from= key bookkeeping'
+grep -Fxq 'paste=false reason=' "$work/last.out" || fail 'usable key still asks for a paste'
 printf 'no-port-forwarding,command="echo '\''Please login as the user \\"debian\\"'\'';sleep 10;exit 142" %s\n' "$pub" >"$work/ak-command"
-expect_die 'only command= keys' '无法重装：没有可用于交互登录的公钥（全部带有 command= 或 restrict 限制）' t_keys "$work/ak-command"
+expect_ok 'only command= keys: paste needed, lines kept' t_keys "$work/ak-command"
+grep -Fxq "paste=true reason=$unusable_reason" "$work/last.out" || fail 'command= reason'
+grep -Fq 'keys=1 opts=true' "$work/last.out" || fail 'command= line dropped'
 printf 'RESTRICT,pty %s\n' "$pub" >"$work/ak-restrict"
-expect_die 'only restrict keys' '无法重装：没有可用于交互登录的公钥（全部带有 command= 或 restrict 限制）' t_keys "$work/ak-restrict"
+expect_ok 'only restrict keys: paste needed' t_keys "$work/ak-restrict"
+grep -Fxq "paste=true reason=$unusable_reason" "$work/last.out" || fail 'restrict reason'
+printf '# only a comment\n\nnot-a-key\n' >"$work/ak-none"
+expect_ok 'no valid key: paste needed' t_keys "$work/ak-none"
+grep -Fxq "paste=true reason=$work/ak-none 中没有有效的 SSH 公钥" "$work/last.out" || fail 'no valid key reason'
+expect_ok 'missing authorized_keys: paste needed' t_keys "$work/no-such-ak"
+grep -Fxq "paste=true reason=不存在可读的 $work/no-such-ak" "$work/last.out" || fail 'missing file reason'
+# A directory is no key file (it would make read fail); a readable non-directory such as /dev/null is read.
+mkdir -p "$work/ak-dir"
+expect_ok 'authorized_keys path is a directory: paste needed' t_keys "$work/ak-dir"
+grep -Fxq "paste=true reason=不存在可读的 $work/ak-dir" "$work/last.out" || fail 'directory reason'
+expect_ok 'authorized_keys is /dev/null: read as empty' t_keys /dev/null
+grep -Fxq 'paste=true reason=/dev/null 中没有有效的 SSH 公钥' "$work/last.out" || fail '/dev/null reason'
 {
   printf 'command="/bin/false" %s\n' "$pub"
   printf '# comment\r\n\r\nnot-a-key\r\n%s\r\n' "$pub"
 } >"$work/ak-mixed"
 expect_ok 'command= key plus a plain CRLF key' t_keys "$work/ak-mixed"
-grep -Fq 'keys=2 opts=true false' "$work/last.out" || fail 'mixed key bookkeeping'
+grep -Fq 'keys=2 opts=false true' "$work/last.out" || fail 'mixed key bookkeeping (loginable line first)'
 grep -Fq '丢弃空行/注释/无效行 3 行' "$work/last.out" || fail 'discarded line count'
 grep -Fxq "line=$pub" "$work/last.out" || fail 'CRLF plain key not stripped of CR'
+grep -Fxq 'paste=false reason=' "$work/last.out" || fail 'mixed file with a usable key asks for a paste'
+# Loginable lines first, the rest after, each group in file order; the written file follows that.
+[[ "$(grep '^line=' "$work/last.out" | head -n 1)" == "line=$pub" ]] || fail 'clean line not moved before the command= line'
+t_keys_written() {
+  REINSTALL_AUTHORIZED_KEYS=$1
+  reinstall_check_keys
+  reinstall_write_authorized_keys "$2"
+}
+expect_ok 'written authorized_keys: loginable line first' t_keys_written "$work/ak-mixed" "$work/ak-mixed.written"
+[[ "$(cat "$work/ak-mixed.written")" == "$pub"$'\n'"command=\"/bin/false\" $pub" ]] || fail "written order: $(cat "$work/ak-mixed.written")"
+{
+  printf 'restrict %s\n' "$second_pub"
+  printf '%s\n' "$dss_line"
+  printf 'from="198.51.100.0/24" %s\n' "$pub"
+  printf 'command="/bin/true" %s\n' "$pub"
+  printf '%s\n' "$second_pub"
+} >"$work/ak-order"
+t_keys_order() { dss_fakes; t_keys "$work/ak-order"; }
+expect_ok 'stable order: loginable lines, then the rest' t_keys_order
+[[ "$(grep '^line=' "$work/last.out")" == "line=from=\"198.51.100.0/24\" $pub"$'\n'"line=$second_pub"$'\n'"line=restrict $second_pub"$'\n'"line=$dss_line"$'\n'"line=command=\"/bin/true\" $pub" ]] ||
+  fail "stable order: $(grep '^line=' "$work/last.out")"
+grep -Fxq 'keys=5 opts=true false true false true' "$work/last.out" || fail 'option flags not moved with their lines'
+grep -Fq '可交互登录 2 把' "$work/last.out" || fail 'usable count'
+# Only ssh-dss: kept, but not loginable on Debian 13, so a paste is needed.
+printf '%s\n' "$dss_line" >"$work/ak-dss"
+t_keys_dss() { dss_fakes; t_keys "$work/ak-dss"; }
+expect_ok 'only ssh-dss: paste needed' t_keys_dss
+grep -Fxq "paste=true reason=$unusable_reason" "$work/last.out" || fail 'ssh-dss reason'
+grep -Fxq "line=$dss_line" "$work/last.out" || fail 'ssh-dss line not kept'
+t_keys_dss_summary() { dss_fakes; use_host; UI_WIDTH=200; REINSTALL_AUTHORIZED_KEYS="$work/ak-order"; reinstall_check_keys; reinstall_print_summary; }
+expect_ok 'summary marks ssh-dss' t_keys_dss_summary
+grep -Fq '1024 SHA256:dssFixture old-dsa (DSA)（ssh-dss，新系统不支持）' "$work/last.out" || fail 'ssh-dss summary marker'
+[[ "$(grep -c '（ssh-dss，新系统不支持）' "$work/last.out")" == 1 ]] || fail 'ssh-dss marker on other keys'
 t_keys_summary() {
   use_host
   REINSTALL_AUTHORIZED_KEYS=$1
@@ -1045,6 +1128,317 @@ t_keys_summary() {
 }
 expect_ok 'summary marks keys with options' t_keys_summary "$work/ak-mixed"
 [[ "$(grep -c '（带限制选项）' "$work/last.out")" == 1 ]] || fail 'option marker count in summary'
+if grep -Fq '（当场粘贴）' "$work/last.out"; then fail 'file keys marked as pasted'; fi
+grep -Fq '重装后 SSH 只允许公钥登录（密码登录已关闭）' "$work/last.out" || fail 'summary lacks the key-only line'
+grep -Fq 'SSH 端口 22；公钥 2 把（丢弃 3 行）' "$work/last.out" || fail 'summary lacks the port/key count line'
+if grep -Fq '重装后 SSH：端口 22' "$work/last.out"; then fail 'old summary SSH line still shown'; fi
+awk '/只允许公钥登录/ {a=NR} /SSH 端口 22；/ {b=NR} /SHA256:/ && !c {c=NR} END {exit !(a && b && c && a < b && b < c)}' "$work/last.out" ||
+  fail 'summary SSH lines out of order'
+
+# The paste runs after every read-only check and only when needed.
+(source "$work/installer"; trap - EXIT ERR HUP INT TERM; declare -f reinstall_preflight) | awk '/reinstall_check_identity/ {i=NR} /reinstall_collect_pasted_key/ {p=NR} /重装环境检查全部通过/ {d=NR} END {exit !(i && p && d && i < p && p < d)}' ||
+  fail 'paste is not between the identity check and the final preflight log'
+
+# ---- paste flow -----------------------------------------------------------------
+# A scripted terminal: REPLIES answer read_tty in order; reply numbers (1-based) listed in
+# PASTE_MULTI behave as if more pasted lines followed and were discarded.
+paste_fakes() {
+  REPLY_I=0
+  : >"$work/paste.prompts"
+  read_tty() {
+    (( REPLY_I < ${#REPLIES[@]} )) || fail "unexpected prompt: $1"
+    printf '%s\n' "$1" >>"$work/paste.prompts"
+    printf -v "$2" '%s' "${REPLIES[REPLY_I]}"
+    REPLY_I=$((REPLY_I + 1))
+  }
+  reinstall_drain_tty() { [[ " ${PASTE_MULTI:-} " == *" $REPLY_I "* ]]; }
+}
+t_paste() {
+  use_host
+  UI_WIDTH=200 # Keep each summary line whole for grep.
+  REINSTALL_AUTHORIZED_KEYS=$1
+  shift
+  REPLIES=("$@")
+  paste_fakes
+  reinstall_check_keys
+  [[ "$REINSTALL_KEYS_NEED_PASTE" == true ]] || fail 'fixture does not need a paste'
+  reinstall_collect_pasted_key
+  (( REPLY_I == ${#REPLIES[@]} )) || fail "only $REPLY_I of ${#REPLIES[@]} replies used"
+  printf 'keys=%s pasted=%s opts=%s\n' "${#REINSTALL_KEYS[@]}" "$REINSTALL_KEY_PASTED_INDEX" "$(reinstall_join "${REINSTALL_KEY_HAS_OPTS[@]}")"
+  printf 'line=%s\n' "${REINSTALL_KEYS[@]}"
+  printf 'fp=%s\n' "${REINSTALL_KEY_FPS[@]}"
+  reinstall_print_summary
+  reinstall_write_authorized_keys "$work/paste.written"
+}
+# The real drain on a plain file standing in for the terminal (the real-terminal cases are in the
+# PTY section): text is reported, blank lines only are not.
+t_drain() {
+  printf 'line 2\nline 3\n' >"$work/tty"
+  reinstall_drain_tty || fail 'buffered lines not reported'
+  printf 'partial' >"$work/tty"
+  reinstall_drain_tty || fail 'buffered partial line not reported'
+  printf '\n\r\n \t\n' >"$work/tty"
+  if reinstall_drain_tty; then fail 'blank lines reported as more pasted lines'; fi
+  : >"$work/tty"
+  if reinstall_drain_tty; then fail 'nothing buffered but reported'; fi
+}
+expect_ok 'drain buffered terminal input' t_drain
+: >"$work/tty"
+
+paste_prompt='粘贴 SSH 公钥（直接回车放弃）: '
+use_prompt='是否使用这把公钥？ [y/n] '
+prompt_count() { grep -Fxc -- "$1" "$work/paste.prompts" || true; }
+# The whole preflight with every other check replaced: a usable key never shows the paste flow;
+# without one the paste comes after the identity check. The root check is the only reinstall_fail
+# waived, since the offline tests do not run as root.
+t_preflight() {
+  local check
+  unset VPS_INIT_REINSTALL_TEST VPS_INIT_REINSTALL_KEYS_FILE
+  REINSTALL_AUTHORIZED_KEYS=$1
+  shift
+  for check in leftover system virt firmware memory disk grub kexec tools boot_space ipv4 ipv6 identity; do
+    eval "reinstall_check_$check() { log 'check $check'; }"
+  done
+  reinstall_fail() { [[ "$*" == '必须以 root 身份运行' ]] || die "无法重装：$*"; }
+  REPLIES=("$@")
+  paste_fakes
+  reinstall_preflight
+  (( REPLY_I == ${#REPLIES[@]} )) || fail "only $REPLY_I of ${#REPLIES[@]} replies used"
+}
+expect_ok 'preflight with a usable key: no paste' t_preflight "$work/ak-mixed"
+grep -Fq '重装环境检查全部通过。' "$work/last.out" || fail 'preflight did not finish'
+grep -Fq 'check identity' "$work/last.out" || fail 'preflight checks not run'
+if grep -Fq '粘贴' "$work/last.out" || [[ -s "$work/paste.prompts" ]]; then fail 'paste flow shown although a usable key exists'; fi
+expect_ok 'preflight without a usable key: paste after the checks' t_preflight "$work/ak-command" "$paste_pub" y
+awk '/check identity/ {i=NR} /本机 root 没有可用的 SSH 公钥/ {p=NR} /重装环境检查全部通过/ {d=NR} END {exit !(i && p && d && i < p && p < d)}' "$work/last.out" ||
+  fail 'paste not between the identity check and the end of the preflight'
+
+expect_ok 'paste: missing file, valid key, y' t_paste "$work/no-such-ak" "$paste_pub" y
+grep -Fq "本机 root 没有可用的 SSH 公钥（不存在可读的 $work/no-such-ak）。" "$work/last.out" || fail 'paste intro reason'
+grep -Fq '重装后新系统只允许公钥登录，请粘贴一把公钥（一整行，例如 ssh-ed25519 AAAA... 备注）。' "$work/last.out" || fail 'paste intro line 2'
+grep -Fq '直接回车放弃，不会做任何改动。' "$work/last.out" || fail 'paste intro line 3'
+grep -Fxq "$paste_fp" "$work/last.out" || fail 'ssh-keygen -l output of the pasted key not shown'
+grep -Fq '请在你的电脑上运行 ssh-keygen -lf ~/.ssh/id_ed25519.pub（换成你的公钥文件），确认指纹一致' "$work/last.out" || fail 'fingerprint hint'
+grep -Fxq 'keys=1 pasted=0 opts=false' "$work/last.out" || fail 'pasted key bookkeeping'
+grep -Fxq "line=$paste_pub" "$work/last.out" || fail 'pasted key line'
+grep -Fxq "fp=$paste_fp" "$work/last.out" || fail 'pasted key fingerprint entry differs from the file format'
+grep -Fq "${paste_fp}（当场粘贴）" "$work/last.out" || fail 'summary lacks the pasted marker'
+[[ "$(prompt_count "$paste_prompt")" == 1 && "$(prompt_count "$use_prompt")" == 1 ]] || fail 'paste prompts'
+
+expect_ok 'paste: no valid key, invalid then valid (blanks, CRLF)' t_paste "$work/ak-none" 'ssh-ed25519 not-base64!' 'hello world' "  $paste_pub  "$'\r' y
+[[ "$(grep -Fc '公钥无效，请重新粘贴（直接回车放弃）' "$work/last.out")" == 2 ]] || fail 'invalid key warnings'
+grep -Fxq "line=$paste_pub" "$work/last.out" || fail 'blanks or CR kept on the pasted key'
+[[ "$(prompt_count "$paste_prompt")" == 3 ]] || fail 'invalid key not re-asked'
+
+# The usual cloud image: the user's own key, locked by command=/restrict. Pasting the same key
+# puts the clean copy first, so sshd (first matching line wins) lets the user in.
+expect_ok 'paste: same key as a command= file line goes first' t_paste "$work/ak-command" "$pub" y
+grep -Fxq 'keys=2 pasted=0 opts=false true' "$work/last.out" || fail 'pasted key not inserted at index 0'
+[[ "$(head -n 1 "$work/paste.written")" == "$pub" ]] || fail "written authorized_keys does not start with the pasted key: $(head -n 1 "$work/paste.written")"
+[[ "$(sed -n 2p "$work/paste.written")" == no-port-forwarding,command=* ]] || fail 'restricted file line not kept after the pasted key'
+grep -Fq "${pub_fp}（当场粘贴）" "$work/last.out" || fail 'pasted marker'
+awk -v fp="$pub_fp（当场粘贴）" -v r="$pub_fp（带限制选项）" 'index($0, fp) {p=NR} index($0, r) {q=NR} END {exit !(p && q && p < q)}' "$work/last.out" ||
+  fail 'summary does not list the pasted key first'
+expect_ok 'paste: same key as a restrict file line goes first' t_paste "$work/ak-restrict" "$pub" y
+[[ "$(cat "$work/paste.written")" == "$pub"$'\n'"RESTRICT,pty $pub" ]] || fail "restrict + paste written order: $(cat "$work/paste.written")"
+
+# Only a bare public key line: options, ssh-dss and anything else are refused.
+expect_ok 'paste: options and ssh-dss refused' t_paste "$work/ak-command" "restrict $paste_pub" "command=\"/bin/true\" $paste_pub" "from=\"198.51.100.0/24\" $paste_pub" "cert-authority $paste_pub" "$dss_line" "$paste_pub" y
+[[ "$(grep -Fc '请只粘贴 .pub 文件里的公钥，不要带 from=、command= 等选项' "$work/last.out")" == 4 ]] || fail 'option lines not refused'
+[[ "$(grep -Fc 'ssh-dss（DSA）公钥在 Debian 13 上已不能使用，请换一把 ed25519 或 RSA 公钥' "$work/last.out")" == 1 ]] || fail 'ssh-dss paste not refused'
+if grep -Fq '公钥无效' "$work/last.out"; then fail 'option or ssh-dss line reported as invalid'; fi
+grep -Fxq 'keys=2 pasted=0 opts=false true' "$work/last.out" || fail 'bare key bookkeeping'
+[[ "$(grep '^line=' "$work/last.out" | head -n 1)" == "line=$paste_pub" ]] || fail 'bare pasted key not first'
+[[ "$(grep -c '（当场粘贴）' "$work/last.out")" == 1 ]] || fail 'pasted marker count'
+[[ "$(prompt_count "$use_prompt")" == 1 ]] || fail 'refused lines reached the confirmation'
+
+expect_ok 'paste: private key refused' t_paste "$work/ak-restrict" '-----BEGIN OPENSSH PRIVATE KEY-----' "$paste_pub" y
+grep -Fq '这是私钥，不是公钥！请粘贴 .pub 文件的内容；这把私钥已经显示在屏幕上，建议更换' "$work/last.out" || fail 'private key warning'
+
+PASTE_MULTI=1 expect_ok 'paste: multi-line private key refused' t_paste "$work/ak-none" '-----BEGIN OPENSSH PRIVATE KEY-----' "$paste_pub" y
+grep -Fq '这是私钥，不是公钥！' "$work/last.out" || fail 'multi-line private key warning'
+grep -Fq '检测到多行内容，请只粘贴一行公钥' "$work/last.out" || fail 'multi-line warning for a private key'
+
+PASTE_MULTI=1 expect_ok 'paste: a valid key followed by more lines is refused' t_paste "$work/ak-none" "$second_pub" "$paste_pub" y
+grep -Fq '检测到多行内容，请只粘贴一行公钥' "$work/last.out" || fail 'multi-line warning'
+grep -Fxq "line=$paste_pub" "$work/last.out" || fail 'key after a multi-line paste'
+if grep -Fq "line=$second_pub" "$work/last.out"; then fail 'multi-line paste accepted'; fi
+[[ "$(prompt_count "$use_prompt")" == 1 ]] || fail 'multi-line paste reached the confirmation'
+
+expect_ok 'paste: answer n, paste again' t_paste "$work/ak-none" "$second_pub" '' n "$paste_pub" y
+grep -Fxq "line=$paste_pub" "$work/last.out" || fail 'second paste after n'
+if grep -Fq "line=$second_pub" "$work/last.out"; then fail 'key kept after n'; fi
+# Confirmations: Enter (asked again), n, then y for the second paste.
+[[ "$(prompt_count "$paste_prompt")" == 2 && "$(prompt_count "$use_prompt")" == 3 ]] || fail 'n did not return to the paste prompt'
+
+# An empty paste exits 0 without writing anything; the current authorized_keys is untouched.
+t_paste_empty() {
+  use_paths "$work/paste-empty"
+  t_paste "$work/ak-command" '   '
+  fail 'run continued after an empty paste'
+}
+expect_ok 'paste: empty answer exits 0' t_paste_empty
+grep -Fq '已放弃，未做任何修改' "$work/last.out" || fail 'empty paste message'
+[[ "$(cd "$work/paste-empty" && find . -mindepth 1 | sort | tr '\n' ' ')" == './boot ./boot/grub ./sys ' ]] || fail 'empty paste wrote files'
+[[ "$(cat "$work/ak-command")" == "no-port-forwarding,command=\"echo 'Please login as the user \\\"debian\\\"';sleep 10;exit 142\" $pub" ]] || fail 'authorized_keys changed'
+
+t_paste_no_tty() {
+  REPLIES=()
+  paste_fakes
+  rm -f -- "$work/tty"
+  REINSTALL_AUTHORIZED_KEYS="$work/no-such-ak"
+  reinstall_check_keys
+  reinstall_collect_pasted_key
+}
+expect_die 'paste: no terminal' "无法重装：不存在可读的 $work/no-such-ak，且没有交互终端可粘贴公钥" t_paste_no_tty
+: >"$work/tty"
+
+# ---- real terminal: what the drain leaves for the next question ------------------
+# Input is written into a real PTY (script). Pieces arriving together are buffered like a paste;
+# "@N" sleeps N seconds, so whatever follows a long sleep is typed after the drain is over.
+command -v script >/dev/null 2>&1 || fail 'script (util-linux) is required for the PTY tests'
+cat >"$work/pty-drain.sh" <<PROBE
+source "$repo/debian-init.sh"
+trap - EXIT ERR HUP INT TERM
+before=\$(stty -g)
+read_tty 'P: ' first
+if reinstall_drain_tty; then echo DRAIN=multi; else echo DRAIN=clean; fi
+after=\$(stty -g)
+if [[ "\$before" == "\$after" ]]; then echo STTY=same; else echo STTY=changed; fi
+read_tty 'NEXT: ' next
+printf 'FIRST=[%s]\nNEXT=[%s]\n' "\$first" "\$next"
+PROBE
+cat >"$work/pty-paste.sh" <<PROBE
+source "$repo/debian-init.sh"
+trap - EXIT ERR HUP INT TERM
+REINSTALL_KEYS_PASTE_REASON=fixture REINSTALL_KEYS=() REINSTALL_KEY_FPS=() REINSTALL_KEY_HAS_OPTS=()
+before=\$(stty -g)
+reinstall_collect_pasted_key
+after=\$(stty -g)
+if [[ "\$before" == "\$after" ]]; then echo STTY=same; else echo STTY=changed; fi
+printf 'KEY0=[%s] COUNT=%s\n' "\${REINSTALL_KEYS[0]}" "\${#REINSTALL_KEYS[@]}"
+PROBE
+pty_run() {
+  local probe=$1 out=$2 piece
+  shift 2
+  {
+    for piece in "$@"; do
+      if [[ "$piece" == @* ]]; then sleep "${piece#@}"; else printf '%b' "$piece"; fi
+    done
+    sleep 1
+  } | timeout 60 env -u NO_COLOR TERM=xterm-256color script -qec "bash \"$probe\"" /dev/null >"$out" 2>&1 ||
+    fail "PTY probe did not finish: $*"
+  tr -d '\r' <"$out" | sed $'s/\033\\[[0-9;]*[A-Za-z]//g' >"$out.txt"
+}
+pty_case() {
+  local name=$1 expect=$2 first=$3
+  shift 3
+  pty_run "$work/pty-drain.sh" "$work/pty-$name.out" "$@"
+  grep -Fq "DRAIN=$expect" "$work/pty-$name.out.txt" || { cat "$work/pty-$name.out.txt" >&2; fail "PTY $name: drain not $expect"; }
+  grep -Fq 'STTY=same' "$work/pty-$name.out.txt" || fail "PTY $name: terminal mode not restored"
+  grep -Fq "FIRST=[$first]" "$work/pty-$name.out.txt" || fail "PTY $name: first line"
+  grep -Fq 'NEXT=[y]' "$work/pty-$name.out.txt" || { cat "$work/pty-$name.out.txt" >&2; fail "PTY $name: next answer polluted"; }
+}
+pty_case lf clean 'ssh-ed25519 AAAA key1' 'ssh-ed25519 AAAA key1\n' @3 'y\n'
+pty_case crlf clean 'ssh-ed25519 AAAA key1' 'ssh-ed25519 AAAA key1\r\n' @3 'y\n'
+pty_case extra-enter clean 'ssh-ed25519 AAAA key1' 'ssh-ed25519 AAAA key1\n' @0.1 '\n' @3 'y\n'
+pty_case no-final-newline multi 'ssh-ed25519 AAAA key1' 'ssh-ed25519 AAAA key1\nssh-ed25519 BBBB key2' @3 'y\n'
+# Three-line private key through the real paste flow: both warnings, then a clean next prompt.
+pty_run "$work/pty-paste.sh" "$work/pty-private.out" \
+  '-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQ\n-----END OPENSSH PRIVATE KEY-----\n' @3 "$paste_pub\\n" @3 'y\n'
+grep -Fq '这是私钥，不是公钥！' "$work/pty-private.out.txt" || { cat "$work/pty-private.out.txt" >&2; fail 'PTY private key warning'; }
+grep -Fq '检测到多行内容，请只粘贴一行公钥' "$work/pty-private.out.txt" || fail 'PTY multi-line warning'
+if grep -Fq '公钥无效' "$work/pty-private.out.txt"; then fail 'PTY: private key lines leaked into the next paste prompt'; fi
+grep -Fq "KEY0=[$paste_pub] COUNT=1" "$work/pty-private.out.txt" || { cat "$work/pty-private.out.txt" >&2; fail 'PTY: key pasted after the private key not taken as is'; }
+grep -Fq 'STTY=same' "$work/pty-private.out.txt" || fail 'PTY paste: terminal mode not restored'
+
+# ---- test switch for the key file -----------------------------------------------
+t_keys_file_alone() { unset VPS_INIT_REINSTALL_TEST; VPS_INIT_REINSTALL_KEYS_FILE="$work/ak-none"; reinstall_parse_test_mode; }
+expect_die 'keys file without a test mode' 'VPS_INIT_REINSTALL_KEYS_FILE 只能与 VPS_INIT_REINSTALL_TEST=dry-run 一起使用。' t_keys_file_alone
+# Only dry-run: the other modes write a real boot entry, which must never carry a test key file.
+t_keys_file_mode() { VPS_INIT_REINSTALL_TEST=$1 VPS_INIT_REINSTALL_KEYS_FILE="$work/ak-none"; reinstall_parse_test_mode; }
+for mode in no-reboot selfcheck-fail; do
+  expect_die "keys file with $mode" 'VPS_INIT_REINSTALL_KEYS_FILE 只能与 VPS_INIT_REINSTALL_TEST=dry-run 一起使用。' t_keys_file_mode "$mode"
+done
+t_keys_file_dry() {
+  use_host
+  UI_WIDTH=200
+  VPS_INIT_REINSTALL_TEST=dry-run VPS_INIT_REINSTALL_KEYS_FILE="$work/ak-mixed"
+  reinstall_parse_test_mode
+  [[ "$REINSTALL_AUTHORIZED_KEYS" == "$work/ak-mixed" ]] || fail "keys file not used: $REINSTALL_AUTHORIZED_KEYS"
+  reinstall_check_keys
+  (( ${#REINSTALL_KEYS[@]} == 2 )) || fail 'keys not read from the override file'
+  reinstall_print_summary
+}
+expect_ok 'keys file with dry-run' t_keys_file_dry
+awk '/测试模式：dry-run/ {m=NR} /测试：公钥文件改读/ {k=NR} END {exit !(m && k && k == m + 1)}' "$work/last.out" || fail 'keys file summary line missing or misplaced'
+grep -Fq "测试：公钥文件改读 $work/ak-mixed" "$work/last.out" || fail 'keys file summary path'
+t_keys_file_unset() {
+  local default=$REINSTALL_AUTHORIZED_KEYS
+  unset VPS_INIT_REINSTALL_TEST VPS_INIT_REINSTALL_KEYS_FILE
+  reinstall_parse_test_mode
+  [[ "$REINSTALL_AUTHORIZED_KEYS" == "$default" && -z "$REINSTALL_KEYS_FILE_OVERRIDE" ]] || fail 'keys path changed without the switch'
+  use_host
+  reinstall_print_summary
+}
+expect_ok 'no keys file switch' t_keys_file_unset
+if grep -Fq '测试：公钥文件改读' "$work/last.out"; then fail 'keys file line shown without the switch'; fi
+
+# ---- hostname confirmation and the ready box ------------------------------------
+t_hostname_empty_then_ok() {
+  use_host
+  REPLIES=('' '  ' 'vps-test')
+  paste_fakes
+  reinstall_generate_password() { :; }
+  reinstall_confirm
+  (( REPLY_I == 3 )) || fail "hostname asked $REPLY_I times"
+}
+expect_ok 'hostname: empty asks again, then passes' t_hostname_empty_then_ok
+grep -Fq '主机名确认通过' "$work/last.out" || fail 'hostname confirmation after re-ask'
+grep -Fxq '请输入主机名 vps-test 以确认，或 Ctrl+C 退出（输错将取消）' "$work/tty" || fail 'hostname re-ask hint'
+: >"$work/tty"
+# The hostname prompt is styled as a warning (whole line bold yellow when colored).
+t_hostname_style() {
+  use_host
+  reinstall_generate_password() { :; }
+  read_tty() { [[ "${3:-}" == warn ]] || fail 'hostname prompt not styled as a warning'; printf -v "$2" '%s' vps-test; }
+  reinstall_confirm
+}
+expect_ok 'hostname prompt style' t_hostname_style
+
+t_ready() {
+  use_host
+  UI_WIDTH=200 # Keep each box line whole for grep.
+  if [[ "$1" == unset ]]; then unset SSH_CONNECTION; else SSH_CONNECTION=$1; fi
+  reinstall_print_ready
+}
+ready_lines=(
+  'ssh -p 22 root@203.0.113.10'
+  '请用私钥连接（如 Termius 需在主机设置里绑定私钥）；密码登录已关闭'
+  'root 密码：FixturePassword12345'
+  'root 密码只在 VNC 控制台有效；商家面板显示的旧密码会失效'
+  'ssh-keygen -R 203.0.113.10'
+  '下一步：用 README 的一键命令运行 [1] 快速初始化'
+  '安装通常需要 2～10 分钟，期间 SSH 连不上属正常现象'
+  '超过 30 分钟仍连不上，再用 VNC 查看'
+)
+old_port_line='若用旧端口 2222 又能连上：说明安装器自检未通过、已自动回到旧系统，磁盘未改动'
+same_port_line='若连上后发现仍是旧系统：说明安装器自检未通过、已自动回到旧系统，磁盘未改动'
+for ssh_connection in '198.51.100.7 50000 203.0.113.10 2222' '198.51.100.7 50000 203.0.113.10 22' unset '198.51.100.7 50000 203.0.113.10 70000' '198.51.100.7 50000 203.0.113.10 22x' ''; do
+  expect_ok "ready box with SSH_CONNECTION=[$ssh_connection]" t_ready "$ssh_connection"
+  prev=0
+  for line in "${ready_lines[@]}"; do
+    n=$(grep -Fn -- "$line" "$work/last.out" | head -n 1 | cut -d: -f1)
+    [[ -n "$n" && "$n" -gt "$prev" ]] || fail "ready box line missing or out of order: $line"
+    prev=$n
+  done
+  if [[ "$ssh_connection" == *' 2222' ]]; then expected=$old_port_line; else expected=$same_port_line; fi
+  n=$(grep -Fn -- "$expected" "$work/last.out" | head -n 1 | cut -d: -f1)
+  [[ -n "$n" && "$n" -gt "$prev" ]] || fail "ready box old-port line for [$ssh_connection]"
+  [[ "$(grep -c '若用旧端口\|若连上后发现仍是旧系统' "$work/last.out")" == 1 ]] || fail "ready box shows both old-port lines for [$ssh_connection]"
+  [[ "$(grep -c 'root 密码' "$work/last.out")" == 2 ]] || fail 'ready box repeats the root password note'
+  if grep -Fq '5～20 分钟' "$work/last.out"; then fail 'old install time still shown'; fi
+done
 
 # GRUB checks: each rejection condition.
 grub_fixture() {
