@@ -165,8 +165,291 @@ declare -a FAIL2BAN_MANAGED_FILES=(
   jail.d/vps-init-sing-box-reality.local
 )
 
-log()  { printf '[INFO] %s\n' "$*"; }
-warn() { printf '[WARN] %s\n' "$*" >&2; }
+C_OUT_RESET='' C_OUT_BOLD='' C_OUT_DIM='' C_OUT_RED='' C_OUT_GREEN='' C_OUT_YELLOW='' C_OUT_CYAN=''
+C_ERR_RESET='' C_ERR_BOLD='' C_ERR_DIM='' C_ERR_RED='' C_ERR_GREEN='' C_ERR_YELLOW='' C_ERR_CYAN=''
+C_TTY_RESET='' C_TTY_BOLD='' C_TTY_DIM='' C_TTY_RED='' C_TTY_GREEN='' C_TTY_YELLOW='' C_TTY_CYAN=''
+C_RESET='' C_BOLD='' C_DIM='' C_RED='' C_GREEN='' C_YELLOW='' C_CYAN=''
+UI_TARGET='out'
+UI_TL='╭' UI_TR='╮' UI_BL='╰' UI_BR='╯' UI_V='│' UI_H='─' UI_ML='├' UI_MR='┤'
+UI_WIDTH=72
+
+ui_set_palette() {
+  local prefix=$1 enabled=$2
+  if [[ "$enabled" == true ]]; then
+    printf -v "${prefix}_RESET" '%s' $'\033[0m'
+    printf -v "${prefix}_BOLD" '%s' $'\033[1m'
+    printf -v "${prefix}_DIM" '%s' $'\033[2m'
+    printf -v "${prefix}_RED" '%s' $'\033[31m'
+    printf -v "${prefix}_GREEN" '%s' $'\033[32m'
+    printf -v "${prefix}_YELLOW" '%s' $'\033[33m'
+    printf -v "${prefix}_CYAN" '%s' $'\033[36m'
+  else
+    printf -v "${prefix}_RESET" '%s' ''
+    printf -v "${prefix}_BOLD" '%s' ''
+    printf -v "${prefix}_DIM" '%s' ''
+    printf -v "${prefix}_RED" '%s' ''
+    printf -v "${prefix}_GREEN" '%s' ''
+    printf -v "${prefix}_YELLOW" '%s' ''
+    printf -v "${prefix}_CYAN" '%s' ''
+  fi
+}
+
+ui_use_target() {
+  local target=${1:-out}
+  UI_TARGET=$target
+  case "$target" in
+    out)
+      if [[ -t 1 && -n "$C_OUT_RESET" ]]; then
+        C_RESET=$C_OUT_RESET C_BOLD=$C_OUT_BOLD C_DIM=$C_OUT_DIM
+        C_RED=$C_OUT_RED C_GREEN=$C_OUT_GREEN C_YELLOW=$C_OUT_YELLOW C_CYAN=$C_OUT_CYAN
+      else
+        C_RESET='' C_BOLD='' C_DIM='' C_RED='' C_GREEN='' C_YELLOW='' C_CYAN=''
+      fi ;;
+    err)
+      if [[ -t 2 && -n "$C_ERR_RESET" ]]; then
+        C_RESET=$C_ERR_RESET C_BOLD=$C_ERR_BOLD C_DIM=$C_ERR_DIM
+        C_RED=$C_ERR_RED C_GREEN=$C_ERR_GREEN C_YELLOW=$C_ERR_YELLOW C_CYAN=$C_ERR_CYAN
+      else
+        C_RESET='' C_BOLD='' C_DIM='' C_RED='' C_GREEN='' C_YELLOW='' C_CYAN=''
+      fi ;;
+    tty)
+      C_RESET=$C_TTY_RESET C_BOLD=$C_TTY_BOLD C_DIM=$C_TTY_DIM
+      C_RED=$C_TTY_RED C_GREEN=$C_TTY_GREEN C_YELLOW=$C_TTY_YELLOW C_CYAN=$C_TTY_CYAN ;;
+  esac
+}
+
+ui_init() {
+  local color_allowed=false out_color=false err_color=false tty_color=false
+  local size='' cols=''
+  if [[ -z "${NO_COLOR+x}" && "${TERM:-}" != dumb ]]; then
+    color_allowed=true
+  fi
+  if [[ "$color_allowed" == true ]]; then
+    if [[ -t 1 ]]; then out_color=true; fi
+    if [[ -t 2 ]]; then err_color=true; fi
+    if [[ -w /dev/tty ]] && ( exec 3>>/dev/tty && [[ -t 3 ]] ) 2>/dev/null; then
+      tty_color=true
+    fi
+  fi
+  ui_set_palette C_OUT "$out_color"
+  ui_set_palette C_ERR "$err_color"
+  ui_set_palette C_TTY "$tty_color"
+  ui_use_target out
+
+  if [[ "${TERM:-}" == linux ]]; then
+    UI_TL='+' UI_TR='+' UI_BL='+' UI_BR='+'
+    UI_V='|' UI_H='-' UI_ML='+' UI_MR='+'
+  else
+    UI_TL='╭' UI_TR='╮' UI_BL='╰' UI_BR='╯'
+    UI_V='│' UI_H='─' UI_ML='├' UI_MR='┤'
+  fi
+
+  UI_WIDTH=72
+  if [[ -r /dev/tty ]]; then
+    size=$({ stty size </dev/tty; } 2>/dev/null || true)
+  fi
+  if [[ "$size" =~ ^[0-9]+[[:space:]]+([0-9]+)$ ]]; then
+    cols=${BASH_REMATCH[1]}
+    if (( cols > 0 && cols < 72 )); then
+      UI_WIDTH=$cols
+    fi
+  fi
+}
+
+ui_tty_writable() {
+  ( : >>/dev/tty ) 2>/dev/null
+}
+
+ui_repeat() {
+  local char=$1 count=$2 out=''
+  (( count > 0 )) || return 0
+  printf -v out '%*s' "$count" ''
+  printf '%s' "${out// /$char}"
+}
+
+ui_display_width() {
+  local width
+  width=$(LC_ALL=C.UTF-8 wc -L <<<"$1")
+  printf '%s' "${width//[[:space:]]/}"
+}
+
+ui_box_top() {
+  local title=${1:-} b_color=$C_CYAN t_color=$C_BOLD r_color=$C_RESET
+  local tw fill
+  if [[ "$UI_TARGET" == out && ! -t 1 ]]; then b_color='' t_color='' r_color=''; fi
+  if [[ -z "$title" ]]; then
+    fill=$((UI_WIDTH - 2))
+    printf '%s%s%s%s%s\n' "$b_color" "$UI_TL" "$(ui_repeat "$UI_H" "$fill")" "$UI_TR" "$r_color"
+    return 0
+  fi
+  tw=$(ui_display_width "$title")
+  fill=$((UI_WIDTH - tw - 5))
+  if (( fill >= 1 )); then
+    printf '%s%s%s%s %s%s%s %s%s%s%s\n' \
+      "$b_color" "$UI_TL" "$UI_H" "$r_color" \
+      "$t_color" "$title" "$r_color" \
+      "$b_color" "$(ui_repeat "$UI_H" "$fill")" "$UI_TR" "$r_color"
+  else
+    printf '%s%s%s%s %s%s%s\n' \
+      "$b_color" "$UI_TL" "$UI_H" "$r_color" \
+      "$t_color" "$title" "$r_color"
+  fi
+}
+
+declare -A UI_CHAR_WIDTH_CACHE=()
+UI_CHAR_WIDTH=1
+declare -a UI_WRAP_SEGS=() UI_WRAP_WIDTHS=()
+
+# Display width of one character into UI_CHAR_WIDTH. Printable ASCII is 1; anything else is
+# measured once with wc -L and cached, so wrapping never spawns a process per character.
+# Callers must already run under a UTF-8 LC_ALL (see ui_wrap_text).
+ui_char_width() {
+  local ch=$1 code=0 w
+  printf -v code '%d' "'$ch" 2>/dev/null || code=0
+  if (( code >= 32 && code <= 126 )); then
+    UI_CHAR_WIDTH=1
+    return 0
+  fi
+  if [[ -z "${UI_CHAR_WIDTH_CACHE[$ch]+x}" ]]; then
+    w=$(LC_ALL=C.UTF-8 wc -L <<<"$ch")
+    UI_CHAR_WIDTH_CACHE[$ch]=${w//[[:space:]]/}
+  fi
+  UI_CHAR_WIDTH=${UI_CHAR_WIDTH_CACHE[$ch]}
+}
+
+# Split plain text into segments no wider than $2 display columns (UI_WRAP_SEGS, with each segment's
+# width in UI_WRAP_WIDTHS). Break after a space or Chinese punctuation found in the latter half of a
+# segment, else hard-break; no character is dropped. Continuation segments are indented by the
+# original leading spaces + 2 (capped at half the inner width so progress is always possible).
+ui_wrap_text() {
+  local text=$1 inner=$2
+  local LC_ALL=C.UTF-8
+  local punct='，。；、：' lead cont indent n=${#text} i j k start=0 avail cum brk seg first=true
+  local -a ch=() cw=()
+  UI_WRAP_SEGS=() UI_WRAP_WIDTHS=()
+  lead=${text%%[! ]*}
+  cont=$(( ${#lead} + 2 ))
+  if (( cont > inner / 2 )); then cont=$(( inner / 2 )); fi
+  printf -v indent '%*s' "$cont" ''
+  for (( i = 0; i < n; i++ )); do
+    ch[i]=${text:i:1}
+    ui_char_width "${ch[i]}"
+    cw[i]=$UI_CHAR_WIDTH
+  done
+  while (( start < n )); do
+    if [[ "$first" == true ]]; then avail=$inner; else avail=$(( inner - cont )); fi
+    cum=0 j=$start brk=-1
+    while (( j < n && cum + cw[j] <= avail )); do
+      cum=$(( cum + cw[j] ))
+      if (( cum * 2 > avail )) && [[ "${ch[j]}" == ' ' || "$punct" == *"${ch[j]}"* ]]; then brk=$j; fi
+      j=$(( j + 1 ))
+    done
+    if (( j == start )); then
+      j=$(( start + 1 ))  # a character wider than the box still makes progress
+      cum=${cw[start]}
+    elif (( j < n && brk >= 0 )); then
+      j=$(( brk + 1 ))
+      cum=0
+      for (( k = start; k < j; k++ )); do cum=$(( cum + cw[k] )); done
+    fi
+    seg=''
+    for (( k = start; k < j; k++ )); do seg+=${ch[k]}; done
+    if [[ "$first" == true ]]; then
+      UI_WRAP_SEGS+=("$seg")
+      UI_WRAP_WIDTHS+=("$cum")
+    else
+      UI_WRAP_SEGS+=("${indent}${seg}")
+      UI_WRAP_WIDTHS+=("$(( cont + cum ))")
+    fi
+    first=false
+    start=$j
+  done
+}
+
+# Internal: $1 plain text, $2 rendered text (used only when the line fits), $3 optional whole-line color.
+ui_box_emit() {
+  local plain=$1 rendered=$2 color=$3 b_color=$C_CYAN r_color=$C_RESET
+  local w inner pad i text
+  if [[ "$UI_TARGET" == out && ! -t 1 ]]; then
+    b_color='' r_color='' rendered=$plain color=''
+  fi
+  w=$(ui_display_width "$plain")
+  inner=$((UI_WIDTH - 4))
+  if (( w <= inner )); then
+    if [[ -n "$color" ]]; then rendered="${color}${plain}${r_color}"; fi
+    pad=$((inner - w))
+    printf '%s%s%s %s%s %s%s%s\n' \
+      "$b_color" "$UI_V" "$r_color" \
+      "$rendered" "$(ui_repeat ' ' "$pad")" \
+      "$b_color" "$UI_V" "$r_color"
+    return 0
+  fi
+  ui_wrap_text "$plain" "$inner"
+  for i in "${!UI_WRAP_SEGS[@]}"; do
+    text=${UI_WRAP_SEGS[i]}
+    if [[ -n "$color" ]]; then text="${color}${text}${r_color}"; fi
+    pad=$((inner - UI_WRAP_WIDTHS[i]))
+    printf '%s%s%s %s%s %s%s%s\n' \
+      "$b_color" "$UI_V" "$r_color" \
+      "$text" "$(ui_repeat ' ' "$pad")" \
+      "$b_color" "$UI_V" "$r_color"
+  done
+}
+
+# ui_box_line <plain> [rendered]: rendered may color part of the line; a wrapped line is uncolored.
+ui_box_line() {
+  ui_box_emit "$1" "${2-$1}" ''
+}
+
+# ui_box_line_color <color> <text>: color the whole line, every wrapped segment included.
+ui_box_line_color() {
+  ui_box_emit "$2" "$2" "$1"
+}
+
+ui_box_sep() {
+  local b_color=$C_CYAN r_color=$C_RESET fill=$((UI_WIDTH - 2))
+  if [[ "$UI_TARGET" == out && ! -t 1 ]]; then b_color='' r_color=''; fi
+  printf '%s%s%s%s%s\n' "$b_color" "$UI_ML" "$(ui_repeat "$UI_H" "$fill")" "$UI_MR" "$r_color"
+}
+
+ui_box_bottom() {
+  local b_color=$C_CYAN r_color=$C_RESET fill=$((UI_WIDTH - 2))
+  if [[ "$UI_TARGET" == out && ! -t 1 ]]; then b_color='' r_color=''; fi
+  printf '%s%s%s%s%s\n' "$b_color" "$UI_BL" "$(ui_repeat "$UI_H" "$fill")" "$UI_BR" "$r_color"
+}
+
+ui_menu_item() {
+  local num=$1 label=$2 color=${3:-${C_BOLD}${C_GREEN}}
+  ui_box_line "${num}. ${label}" "${color}${num}.${C_RESET} ${label}"
+}
+
+ui_box_kv() {
+  local key=$1 val=$2 warn_flag=${3:-false}
+  local plain="${key}${val}"
+  if [[ "$warn_flag" == true && -n "$C_YELLOW" ]]; then
+    ui_box_line "$plain" "${key}${C_YELLOW}${val}${C_RESET}"
+  else
+    ui_box_line "$plain"
+  fi
+}
+
+ui_init
+
+log() {
+  if [[ -t 1 && -n "$C_OUT_CYAN" ]]; then
+    printf '%s[INFO]%s %s\n' "$C_OUT_CYAN" "$C_OUT_RESET" "$*"
+  else
+    printf '[INFO] %s\n' "$*"
+  fi
+}
+
+warn() {
+  if [[ -t 2 && -n "$C_ERR_YELLOW" ]]; then
+    printf '%s[WARN]%s %s\n' "$C_ERR_YELLOW" "$C_ERR_RESET" "$*" >&2
+  else
+    printf '[WARN] %s\n' "$*" >&2
+  fi
+}
 
 usage() {
   cat <<'EOF'
@@ -222,7 +505,17 @@ read_tty() {
   local prompt=$1 var=$2
   [[ "$CONFIG_CONFIRMED" == false ]] || die "执行阶段出现未预收集的交互：$prompt"
   [[ -r /dev/tty && -w /dev/tty ]] || die '需要交互输入，但当前没有可用 /dev/tty。'
-  printf '%s' "$prompt" >/dev/tty
+  if [[ -n "$C_TTY_BOLD" ]]; then
+    if [[ "$prompt" == *' [Y/n] ' ]]; then
+      printf '%s%s%s [%sY%s/n] ' "$C_TTY_BOLD" "${prompt%' [Y/n] '}" "$C_TTY_RESET" "${C_TTY_BOLD}${C_TTY_CYAN}" "$C_TTY_RESET" >/dev/tty
+    elif [[ "$prompt" == *' [y/N] ' ]]; then
+      printf '%s%s%s [y/%sN%s] ' "$C_TTY_BOLD" "${prompt%' [y/N] '}" "$C_TTY_RESET" "${C_TTY_BOLD}${C_TTY_CYAN}" "$C_TTY_RESET" >/dev/tty
+    else
+      printf '%s%s%s' "$C_TTY_BOLD" "$prompt" "$C_TTY_RESET" >/dev/tty
+    fi
+  else
+    printf '%s' "$prompt" >/dev/tty
+  fi
   IFS= read -r "${var?}" </dev/tty || die '读取交互输入失败。'
 }
 
@@ -423,7 +716,11 @@ on_error() {
   rollback_ufw || true
   rollback_ssh || true
   rollback_dns || true
-  printf '[ERROR] 步骤“%s”第 %s 行失败（退出码 %s）。\n' "$CURRENT_STEP" "$line" "$rc" >&2
+  if [[ -t 2 && -n "$C_ERR_RED" ]]; then
+    printf '%s[ERROR]%s 步骤“%s”第 %s 行失败（退出码 %s）。\n' "${C_ERR_BOLD}${C_ERR_RED}" "$C_ERR_RESET" "$CURRENT_STEP" "$line" "$rc" >&2
+  else
+    printf '[ERROR] 步骤“%s”第 %s 行失败（退出码 %s）。\n' "$CURRENT_STEP" "$line" "$rc" >&2
+  fi
   exit "$rc"
 }
 
@@ -445,7 +742,11 @@ die() {
   rollback_ufw || true
   rollback_ssh || true
   rollback_dns || true
-  printf '[ERROR] 步骤“%s”：%s\n' "$CURRENT_STEP" "$*" >&2
+  if [[ -t 2 && -n "$C_ERR_RED" ]]; then
+    printf '%s[ERROR]%s 步骤“%s”：%s\n' "${C_ERR_BOLD}${C_ERR_RED}" "$C_ERR_RESET" "$CURRENT_STEP" "$*" >&2
+  else
+    printf '[ERROR] 步骤“%s”：%s\n' "$CURRENT_STEP" "$*" >&2
+  fi
   exit 1
 }
 
@@ -838,7 +1139,20 @@ collect_quick_choices() {
   if [[ "$KEEP_SSH_22_SET" == false ]]; then KEEP_SSH_22=false; fi
   if [[ "$PRESERVE_SSH" == false && "$SSH_PORT_SET" == false ]]; then
     while true; do
-      read_tty $'\n1. 22 only\n2. 53651 only（默认）\n3. 自定义端口 only\n4. 保留现有 SSH 配置\n请选择 SSH 端口 [1-4]: ' choice
+      if ui_tty_writable; then
+        ui_use_target tty
+        {
+          printf '\n'
+          ui_box_top 'SSH 端口'
+          ui_menu_item 1 '22 only'
+          ui_menu_item 2 '53651 only（默认）'
+          ui_menu_item 3 '自定义端口 only'
+          ui_menu_item 4 '保留现有 SSH 配置'
+          ui_box_bottom
+        } >/dev/tty
+        ui_use_target out
+      fi
+      read_tty '请选择 SSH 端口 [1-4]: ' choice
       case "${choice:-2}" in
         1) port=22 ;;
         2) port=$DEFAULT_SSH_PORT ;;
@@ -868,7 +1182,19 @@ collect_network_choice() {
   local choice=''
   if [[ "$NETWORK_REQUEST_SET" == false ]]; then
     while true; do
-      read_tty $'\n1. Auto（默认）\n2. IPv4-only\n3. Dual-Stack\n请选择网络模式 [1-3]: ' choice
+      if ui_tty_writable; then
+        ui_use_target tty
+        {
+          printf '\n'
+          ui_box_top '网络模式'
+          ui_menu_item 1 'Auto（默认）'
+          ui_menu_item 2 'IPv4-only'
+          ui_menu_item 3 'Dual-Stack'
+          ui_box_bottom
+        } >/dev/tty
+        ui_use_target out
+      fi
+      read_tty '请选择网络模式 [1-3]: ' choice
       case "${choice:-1}" in
         1) NETWORK_REQUEST=auto; break ;;
         2) NETWORK_REQUEST=ipv4; break ;;
@@ -1541,7 +1867,18 @@ collect_ipv6_boot_policy() {
   fi
   if [[ "$NETWORK_REQUEST_SET" == false ]] && tty_available; then
     while true; do
-      read_tty $'\n1. 恢复 IPv6：写入脚本管理的 /etc/sysctl.d/99-vps-init-network.conf 覆盖上述设置（不修改原有文件）\n2. 保留，Auto 按 IPv4 处理（默认）\n请选择 [1-2]: ' choice
+      if ui_tty_writable; then
+        ui_use_target tty
+        {
+          printf '\n'
+          ui_box_top '重启后 IPv6'
+          ui_menu_item 1 '恢复 IPv6：写入脚本管理的 /etc/sysctl.d/99-vps-init-network.conf 覆盖上述设置（不修改原有文件）'
+          ui_menu_item 2 '保留，Auto 按 IPv4 处理（默认）'
+          ui_box_bottom
+        } >/dev/tty
+        ui_use_target out
+      fi
+      read_tty '请选择 [1-2]: ' choice
       case "${choice:-2}" in
         1) IPV6_RESTORE_CHOICE=restore; break ;;
         2) IPV6_RESTORE_CHOICE=keep; break ;;
@@ -4188,16 +4525,30 @@ audit_type_help() {
 }
 
 print_security_audit() {
-  local mode=${1:-summary} level title row count type target detail seen
+  local mode=${1:-summary} level title desc level_color row count type target detail seen label help
+  ui_use_target out
+  printf '\n'
+  ui_box_top '安全体检报告'
   for level in A B C; do
+    if [[ "$level" != A ]]; then ui_box_sep; fi
     case "$level" in
-      A) title='A 建议删除：这些是登录钥匙或商家助手；确认不需要再处理，默认保留。' ;;
-      B) title='B 需要你看一眼：这些有额外权限或后台行为；可能是你装的，只报告。' ;;
-      C) title='C 严重异常：这些会改变系统或登录信任；只报告，建议用官方系统重装。' ;;
+      A)
+        title='A 建议删除'
+        desc='这些是登录钥匙或商家助手；确认不需要再处理，默认保留。'
+        level_color="$C_YELLOW" ;;
+      B)
+        title='B 需要你看一眼'
+        desc='这些有额外权限或后台行为；可能是你装的，只报告。'
+        level_color="$C_CYAN" ;;
+      C)
+        title='C 严重异常'
+        desc='这些会改变系统或登录信任；只报告，建议用官方系统重装。'
+        level_color="${C_BOLD}${C_RED}" ;;
     esac
     count=0
     for row in "${AUDIT_FINDINGS[@]}"; do [[ "$row" != "$level"$'\t'* ]] || count=$((count + 1)); done
-    printf '\n[%s]（%s 项）\n' "$title" "$count"
+    ui_box_line_color "$level_color" "${title}（${count} 项）"
+    ui_box_line_color "$C_DIM" "  ${desc}"
     if [[ "$mode" == full ]]; then
       seen=$'\n'
       for row in "${AUDIT_FINDINGS[@]}"; do
@@ -4205,13 +4556,17 @@ print_security_audit() {
         IFS=$'\t' read -r _ type target detail <<<"$row"
         if [[ "$seen" != *$'\n'"$type"$'\n'* ]]; then
           seen+="$type"$'\n'
-          printf '  ▸ %s：%s\n' "$(audit_type_label "$type")" "$(audit_type_help "$type")"
+          label=$(audit_type_label "$type")
+          help=$(audit_type_help "$type")
+          ui_box_line "  ▸ ${label}：${help}" "  ${level_color}▸ ${label}${C_RESET}：${help}"
         fi
-        printf '      - %s — %s\n' "$target" "$detail"
+        ui_box_line "      - ${target} — ${detail}"
       done
     fi
   done
-  printf '\n当前会话公钥：%s\n' "${AUDIT_SESSION_KEY:-无法确定，禁止删除公钥}"
+  ui_box_sep
+  ui_box_line "当前会话公钥：${AUDIT_SESSION_KEY:-无法确定，禁止删除公钥}"
+  ui_box_bottom
 }
 
 hardening_delete_key() {
@@ -4459,13 +4814,15 @@ run_security_hardening() {
           HARDENING_ACTIONS+=("已 purge exim4 邮件服务；cron 输出邮件将无法投递；恢复：apt-get install exim4；配置备份：$BACKUP_DIR/files/etc/exim4")
         fi ;;
     esac
-  done > >(tee "$BACKUP_DIR/actions.txt") 2>&1
+  done
   if (( ${#HARDENING_ACTIONS[@]} == 0 )); then
     rm -rf -- "$BACKUP_DIR"
     log '没有执行任何修改，已删除未使用的备份目录。'
     BACKUP_DIR=''
     return 0
   fi
+  install -m 0600 /dev/null "$BACKUP_DIR/actions.txt"
+  printf -- '- %s\n' "${HARDENING_ACTIONS[@]}" >"$BACKUP_DIR/actions.txt"
   collect_security_audit
   print_security_audit full >"$BACKUP_DIR/audit-after.txt"
   print_security_audit full
@@ -4476,6 +4833,9 @@ run_security_hardening() {
 
 print_report() {
   local ssh_listeners fail2ban_status='已安装、自启并运行；sshd 和 sshd-slow 已验证'
+  local ssh_display ufw_status smartdns_ver smartdns_mode singbox_ver tcp_cc tcp_qdisc swap_val sys_dns auto_sec reboot_needed
+  local ipv6_lines line
+  local ssh_warn=false ufw_warn=false smartdns_warn=false singbox_warn=false fail2ban_warn=false auto_sec_warn=false reboot_warn=false cleanup_warn=false
   ssh_listeners=$(ssh_listener_addresses | sort -u | paste -sd ' ' -) || ssh_listeners=''
   if [[ "$NETWORK_REQUEST" == ipv4 ]]; then verify_ipv4_policy; fi
   if [[ "$PRESERVE_SSH" == true ]]; then
@@ -4486,44 +4846,97 @@ print_report() {
       warn 'Fail2ban 未安装，保留 SSH 模式已跳过安装与配置。'
     fi
   fi
-  cat <<EOF
+  ssh_display="${ssh_listeners:-未检测到}"
+  if [[ "$PRESERVE_SSH" == true ]]; then ssh_display+='（保留现有配置）'; fi
+  if [[ -z "$ssh_listeners" ]]; then ssh_warn=true; fi
+  ufw_status=$(ufw status 2>/dev/null | sed -n '1p' || echo unavailable)
+  if [[ "$ufw_status" != 'Status: active' ]]; then ufw_warn=true; fi
+  smartdns_ver=$(smartdns -v 2>/dev/null | head -1 || echo unavailable)
+  if [[ "$smartdns_ver" == unavailable ]]; then smartdns_warn=true; fi
+  smartdns_mode="$([[ "$NETWORK_REQUEST" == ipv4 ]] && echo 'A only' || echo 'A + AAAA') / $SMARTDNS_TRANSPORT"
+  singbox_ver=$(sing-box version 2>/dev/null | head -1 || echo unavailable)
+  if [[ "$singbox_ver" == unavailable ]]; then singbox_warn=true; fi
+  if [[ "$fail2ban_status" == *未安装* ]]; then fail2ban_warn=true; fi
+  tcp_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo unavailable)
+  tcp_qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo unavailable)
+  swap_val=$(awk '/SwapTotal:/ {printf "%.0f MiB", $2/1024}' /proc/meminfo)
+  if [[ "$EARLY_DNS_FIXED" == true ]]; then
+    sys_dns="已提前修复系统 DNS，原文件备份在 $EARLY_DNS_BACKUP"
+  else
+    sys_dns='未提前修复（系统 DNS 原本可用）'
+  fi
+  if security_updates_enabled; then auto_sec='已启用'; else auto_sec='未启用'; auto_sec_warn=true; fi
+  if [[ -e /run/reboot-required ]]; then reboot_needed='yes'; reboot_warn=true; else reboot_needed='no'; fi
+  if [[ "$SAFE_CLEANUP_RESULT" == *未全部完成* || "$SAFE_CLEANUP_RESULT" == 未执行 ]]; then cleanup_warn=true; fi
+  ipv6_lines=$(ipv6_report_lines)
 
-============================================================
-VPS 初始化完成
-============================================================
-脚本版本      : $SCRIPT_VERSION
-系统          : ${PRETTY_NAME:-Debian}
-网络栈        : $NETWORK_STACK（策略 $NETWORK_REQUEST）
-$(if [[ "$NETWORK_REQUEST" == ipv4 ]]; then printf '内核 IPv6     : %s\n' "$IPV4_POLICY_STATUS"; fi)
-SSH 实际监听  : ${ssh_listeners:-未检测到}$(if [[ "$PRESERVE_SSH" == true ]]; then printf '（保留现有配置）'; fi)
-UFW           : $(ufw status 2>/dev/null | sed -n '1p' || echo unavailable)
-SmartDNS      : $(smartdns -v 2>/dev/null | head -1 || echo unavailable)
-SmartDNS 模式 : $([[ "$NETWORK_REQUEST" == ipv4 ]] && echo 'A only' || echo 'A + AAAA') / $SMARTDNS_TRANSPORT
-SmartDNS 监听 : 127.0.0.1:53（UDP+TCP）
-备用 DNS      : $FALLBACK_DNS（resolv.conf 第二个 nameserver）
-$(ipv6_report_lines)
-sing-box      : $(sing-box version 2>/dev/null | head -1 || echo unavailable)
-Fail2ban      : $fail2ban_status
-TCP / qdisc   : $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo unavailable) / $(sysctl -n net.core.default_qdisc 2>/dev/null || echo unavailable)
-Swap          : $(awk '/SwapTotal:/ {printf "%.0f MiB", $2/1024}' /proc/meminfo)
-系统 DNS      : $(if [[ "$EARLY_DNS_FIXED" == true ]]; then printf '已提前修复系统 DNS，原文件备份在 %s' "$EARLY_DNS_BACKUP"; else printf '未提前修复（系统 DNS 原本可用）'; fi)
-备份目录      : $BACKUP_DIR
-自动安全更新  : $(if security_updates_enabled; then echo 已启用; else echo 未启用; fi)
-需要重启      : $([[ -e /run/reboot-required ]] && echo yes || echo no)
-安全清理      : $SAFE_CLEANUP_RESULT
-重启后可运行 [7] 清理旧内核和无用包
-开机自启检查（不额外启动）：
-$BOOT_REPORT
-============================================================
-请保持当前 SSH 会话，并从另一终端验证所需的 SSH 监听地址和端口。
-EOF
+  ui_use_target out
+  printf '\n'
+  ui_box_top 'VPS 初始化完成'
+  ui_box_line "脚本版本      : $SCRIPT_VERSION"
+  ui_box_line "系统          : ${PRETTY_NAME:-Debian}"
+  ui_box_line "网络栈        : $NETWORK_STACK（策略 $NETWORK_REQUEST）"
+  if [[ "$NETWORK_REQUEST" == ipv4 ]]; then
+    ui_box_line "内核 IPv6     : $IPV4_POLICY_STATUS"
+  fi
+  ui_box_kv 'SSH 实际监听  : ' "$ssh_display" "$ssh_warn"
+  ui_box_kv 'UFW           : ' "$ufw_status" "$ufw_warn"
+  ui_box_kv 'SmartDNS      : ' "$smartdns_ver" "$smartdns_warn"
+  ui_box_line "SmartDNS 模式 : $smartdns_mode"
+  ui_box_line 'SmartDNS 监听 : 127.0.0.1:53（UDP+TCP）'
+  ui_box_line "备用 DNS      : $FALLBACK_DNS（resolv.conf 第二个 nameserver）"
+  if [[ -n "$ipv6_lines" ]]; then
+    while IFS= read -r line; do
+      ui_box_line "$line"
+    done <<<"$ipv6_lines"
+  fi
+  ui_box_kv 'sing-box      : ' "$singbox_ver" "$singbox_warn"
+  ui_box_kv 'Fail2ban      : ' "$fail2ban_status" "$fail2ban_warn"
+  ui_box_line "TCP / qdisc   : $tcp_cc / $tcp_qdisc"
+  ui_box_line "Swap          : $swap_val"
+  ui_box_line "系统 DNS      : $sys_dns"
+  ui_box_line "备份目录      : $BACKUP_DIR"
+  ui_box_kv '自动安全更新  : ' "$auto_sec" "$auto_sec_warn"
+  ui_box_kv '需要重启      : ' "$reboot_needed" "$reboot_warn"
+  ui_box_kv '安全清理      : ' "$SAFE_CLEANUP_RESULT" "$cleanup_warn"
+  ui_box_line '重启后可运行 [7] 清理旧内核和无用包'
+  ui_box_line '开机自启检查（不额外启动）：'
+  if [[ -n "$BOOT_REPORT" ]]; then
+    while IFS= read -r line; do
+      [[ -n "$line" ]] || continue
+      if [[ "$line" == *失败* || "$line" == *'不是 active'* || "$line" == *未获得持久自启状态* || "$line" == *冲突* ]]; then
+        ui_box_line "$line" "${C_YELLOW}${line}${C_RESET}"
+      else
+        ui_box_line "$line"
+      fi
+    done <<<"$BOOT_REPORT"
+  fi
+  ui_box_bottom
+  printf '%s请保持当前 SSH 会话，并从另一终端验证所需的 SSH 监听地址和端口。%s\n' "$C_YELLOW" "$C_RESET"
 }
 
 select_install_mode() {
   [[ -z "$INSTALL_MODE" ]] || return 0
   local choice=''
   while true; do
-    printf '\n404-vps-tools debian-init.sh v%s\n1. 快速初始化\n2. 自定义初始化\n3. 仅安装/更新 SmartDNS\n4. 安装/升级 sing-box\n5. 仅安装/更新 Fail2ban\n6. 仅更新系统\n7. 系统清理\n8. 安全加固（体检 → 建议 → 确认后执行）\n0. 退出\n' "$SCRIPT_VERSION" >/dev/tty
+    if ui_tty_writable; then
+      ui_use_target tty
+      {
+        printf '\n'
+        ui_box_top "404-vps-tools · debian-init.sh v$SCRIPT_VERSION"
+        ui_menu_item 1 '快速初始化'
+        ui_menu_item 2 '自定义初始化'
+        ui_menu_item 3 '仅安装/更新 SmartDNS'
+        ui_menu_item 4 '安装/升级 sing-box'
+        ui_menu_item 5 '仅安装/更新 Fail2ban'
+        ui_menu_item 6 '仅更新系统'
+        ui_menu_item 7 '系统清理'
+        ui_menu_item 8 '安全加固（体检 → 建议 → 确认后执行）' "$C_YELLOW"
+        ui_menu_item 0 '退出' "$C_DIM"
+        ui_box_bottom
+      } >/dev/tty
+      ui_use_target out
+    fi
     read_tty '请选择 [0-8]: ' choice
     case "$choice" in
       1) INSTALL_MODE=quick; return 0 ;;
@@ -4543,7 +4956,17 @@ select_install_mode() {
 collect_custom_phase_choice() {
   local choice=''
   while true; do
-    printf '\n选择基础工具安装后的流程：\n1. 继续完整初始化\n2. 完成基础工具后退出，用于测试 IP、线路和基础环境\n' >/dev/tty
+    if ui_tty_writable; then
+      ui_use_target tty
+      {
+        printf '\n'
+        ui_box_top '选择基础工具安装后的流程'
+        ui_menu_item 1 '继续完整初始化'
+        ui_menu_item 2 '完成基础工具后退出，用于测试 IP、线路和基础环境'
+        ui_box_bottom
+      } >/dev/tty
+      ui_use_target out
+    fi
     read_tty '请选择 [1-2]: ' choice
     case "$choice" in
       1) return 0 ;;
@@ -4617,20 +5040,27 @@ print_initialization_summary() {
   if [[ "$REUSE_PUBLIC_KEY" == true ]]; then key='复用已确认的公钥'; fi
   if [[ "$PRESERVE_SSH" == true ]]; then ssh='保留原有监听、认证及 UFW'; key='保留原有公钥'; fi
   if [[ "$BASE_ONLY" == true ]]; then ssh='不配置'; key='不配置'; network='不修改'; fi
-  printf '\n本次执行配置：\n模式：%s；仅基础工具：%s\nSSH：%s\n公钥：%s\n网络：%s\nfull-upgrade：%s；Swap：%sMiB（0 表示不创建）\n' \
-    "$INSTALL_MODE" "$BASE_ONLY" "$ssh" "$key" "$network" "$DO_FULL_UPGRADE" "$SWAP_CONFIRMED_MIB"
-  printf '自动安全更新：%s\n' "$AUTO_SECURITY"
+  ui_use_target out
+  printf '\n'
+  ui_box_top '本次执行配置'
+  ui_box_line "模式：${INSTALL_MODE}；仅基础工具：${BASE_ONLY}"
+  ui_box_line "SSH：${ssh}"
+  ui_box_line "公钥：${key}"
+  ui_box_line "网络：${network}"
+  ui_box_line "full-upgrade：${DO_FULL_UPGRADE}；Swap：${SWAP_CONFIRMED_MIB}MiB（0 表示不创建）"
+  ui_box_line "自动安全更新：${AUTO_SECURITY}"
   if [[ "$NETWORK_REQUEST" == auto && "$BASE_ONLY" == false ]]; then
     case "$IPV6_BOOT_STATE:$IPV6_RESTORE_CHOICE" in
-      off:restore) printf '重启后 IPv6：将被现有配置关闭；选择恢复，写入 %s 覆盖，不改原文件\n' "$NETWORK_SYSCTL" ;;
-      off:keep) printf '重启后 IPv6：将被现有配置关闭；保留，Auto 按 ipv4 处理\n' ;;
-      kernel-off:*) printf '重启后 IPv6：内核已禁用，按 ipv4 处理\n' ;;
-      pending:*) printf '重启后 IPv6：迁移脚本旧策略后复查\n' ;;
+      off:restore) ui_box_line "重启后 IPv6：将被现有配置关闭；选择恢复，写入 ${NETWORK_SYSCTL} 覆盖，不改原文件" ;;
+      off:keep) ui_box_line '重启后 IPv6：将被现有配置关闭；保留，Auto 按 ipv4 处理' ;;
+      kernel-off:*) ui_box_line '重启后 IPv6：内核已禁用，按 ipv4 处理' ;;
+      pending:*) ui_box_line '重启后 IPv6：迁移脚本旧策略后复查' ;;
     esac
   fi
   if [[ "$BASE_ONLY" == false ]]; then
-    printf 'DNS：SmartDNS 仅监听 127.0.0.1:53；resolv.conf 备用 %s\n' "$FALLBACK_DNS"
+    ui_box_line "DNS：SmartDNS 仅监听 127.0.0.1:53；resolv.conf 备用 ${FALLBACK_DNS}"
   fi
+  ui_box_bottom
 }
 
 install_component_dependencies() {

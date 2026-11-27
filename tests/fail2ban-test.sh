@@ -376,7 +376,8 @@ help_output=$(bash "$TEST_DIR/../debian-init.sh" --help)
 # A PTY exercises the real interactive menu on Linux CI.
 if [[ "$(uname -s)" == Linux ]] && command -v script >/dev/null; then
   printf '5\n' | script -qec "bash -c 'source \"$TEST_DIR/../debian-init.sh\"; select_install_mode; echo \"selected=\$INSTALL_MODE\"'" /dev/null >"$TEST_TMP/menu"
-  grep -Fq '5. 仅安装/更新 Fail2ban' "$TEST_TMP/menu"
-  grep -Fq 'selected=fail2ban' "$TEST_TMP/menu"
+  sed $'s/\033\\[[0-9;]*[A-Za-z]//g' "$TEST_TMP/menu" >"$TEST_TMP/menu.plain"
+  grep -Fq '5. 仅安装/更新 Fail2ban' "$TEST_TMP/menu.plain"
+  grep -Fq 'selected=fail2ban' "$TEST_TMP/menu.plain"
 fi
 echo 'PASS: Fail2ban quick install, preserve mode, standalone backends, custom jails and rollback'

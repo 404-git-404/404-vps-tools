@@ -690,7 +690,7 @@ for signals in 'TERM TERM' 'HUP TERM'; do
 done
 
 # The old wizard and its state file code are gone.
-grep -Fq '4. 安装/升级 sing-box' "$repo/debian-init.sh"
+grep -Fq "ui_menu_item 4 '安装/升级 sing-box'" "$repo/debian-init.sh"
 if grep -qE 'run_node_config_wizard|SINGBOX_WIZARD|persist_network_stack' "$repo/debian-init.sh"; then fail 'wizard code is still present'; fi
 [[ ! -e "$repo/templates" ]] || fail 'templates directory is still present'
 echo 'PASS: sing-box install/upgrade, ExecStart rules, check-before-restart, downgrade, hold, policy-rc.d restore and real signals'

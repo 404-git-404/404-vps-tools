@@ -48,6 +48,7 @@ jobs:
             tests/sysctl-dir-container-test.sh
             tests/cloudflare-ips-test.sh
             tests/version-test.sh
+            tests/ui-test.sh
             tests/release-checks-test.sh
             tests/readme-commands-test.sh
             .github/scripts/ci-fetch.sh
@@ -83,6 +84,7 @@ jobs:
             tests/sysctl-dir-container-test.sh \
             tests/cloudflare-ips-test.sh \
             tests/version-test.sh \
+            tests/ui-test.sh \
             tests/release-checks-test.sh \
             tests/readme-commands-test.sh \
             .github/scripts/release-checks.sh \
@@ -171,6 +173,7 @@ jobs:
           PATH="$RUNNER_TEMP/mawk-bin:$PATH" bash tests/ci-workflow-test.sh
           PATH="$RUNNER_TEMP/mawk-bin:$PATH" bash tests/cloudflare-ips-test.sh
           PATH="$RUNNER_TEMP/mawk-bin:$PATH" bash tests/version-test.sh
+          PATH="$RUNNER_TEMP/mawk-bin:$PATH" bash tests/ui-test.sh
           PATH="$RUNNER_TEMP/mawk-bin:$PATH" bash tests/release-checks-test.sh
 
       - name: Validate Actions workflows and inline shell
@@ -262,6 +265,7 @@ jobs:
             tests/sysctl-dir-container-test.sh \
             tests/cloudflare-ips-test.sh \
             tests/version-test.sh \
+            tests/ui-test.sh \
             tests/release-checks-test.sh \
             tests/readme-commands-test.sh \
             .github/scripts/ci-fetch.sh \

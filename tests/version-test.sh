@@ -39,8 +39,7 @@ done
 [[ "$(bash "$repo/debian-init.sh" --version --audit)" == "debian-init.sh $version" ]] || fail 'debian-init.sh --version must exit before other options'
 
 # The menu and the final report show the version, and the help lists the option.
-grep -Fq '404-vps-tools debian-init.sh v%s' "$repo/debian-init.sh" || fail 'menu does not show the version'
-grep -Fq '"$SCRIPT_VERSION" >/dev/tty' "$repo/debian-init.sh" || fail 'menu does not pass the version'
+grep -Fq '404-vps-tools · debian-init.sh v$SCRIPT_VERSION' "$repo/debian-init.sh" || fail 'menu does not show the version'
 grep -Fq '脚本版本      : $SCRIPT_VERSION' "$repo/debian-init.sh" || fail 'final report does not show the version'
 bash "$repo/debian-init.sh" --help | grep -Fq -- '--version' || fail '--help does not list --version'
 

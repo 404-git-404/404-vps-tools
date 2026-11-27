@@ -521,6 +521,12 @@ backup_count=$(find "$BACKUP_ROOT" -mindepth 1 -maxdepth 1 -type d | wc -l)
 backup_dir=$(find "$BACKUP_ROOT" -mindepth 1 -maxdepth 1 -type d)
 [[ -s "$backup_dir/audit-before.txt" && -s "$backup_dir/audit-after.txt" ]] || fail 'audit reports missing'
 if grep -Fq 'A	cloud' "$backup_dir/audit-after.txt"; then fail 'processed item still listed'; fi
+# actions.txt is written after the loop from the executed actions, "- " per line, mode 600; the
+# same lines appear in the final report (the loop output itself is no longer piped through tee).
+[[ -f "$backup_dir/actions.txt" ]] || fail 'actions.txt missing after an executed action'
+[[ "$(stat -c %a "$backup_dir/actions.txt")" == 600 ]] || fail 'actions.txt is not mode 600'
+[[ "$(cat "$backup_dir/actions.txt")" == "- 已关闭 cloud-init（创建 /etc/cloud/cloud-init.disabled）；恢复：删除这个文件即可重新启用" ]] || fail 'actions.txt content differs from HARDENING_ACTIONS'
+grep -Fxq "  $(cat "$backup_dir/actions.txt")" "$work/flow-cloud" || fail 'actions.txt line missing from the final report'
 # Second run: the processed item is gone, no prompt, no second backup directory.
 (
   ask_yes_no() { fail 'prompt on a clean second run'; }
