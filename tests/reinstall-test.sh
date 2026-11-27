@@ -774,8 +774,28 @@ t_missing_gpgv_flow() {
 rm -f "$fix/order.log" "$fix/curl.log"
 expect_ok 'missing gpgv: summary line, install before download' t_missing_gpgv_flow
 grep -Fq '将先安装 gpgv（Debian 官方包，用于校验安装文件签名）' "$work/last.out" || fail 'summary lacks the gpgv line'
-[[ "$(head -n 1 "$fix/order.log")" == 'apt_get install -y --no-install-recommends gpgv' ]] || fail "gpgv install call/order: $(cat "$fix/order.log")"
-[[ "$(grep -c '^apt_get' "$fix/order.log")" == 1 && "$(grep -c '^curl$' "$fix/order.log")" == 4 ]] || fail 'unexpected apt_get/curl calls'
+[[ "$(head -n 2 "$fix/order.log")" == $'apt_get update\napt_get install -y --no-install-recommends gpgv' ]] ||
+  fail "gpgv update/install calls or order (both before the first download): $(cat "$fix/order.log")"
+[[ "$(grep -c '^apt_get' "$fix/order.log")" == 2 && "$(grep -c '^curl$' "$fix/order.log")" == 4 ]] || fail 'unexpected apt_get/curl calls'
+
+t_gpgv_update_fails() {
+  use_paths "$work/gpgv-update-fail"
+  use_host
+  install_download_fakes
+  REINSTALL_NEED_GPGV=true
+  reinstall_generate_password() { :; }
+  read_tty() { printf -v "$2" '%s' "$REINSTALL_HOST"; }
+  apt_get() { local IFS=' '; printf 'apt_get %s\n' "$*" >>"$fix/order.log"; [[ "$1" != update ]]; }
+  run_reinstall
+}
+rm -f "$fix/order.log"
+expect_die 'apt update failure stops before install and download' '更新软件包索引失败，无法安装 gpgv；尚未改动任何启动项' t_gpgv_update_fails
+[[ "$(cat "$fix/order.log")" == 'apt_get update' ]] || fail "update failure still installed or downloaded: $(cat "$fix/order.log")"
+
+# APT_WAIT_MAX is readonly and read from VPS_INIT_APT_WAIT when the script is sourced.
+t_apt_wait() { reinstall_preflight; }
+VPS_INIT_APT_WAIT=abc expect_die 'reinstall path rejects a non-numeric VPS_INIT_APT_WAIT' 'VPS_INIT_APT_WAIT 必须是 >=60 的整数秒' t_apt_wait
+VPS_INIT_APT_WAIT=59 expect_die 'reinstall path rejects VPS_INIT_APT_WAIT below 60' 'VPS_INIT_APT_WAIT 必须是 >=60 的整数秒' t_apt_wait
 
 t_gpgv_install_fails() {
   use_paths "$work/gpgv-fail"
@@ -784,7 +804,7 @@ t_gpgv_install_fails() {
   REINSTALL_NEED_GPGV=true
   reinstall_generate_password() { :; }
   read_tty() { printf -v "$2" '%s' "$REINSTALL_HOST"; }
-  apt_get() { return 100; }
+  apt_get() { [[ "$1" != install ]] || return 100; }
   run_reinstall
 }
 rm -f "$fix/order.log"
@@ -907,5 +927,260 @@ grep -Fxq 'apt-get -y purge qemu-guest-agent task-english' "$work/in-target.log"
 grep -Fxq 'apt-get -y autoremove --purge' "$work/in-target.log" || fail 'finish hook autoremove'
 [[ "$(grep -c -- '--pass-stdout dpkg-query' "$work/in-target.log")" == 12 ]] || fail 'finish hook did not query all 12 packages'
 grep -Fq 'purge failed (rc=100), continuing' "$work/syslog" || fail 'finish hook did not log the purge failure'
+
+# ---- 12. review follow-ups ----------------------------------------------------
+
+# Space-joined logs even though the script runs with IFS=$'\n\t'.
+t_join() { [[ "$(reinstall_join a 'b c' d)" == 'a b c d' ]] || fail "join: $(reinstall_join a 'b c' d)"; }
+expect_ok 'reinstall_join uses single spaces' t_join
+
+# gpgv: ERRSIG is tolerated only with rc 9 and a matching NO_PUBKEY.
+{
+  good_sig AAAA1111BBBB2222CCCC3333DDDD4444EEEE5555
+  printf '[GNUPG:] NEWSIG\n[GNUPG:] ERRSIG 0123456789ABCDEF 22 8 01 1793500000 4 -\n[GNUPG:] NO_PUBKEY 0123456789ABCDEF\n'
+} >"$work/gpg-errsig-rc4-nopub"
+{ good_sig AAAA1111BBBB2222CCCC3333DDDD4444EEEE5555; printf '[GNUPG:] EXPSIG 6ED0E7B82643E131 Debian Archive Signing Key\n'; } >"$work/gpg-expsig"
+{ good_sig AAAA1111BBBB2222CCCC3333DDDD4444EEEE5555; printf '[GNUPG:] REVKEYSIG 6ED0E7B82643E131 Debian Archive Signing Key\n'; } >"$work/gpg-revkey"
+{
+  good_sig AAAA1111BBBB2222CCCC3333DDDD4444EEEE5555
+  printf '[GNUPG:] NEWSIG\n[GNUPG:] ERRSIG 78DBA3BC47EF2265 22 8 01 1793500000 9 -\n[GNUPG:] NO_PUBKEY 78DBA3BC47EF2265\n'
+  printf '[GNUPG:] NEWSIG\n[GNUPG:] ERRSIG 762F67A0B2C39DE4 22 8 01 1793500000 9 -\n[GNUPG:] NO_PUBKEY 762F67A0B2C39DE4\n'
+} >"$work/gpg-two-nopub"
+expect_ok 'gpg: ERRSIG rc 4 rejected even with NO_PUBKEY' t_gpg_reject "$work/gpg-errsig-rc4-nopub"
+grep -Fq 'ERRSIG 0123456789ABCDEF rc=4' "$work/last.out" || fail 'rc=4 ERRSIG not reported'
+expect_ok 'gpg: EXPSIG rejected' t_gpg_reject "$work/gpg-expsig"
+expect_ok 'gpg: REVKEYSIG rejected' t_gpg_reject "$work/gpg-revkey"
+expect_ok 'gpg: two missing keys tolerated' t_gpg_ok "$work/gpg-two-nopub"
+grep -Fq '（78DBA3BC47EF2265 762F67A0B2C39DE4），已忽略；其余 1 个签名有效' "$work/last.out" || fail 'missing-key log is not one line'
+
+# IPv4 gateway and address must be dotted quads.
+t_v4_gw_inet6() {
+  FAKE_V4_ROUTE='default via inet6 fe80::1 dev eth0 proto static'
+  FAKE_ADDR4[eth0]='2: eth0    inet 203.0.113.10/32 scope global eth0'
+  reinstall_check_ipv4
+}
+expect_die 'IPv4 default route via inet6 nexthop' '无法重装：IPv4 默认路由的网关不是 IPv4 地址，暂不支持' t_v4_gw_inet6
+t_v4_gw_range() {
+  FAKE_V4_ROUTE='default via 198.51.100.256 dev eth0 onlink'
+  FAKE_ADDR4[eth0]='2: eth0    inet 203.0.113.10/32 scope global eth0'
+  reinstall_check_ipv4
+}
+expect_die 'IPv4 gateway octet above 255' '无法重装：IPv4 默认路由的网关不是 IPv4 地址，暂不支持' t_v4_gw_range
+t_v4_addr_range() {
+  FAKE_V4_ROUTE='default via 198.51.100.1 dev eth0 onlink'
+  FAKE_ADDR4[eth0]='2: eth0    inet 203.0.113.300/32 scope global eth0'
+  reinstall_check_ipv4
+}
+expect_die 'IPv4 address octet above 255' '无法重装：IPv4 地址不是合法的 IPv4 地址（203.0.113.300/32）' t_v4_addr_range
+t_v4_ok_edges() {
+  if ! reinstall_is_ipv4 0.0.0.0 || ! reinstall_is_ipv4 255.255.255.255; then fail 'valid edge addresses rejected'; fi
+  if reinstall_is_ipv4 1.2.3 || reinstall_is_ipv4 1.2.3.4.5 || reinstall_is_ipv4 fe80::1 || reinstall_is_ipv4 1.2.3.1000; then fail 'invalid address accepted'; fi
+}
+expect_ok 'IPv4 address validator edges' t_v4_ok_edges
+
+# Leftovers: custom.cfg.404tmp.* is the sixth signal; the backup is tested with -f everywhere.
+t_leftover_tmp_and_bak() {
+  use_paths "$work/leftover6"
+  printf 'saved_entry=0\n' >"$FAKE_GRUBENV"
+  printf 'partial\n' >"$REINSTALL_CUSTOM_CFG.404tmp.AbC123"
+  reinstall_detect_leftover || fail 'custom.cfg.404tmp.* not detected'
+  [[ "$(reinstall_join "${REINSTALL_LEFTOVERS[@]}")" == "$REINSTALL_CUSTOM_CFG.404tmp.AbC123" ]] || fail "tmp signal text: ${REINSTALL_LEFTOVERS[*]}"
+  reinstall_cleanup
+  [[ ! -e "$REINSTALL_CUSTOM_CFG.404tmp.AbC123" ]] || fail 'cleanup kept the custom.cfg temp file'
+  if reinstall_detect_leftover; then fail 'leftover after removing temp file'; fi
+  # A non-regular .404bak is neither detected nor touched (same -f test in both places).
+  mkdir -p "$REINSTALL_CUSTOM_BAK"
+  if reinstall_detect_leftover; then fail "directory .404bak counted as leftover: ${REINSTALL_LEFTOVERS[*]}"; fi
+  reinstall_cleanup
+  [[ -d "$REINSTALL_CUSTOM_BAK" && ! -e "$REINSTALL_CUSTOM_CFG" ]] || fail 'cleanup acted on a directory .404bak'
+}
+expect_ok 'leftover: custom.cfg temp files and consistent backup test' t_leftover_tmp_and_bak
+
+# kexec: unquoted, double-quoted and single-quoted true are all rejected.
+t_kexec() {
+  REINSTALL_KEXEC_DEFAULT=$1
+  reinstall_check_kexec
+}
+for variant in 'LOAD_KEXEC=true' 'LOAD_KEXEC="true"' "LOAD_KEXEC='true'" '  LOAD_KEXEC = true'; do
+  printf '# Defaults for kexec\n%s\n' "$variant" >"$work/kexec-on"
+  expect_die "kexec enabled: $variant" '启用了 LOAD_KEXEC=true，重启会绕过 GRUB' t_kexec "$work/kexec-on"
+done
+for variant in 'LOAD_KEXEC=false' '# LOAD_KEXEC=true' "LOAD_KEXEC='false'"; do
+  printf '%s\n' "$variant" >"$work/kexec-off"
+  expect_ok "kexec disabled: $variant" t_kexec "$work/kexec-off"
+done
+expect_ok 'kexec config missing' t_kexec "$work/no-such-kexec"
+
+# authorized_keys: options kept verbatim, at least one key without command=/restrict.
+command -v ssh-keygen >/dev/null 2>&1 || fail 'ssh-keygen is required'
+ssh-keygen -q -t ed25519 -N '' -C fixture -f "$work/fixture-key" >/dev/null
+pub=$(cat "$work/fixture-key.pub")
+t_keys() {
+  REINSTALL_AUTHORIZED_KEYS=$1
+  reinstall_check_keys
+  printf 'keys=%s opts=%s\n' "${#REINSTALL_KEYS[@]}" "$(reinstall_join "${REINSTALL_KEY_HAS_OPTS[@]}")"
+  printf 'line=%s\n' "${REINSTALL_KEYS[@]}"
+}
+printf 'from="198.51.100.0/24,restrict.example",no-agent-forwarding %s\r\n' "$pub" >"$work/ak-from"
+expect_ok 'key with from= is usable' t_keys "$work/ak-from"
+grep -Fxq "line=from=\"198.51.100.0/24,restrict.example\",no-agent-forwarding $pub" "$work/last.out" || fail 'options line not kept verbatim (or CR kept)'
+grep -Fq 'keys=1 opts=true' "$work/last.out" || fail 'from= key bookkeeping'
+printf 'no-port-forwarding,command="echo '\''Please login as the user \\"debian\\"'\'';sleep 10;exit 142" %s\n' "$pub" >"$work/ak-command"
+expect_die 'only command= keys' '无法重装：没有可用于交互登录的公钥（全部带有 command= 或 restrict 限制）' t_keys "$work/ak-command"
+printf 'RESTRICT,pty %s\n' "$pub" >"$work/ak-restrict"
+expect_die 'only restrict keys' '无法重装：没有可用于交互登录的公钥（全部带有 command= 或 restrict 限制）' t_keys "$work/ak-restrict"
+{
+  printf 'command="/bin/false" %s\n' "$pub"
+  printf '# comment\r\n\r\nnot-a-key\r\n%s\r\n' "$pub"
+} >"$work/ak-mixed"
+expect_ok 'command= key plus a plain CRLF key' t_keys "$work/ak-mixed"
+grep -Fq 'keys=2 opts=true false' "$work/last.out" || fail 'mixed key bookkeeping'
+grep -Fq '丢弃空行/注释/无效行 3 行' "$work/last.out" || fail 'discarded line count'
+grep -Fxq "line=$pub" "$work/last.out" || fail 'CRLF plain key not stripped of CR'
+t_keys_summary() {
+  use_host
+  REINSTALL_AUTHORIZED_KEYS=$1
+  reinstall_check_keys
+  reinstall_print_summary
+}
+expect_ok 'summary marks keys with options' t_keys_summary "$work/ak-mixed"
+[[ "$(grep -c '（带限制选项）' "$work/last.out")" == 1 ]] || fail 'option marker count in summary'
+
+# GRUB checks: each rejection condition.
+grub_fixture() {
+  use_paths "$work/grub-$1"
+  printf '%s\n' 'if [ "${next_entry}" ] ; then' '### BEGIN /etc/grub.d/41_custom ###' >"$REINSTALL_GRUB_CFG"
+  grub-reboot() { :; }
+  grub-mkrelpath() { :; }
+  grub-probe() {
+    case "$1" in
+      --target=abstraction) printf '%s\n' "${GRUB_ABS:-}" ;;
+      --target=fs) printf '%s\n' "${GRUB_FS:-ext2}" ;;
+    esac
+  }
+}
+t_grub_ok() { grub_fixture ok; GRUB_FS=xfs; reinstall_check_grub; [[ "$REINSTALL_GRUB_FS" == xfs ]] || fail 'xfs not accepted'; }
+expect_ok 'grub: accepted layout' t_grub_ok
+t_grub_no_cfg() { grub_fixture nocfg; rm -f "$REINSTALL_GRUB_CFG"; reinstall_check_grub; }
+expect_die 'grub: missing grub.cfg' '无法重装：缺少' t_grub_no_cfg
+t_grub_no_next() { grub_fixture nonext; printf '### BEGIN /etc/grub.d/41_custom ###\n' >"$REINSTALL_GRUB_CFG"; reinstall_check_grub; }
+expect_die 'grub: no next_entry logic' '中没有 next_entry 逻辑' t_grub_no_next
+t_grub_no_41() { grub_fixture no41; printf 'if [ "${next_entry}" ] ; then\n' >"$REINSTALL_GRUB_CFG"; reinstall_check_grub; }
+expect_die 'grub: no 41_custom' '中没有 41_custom' t_grub_no_41
+t_grub_abstraction() { grub_fixture lvm; GRUB_ABS=lvm; reinstall_check_grub; }
+expect_die 'grub: abstraction layer' '/boot/grub 使用了不支持的抽象层（lvm）' t_grub_abstraction
+t_grub_fs() { grub_fixture btrfs; GRUB_FS=btrfs; reinstall_check_grub; }
+expect_die 'grub: unsupported filesystem' '/boot/grub 文件系统不支持（当前 btrfs' t_grub_fs
+t_grub_tool() {
+  grub_fixture tool
+  unset -f grub-mkrelpath
+  mkdir -p "$work/empty-bin"
+  # shellcheck disable=SC2123 # Hide any real GRUB tools on the runner.
+  PATH="$work/empty-bin"
+  reinstall_check_grub
+}
+expect_die 'grub: missing grub-mkrelpath' '无法重装：缺少 GRUB 工具：grub-mkrelpath' t_grub_tool
+
+# Tampered downloads and an empty verified Release.
+tamper_curl() {
+  TAMPER_SUFFIX=$1
+  curl() {
+    local IFS=' ' url='' out=''
+    while (( $# )); do case "$1" in -o) out=$2; shift 2 ;; https://*) url=$1; shift ;; *) shift ;; esac; done
+    if [[ "$url" == *"$TAMPER_SUFFIX" ]]; then printf 'tampered\n' >"$out"; return 0; fi
+    cp -- "$fix/mirror/${url#https://deb.debian.org/debian/}" "$out"
+  }
+}
+t_tampered() {
+  use_paths "$work/tamper-$2"
+  use_host
+  install_download_fakes
+  tamper_curl "$1"
+  reinstall_confirm() { :; }
+  run_reinstall
+}
+expect_die 'tampered SHA256SUMS' 'installer SHA256SUMS SHA256 校验失败' t_tampered /images/SHA256SUMS sums
+[[ ! -e "$work/tamper-sums/boot/404-reinstall.tmp" ]] || fail 'SHA256SUMS failure did not clean up'
+expect_die 'tampered initrd.gz' 'netboot initrd.gz SHA256 校验失败' t_tampered /initrd.gz initrd
+[[ ! -e "$work/tamper-initrd/boot/404-reinstall.tmp" && ! -e "$work/tamper-initrd/boot/404-reinstall" ]] || fail 'initrd failure did not clean up'
+t_empty_release() {
+  use_paths "$work/empty-release"
+  use_host
+  install_download_fakes
+  : >"$work/empty-release-file"
+  FAKE_RELEASE="$work/empty-release-file"
+  reinstall_confirm() { :; }
+  run_reinstall
+}
+expect_die 'empty Release.verified' 'gpgv 没有输出已验证的 Release 正文' t_empty_release
+[[ ! -e "$work/empty-release/boot/404-reinstall.tmp" ]] || fail 'empty Release failure did not clean up'
+
+# Hostname mismatch cancels with exit 0 before anything is installed or downloaded.
+t_hostname_mismatch() {
+  use_paths "$work/mismatch"
+  use_host
+  install_download_fakes
+  REINSTALL_NEED_GPGV=true
+  reinstall_generate_password() { :; }
+  read_tty() { printf -v "$2" '%s' 'not-this-host'; }
+  apt_get() { fail 'apt_get ran after a hostname mismatch'; }
+  run_reinstall
+  fail 'run continued after a hostname mismatch'
+}
+rm -f "$fix/curl.log"
+expect_ok 'hostname mismatch cancels with exit 0' t_hostname_mismatch
+grep -Fq '已取消，未做任何修改' "$work/last.out" || fail 'cancel message'
+[[ ! -e "$fix/curl.log" ]] || fail 'download started after a hostname mismatch'
+[[ "$(cd "$work/mismatch/boot" && find . -mindepth 1 | sort | tr '\n' ' ')" == './grub ' ]] || fail "mismatch changed /boot: $(cd "$work/mismatch/boot" && find . -mindepth 1)"
+
+# GRUB mocks for the paths that write the one-shot entry.
+grub_write_mocks() {
+  grub-probe() { [[ "$1" == --target=fs_uuid ]] && echo 1111-2222; }
+  grub-mkrelpath() { echo /404-reinstall; }
+  grub-reboot() { printf 'next_entry=%s\n' "$1" >>"$FAKE_GRUBENV"; }
+}
+
+t_no_reboot() {
+  use_paths "$work/noreboot"
+  use_host
+  install_download_fakes
+  grub_write_mocks
+  printf '# user entry\n' >"$REINSTALL_CUSTOM_CFG"
+  printf 'saved_entry=0\n' >"$FAKE_GRUBENV"
+  REINSTALL_TEST_MODE='no-reboot'
+  reinstall_confirm() { :; }
+  reboot() { fail 'no-reboot mode rebooted'; }
+  sleep() { fail 'no-reboot mode counted down'; }
+  run_reinstall
+  [[ "$REINSTALL_ARMED" == false ]] || fail 'no-reboot stayed armed'
+  [[ -s "$REINSTALL_BOOT_DIR/linux" && -s "$REINSTALL_BOOT_DIR/initrd.gz" ]] || fail 'no-reboot removed the installer files'
+  grep -Fq '# user entry' "$REINSTALL_CUSTOM_CFG" || fail 'user custom.cfg content lost'
+  grep -Fq 'search --no-floppy --fs-uuid --set=root 1111-2222' "$REINSTALL_CUSTOM_CFG" || fail 'menuentry search line'
+  grep -Fq 'linux /404-reinstall/linux auto=true priority=critical' "$REINSTALL_CUSTOM_CFG" || fail 'menuentry linux line'
+  [[ "$(cat "$REINSTALL_CUSTOM_BAK")" == '# user entry' ]] || fail 'custom.cfg backup'
+  grep -Fxq 'next_entry=reinstall-debian13' "$FAKE_GRUBENV" || fail 'next_entry not set'
+  reinstall_detect_leftover || fail 'no-reboot preparation not detectable as leftover'
+}
+expect_ok 'no-reboot keeps the prepared boot entry' t_no_reboot
+for line in '准备就绪' 'ssh -p 22 root@203.0.113.10' 'ssh-keygen -R 203.0.113.10' 'no-reboot 测试模式'; do
+  grep -Fq -- "$line" "$work/last.out" || fail "no-reboot output lacks [$line]"
+done
+
+t_reboot_fails() {
+  use_paths "$work/reboot-fail"
+  use_host
+  install_download_fakes
+  grub_write_mocks
+  printf 'saved_entry=0\n' >"$FAKE_GRUBENV"
+  reinstall_confirm() { :; }
+  sleep() { :; }
+  reboot() { return 1; }
+  run_reinstall
+}
+expect_die 'reboot failure clears the boot entry' 'reboot 执行失败，已清除启动项，系统未改变；可重新运行 [9]' t_reboot_fails
+[[ ! -e "$work/reboot-fail/boot/404-reinstall" && ! -e "$work/reboot-fail/boot/grub/custom.cfg" && ! -e "$work/reboot-fail/boot/grub/custom.cfg.404bak" ]] ||
+  fail 'reboot failure left boot files'
+[[ "$(cat "$work/reboot-fail/boot/grub/grubenv")" == 'saved_entry=0' ]] || fail 'reboot failure left next_entry'
+grep -Fq '10...' "$work/last.out" || fail 'countdown not shown before reboot'
 
 printf 'reinstall tests passed\n'

@@ -5516,6 +5516,8 @@ REINSTALL_BOOT_TMP_DIR='/boot/404-reinstall.tmp'
 REINSTALL_GRUB_CFG='/boot/grub/grub.cfg'
 REINSTALL_CUSTOM_CFG='/boot/grub/custom.cfg'
 REINSTALL_CUSTOM_BAK='/boot/grub/custom.cfg.404bak'
+REINSTALL_KEXEC_DEFAULT='/etc/default/kexec'
+REINSTALL_AUTHORIZED_KEYS=$AUTHORIZED_KEYS
 
 REINSTALL_TEST_MODE=''
 # true from the start of the download until right before reboot: every failure, Ctrl+C, HUP or
@@ -5546,7 +5548,7 @@ REINSTALL_V6_MAC=''
 REINSTALL_KEYS_DISCARDED=0
 REINSTALL_ROOT_PASS=''
 REINSTALL_ROOT_HASH=''
-declare -a REINSTALL_KEYS=() REINSTALL_KEY_FPS=() REINSTALL_LEFTOVERS=()
+declare -a REINSTALL_KEYS=() REINSTALL_KEY_FPS=() REINSTALL_KEY_HAS_OPTS=() REINSTALL_LEFTOVERS=() REINSTALL_CUSTOM_TMPS=()
 
 # Overridable wrapper so offline tests can feed recorded `ip` output.
 reinstall_ip() {
@@ -5554,7 +5556,26 @@ reinstall_ip() {
 }
 
 reinstall_fail() {
+  local IFS=' '
   die "无法重装：$*"
+}
+
+# Join arguments with single spaces. The script runs with IFS=$'\n\t', so a bare "${arr[*]}"
+# would put each element on its own line.
+reinstall_join() {
+  local IFS=' '
+  printf '%s' "$*"
+}
+
+# Dotted-quad IPv4 with four fields of 0-255.
+reinstall_is_ipv4() {
+  local IFS=. part
+  local -a parts=()
+  [[ "$1" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]] || return 1
+  read -r -a parts <<<"$1"
+  for part in "${parts[@]}"; do
+    (( 10#$part <= 255 )) || return 1
+  done
 }
 
 reinstall_parse_test_mode() {
@@ -5584,14 +5605,26 @@ reinstall_next_entry_is_ours() {
   grub-editenv list 2>/dev/null | grep -Fxq -- "next_entry=$REINSTALL_GRUB_ENTRY_ID"
 }
 
-# Fill REINSTALL_LEFTOVERS; succeed when any of the five signals is present.
+# Temporary custom.cfg rewrites (mktemp next to custom.cfg) left behind by an interrupted run.
+reinstall_custom_tmp_files() {
+  local f
+  REINSTALL_CUSTOM_TMPS=()
+  for f in "$REINSTALL_CUSTOM_CFG".404tmp.*; do
+    if [[ -e "$f" || -L "$f" ]]; then REINSTALL_CUSTOM_TMPS+=("$f"); fi
+  done
+  (( ${#REINSTALL_CUSTOM_TMPS[@]} > 0 ))
+}
+
+# Fill REINSTALL_LEFTOVERS; succeed when any of the six signals is present. The custom.cfg
+# backup is tested with -f here and in reinstall_cleanup alike.
 reinstall_detect_leftover() {
   REINSTALL_LEFTOVERS=()
   if [[ -e "$REINSTALL_BOOT_DIR" ]]; then REINSTALL_LEFTOVERS+=("$REINSTALL_BOOT_DIR"); fi
   if [[ -e "$REINSTALL_BOOT_TMP_DIR" ]]; then REINSTALL_LEFTOVERS+=("$REINSTALL_BOOT_TMP_DIR"); fi
   if reinstall_custom_cfg_has_mark; then REINSTALL_LEFTOVERS+=("$REINSTALL_CUSTOM_CFG 中的 404-reinstall 启动项"); fi
   if reinstall_next_entry_is_ours; then REINSTALL_LEFTOVERS+=("GRUB next_entry=$REINSTALL_GRUB_ENTRY_ID"); fi
-  if [[ -e "$REINSTALL_CUSTOM_BAK" ]]; then REINSTALL_LEFTOVERS+=("$REINSTALL_CUSTOM_BAK（custom.cfg 备份）"); fi
+  if [[ -f "$REINSTALL_CUSTOM_BAK" ]]; then REINSTALL_LEFTOVERS+=("$REINSTALL_CUSTOM_BAK（custom.cfg 备份）"); fi
+  if reinstall_custom_tmp_files; then REINSTALL_LEFTOVERS+=("${REINSTALL_CUSTOM_TMPS[@]}"); fi
   (( ${#REINSTALL_LEFTOVERS[@]} > 0 ))
 }
 
@@ -5602,6 +5635,10 @@ reinstall_cleanup() {
   if [[ -n "$REINSTALL_STAGE_DIR" ]]; then rm -rf -- "$REINSTALL_STAGE_DIR"; fi
   REINSTALL_STAGE_DIR=''
   rm -rf -- "$REINSTALL_BOOT_DIR" "$REINSTALL_BOOT_TMP_DIR"
+  if reinstall_custom_tmp_files; then
+    rm -f -- "${REINSTALL_CUSTOM_TMPS[@]}"
+    log '已删除中断留下的 custom.cfg 临时文件'
+  fi
   if [[ -f "$REINSTALL_CUSTOM_BAK" ]]; then
     mv -f -- "$REINSTALL_CUSTOM_BAK" "$REINSTALL_CUSTOM_CFG"
     log "已从备份还原 $REINSTALL_CUSTOM_CFG"
@@ -5631,7 +5668,7 @@ reinstall_abort_cleanup() {
   warn '重装准备未完成，正在清理已下载的文件和 GRUB 启动项。'
   reinstall_cleanup || true
   if reinstall_detect_leftover; then
-    warn "仍有遗留：${REINSTALL_LEFTOVERS[*]}；请重新运行 [9] 清除，或手动删除后再重启。"
+    warn "仍有遗留：$(reinstall_join "${REINSTALL_LEFTOVERS[@]}")；请重新运行 [9] 清除，或手动删除后再重启。"
   else
     warn '已清理，系统启动项未改变。'
   fi
@@ -5649,7 +5686,7 @@ reinstall_check_leftover() {
   acquire_lock
   reinstall_cleanup
   if reinstall_detect_leftover; then
-    reinstall_fail "清除后仍有遗留：${REINSTALL_LEFTOVERS[*]}"
+    reinstall_fail "清除后仍有遗留：$(reinstall_join "${REINSTALL_LEFTOVERS[@]}")"
   fi
   log '已清除上次的重装准备。'
 }
@@ -5775,10 +5812,11 @@ reinstall_check_grub() {
 }
 
 # 7. kexec 不能绕过 GRUB
+# Matches LOAD_KEXEC=true, LOAD_KEXEC="true" and LOAD_KEXEC='true'.
 reinstall_check_kexec() {
-  if [[ -f /etc/default/kexec ]] &&
-    grep -Eq '^[[:space:]]*LOAD_KEXEC[[:space:]]*=[[:space:]]*"?true"?' /etc/default/kexec; then
-    reinstall_fail '/etc/default/kexec 启用了 LOAD_KEXEC=true，重启会绕过 GRUB'
+  if [[ -f "$REINSTALL_KEXEC_DEFAULT" ]] &&
+    grep -Eq "^[[:space:]]*LOAD_KEXEC[[:space:]]*=[[:space:]]*[\"']?true[\"']?" "$REINSTALL_KEXEC_DEFAULT"; then
+    reinstall_fail "$REINSTALL_KEXEC_DEFAULT 启用了 LOAD_KEXEC=true，重启会绕过 GRUB"
   fi
 }
 
@@ -5815,11 +5853,57 @@ reinstall_check_boot_space() {
   fi
 }
 
-# 10. root 的 authorized_keys 至少有一把有效公钥
+# Print the options field of an authorized_keys line (empty when the line starts with the key
+# type). The field ends at the first whitespace outside double quotes; \" inside quotes is kept.
+reinstall_key_options() {
+  local line=$1 first ch opts='' quoted=false i
+  line=${line#"${line%%[![:space:]]*}"}
+  first=${line%%[[:space:]]*}
+  if [[ "$first" =~ ^(ssh-|ecdsa-|sk-) ]]; then return 0; fi
+  for (( i = 0; i < ${#line}; i++ )); do
+    ch=${line:i:1}
+    if [[ "$quoted" == true && "$ch" == "\\" ]]; then
+      opts+=${line:i:2}
+      i=$((i + 1))
+      continue
+    fi
+    if [[ "$ch" == '"' ]]; then
+      if [[ "$quoted" == true ]]; then quoted=false; else quoted=true; fi
+    elif [[ "$quoted" == false && ( "$ch" == ' ' || "$ch" == $'\t' ) ]]; then
+      break
+    fi
+    opts+=$ch
+  done
+  printf '%s' "$opts"
+}
+
+# Succeed when an options field contains command= or restrict (option names are case-insensitive).
+reinstall_key_options_restricted() {
+  local opts=$1 ch name='' in_name=true quoted=false i
+  for (( i = 0; i <= ${#opts}; i++ )); do
+    ch=${opts:i:1}
+    if [[ "$quoted" == true ]]; then
+      if [[ "$ch" == "\\" ]]; then i=$((i + 1)); elif [[ "$ch" == '"' ]]; then quoted=false; fi
+      continue
+    fi
+    if [[ -z "$ch" || "$ch" == ',' ]]; then
+      name=${name,,}
+      if [[ "$name" == command || "$name" == restrict ]]; then return 0; fi
+      name='' in_name=true
+      continue
+    fi
+    if [[ "$ch" == '"' ]]; then quoted=true; continue; fi
+    if [[ "$ch" == '=' ]]; then in_name=false; continue; fi
+    if [[ "$in_name" == true ]]; then name+=$ch; fi
+  done
+  return 1
+}
+
+# 10. root 的 authorized_keys：有效行原样保留（含 options），且至少一把不带 command=/restrict
 reinstall_check_keys() {
-  local line fp
-  REINSTALL_KEYS=() REINSTALL_KEY_FPS=() REINSTALL_KEYS_DISCARDED=0
-  [[ -r "$AUTHORIZED_KEYS" ]] || reinstall_fail "不存在可读的 $AUTHORIZED_KEYS"
+  local line fp opts usable=0
+  REINSTALL_KEYS=() REINSTALL_KEY_FPS=() REINSTALL_KEY_HAS_OPTS=() REINSTALL_KEYS_DISCARDED=0
+  [[ -r "$REINSTALL_AUTHORIZED_KEYS" ]] || reinstall_fail "不存在可读的 $REINSTALL_AUTHORIZED_KEYS"
   while IFS= read -r line || [[ -n "$line" ]]; do
     line=${line%$'\r'}
     if [[ -z "${line//[[:space:]]/}" || "$line" =~ ^[[:space:]]*# ]]; then
@@ -5827,14 +5911,18 @@ reinstall_check_keys() {
       continue
     fi
     if fp=$(printf '%s\n' "$line" | ssh-keygen -l -f - 2>/dev/null) && [[ -n "$fp" ]]; then
+      opts=$(reinstall_key_options "$line")
       REINSTALL_KEYS+=("$line")
       REINSTALL_KEY_FPS+=("$fp")
+      if [[ -n "$opts" ]]; then REINSTALL_KEY_HAS_OPTS+=(true); else REINSTALL_KEY_HAS_OPTS+=(false); fi
+      if [[ -z "$opts" ]] || ! reinstall_key_options_restricted "$opts"; then usable=$((usable + 1)); fi
     else
       REINSTALL_KEYS_DISCARDED=$((REINSTALL_KEYS_DISCARDED + 1))
     fi
-  done <"$AUTHORIZED_KEYS"
-  log "公钥检查：有效 ${#REINSTALL_KEYS[@]} 把，丢弃空行/注释/无效行 $REINSTALL_KEYS_DISCARDED 行"
-  (( ${#REINSTALL_KEYS[@]} > 0 )) || reinstall_fail "$AUTHORIZED_KEYS 中没有有效的 SSH 公钥"
+  done <"$REINSTALL_AUTHORIZED_KEYS"
+  log "公钥检查：有效 ${#REINSTALL_KEYS[@]} 把（可交互登录 $usable 把），丢弃空行/注释/无效行 $REINSTALL_KEYS_DISCARDED 行"
+  (( ${#REINSTALL_KEYS[@]} > 0 )) || reinstall_fail "$REINSTALL_AUTHORIZED_KEYS 中没有有效的 SSH 公钥"
+  (( usable > 0 )) || reinstall_fail '没有可用于交互登录的公钥（全部带有 command= 或 restrict 限制）'
 }
 
 # 11. IPv4（必须有）：恰好 1 条默认路由、默认网卡上恰好 1 个全局地址
@@ -5849,6 +5937,8 @@ reinstall_check_ipv4() {
   if [[ -z "$REINSTALL_V4_GW" || -z "$REINSTALL_V4_IFACE" ]]; then
     reinstall_fail "无法解析 IPv4 默认路由的网关或网卡（$route）"
   fi
+  # e.g. RFC 5549 "default via inet6 fe80::1": the word after via is not an IPv4 address.
+  reinstall_is_ipv4 "$REINSTALL_V4_GW" || reinstall_fail 'IPv4 默认路由的网关不是 IPv4 地址，暂不支持'
   mapfile -t v4_addrs < <(reinstall_ip -4 -o addr show scope global dev "$REINSTALL_V4_IFACE" | sed '/^[[:space:]]*$/d' || true)
   if (( ${#v4_addrs[@]} != 1 )); then
     reinstall_fail "IPv4 默认网卡 $REINSTALL_V4_IFACE 上的全局地址必须恰好 1 个（当前 ${#v4_addrs[@]} 个）"
@@ -5856,10 +5946,11 @@ reinstall_check_ipv4() {
   cidr=$(awk '{ print $4 }' <<<"${v4_addrs[0]}")
   REINSTALL_V4_ADDR=${cidr%/*}
   REINSTALL_V4_PREFIX=${cidr#*/}
-  if [[ ! "$REINSTALL_V4_ADDR" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ || ! "$REINSTALL_V4_PREFIX" =~ ^[0-9]+$ ]] ||
-    (( REINSTALL_V4_PREFIX > 32 )); then
+  reinstall_is_ipv4 "$REINSTALL_V4_ADDR" || reinstall_fail "IPv4 地址不是合法的 IPv4 地址（$cidr），暂不支持"
+  if [[ "$cidr" != */* || ! "$REINSTALL_V4_PREFIX" =~ ^[0-9]{1,2}$ ]] || (( 10#$REINSTALL_V4_PREFIX > 32 )); then
     reinstall_fail "无法解析 IPv4 地址/前缀（$cidr）"
   fi
+  REINSTALL_V4_PREFIX=$((10#$REINSTALL_V4_PREFIX))
   REINSTALL_V4_NETMASK=$(reinstall_prefix_to_mask4 "$REINSTALL_V4_PREFIX")
   if grep -qw dynamic <<<"${v4_addrs[0]}"; then
     REINSTALL_V4_MODE='dhcp'
@@ -5952,6 +6043,8 @@ reinstall_pick_new_hostname() {
 reinstall_preflight() {
   CURRENT_STEP='重装环境检查'
   reinstall_parse_test_mode
+  # Same rule as preflight: gpgv may have to be installed through apt_get later.
+  if [[ ! "$APT_WAIT_MAX" =~ ^[0-9]+$ ]] || (( APT_WAIT_MAX < 60 )); then die 'VPS_INIT_APT_WAIT 必须是 >=60 的整数秒。'; fi
   (( EUID == 0 )) || reinstall_fail '必须以 root 身份运行'
   reinstall_check_leftover
   CURRENT_STEP='重装环境检查'
@@ -5985,7 +6078,7 @@ reinstall_generate_password() {
 }
 
 reinstall_print_summary() {
-  local fp v4="静态 $REINSTALL_V4_ADDR/$REINSTALL_V4_PREFIX，网关 $REINSTALL_V4_GW"
+  local fp i v4="静态 $REINSTALL_V4_ADDR/$REINSTALL_V4_PREFIX，网关 $REINSTALL_V4_GW"
   if [[ "$REINSTALL_V4_MODE" == dhcp ]]; then v4="DHCP（当前 $REINSTALL_V4_ADDR/$REINSTALL_V4_PREFIX）"; fi
   ui_use_target out
   printf '\n'
@@ -6011,7 +6104,11 @@ reinstall_print_summary() {
   esac
   if [[ -n "$REINSTALL_V6_EXTRA" ]]; then ui_box_line "IPv6 附加地址：$REINSTALL_V6_EXTRA"; fi
   ui_box_line "重装后 SSH：端口 22，root 仅公钥登录；公钥 ${#REINSTALL_KEYS[@]} 把（丢弃 $REINSTALL_KEYS_DISCARDED 行）"
-  for fp in "${REINSTALL_KEY_FPS[@]}"; do ui_box_line "  $fp"; done
+  for i in "${!REINSTALL_KEY_FPS[@]}"; do
+    fp=${REINSTALL_KEY_FPS[i]}
+    if [[ "${REINSTALL_KEY_HAS_OPTS[i]:-false}" == true ]]; then fp+='（带限制选项）'; fi
+    ui_box_line "  $fp"
+  done
   ui_box_line "root 密码：$REINSTALL_ROOT_PASS" "root 密码：${C_BOLD}${C_YELLOW}${REINSTALL_ROOT_PASS}${C_RESET}"
   ui_box_line '仅用于 VNC 控制台登录，请存进密码管理器；商家面板显示的旧密码会失效'
   ui_box_bottom
@@ -6037,6 +6134,8 @@ reinstall_install_gpgv() {
   [[ "$REINSTALL_NEED_GPGV" == true ]] || return 0
   CURRENT_STEP='安装 gpgv'
   log '安装 gpgv（Debian 官方包，用于校验安装文件签名）...'
+  # Package lists may be missing (cleared in images) or stale; refresh them first.
+  apt_get update || die '更新软件包索引失败，无法安装 gpgv；尚未改动任何启动项。'
   apt_get install -y --no-install-recommends gpgv || die '安装 gpgv 失败；尚未改动任何启动项。'
   command -v gpgv >/dev/null 2>&1 || die '安装后仍找不到 gpgv；尚未改动任何启动项。'
   REINSTALL_NEED_GPGV=false
@@ -6046,23 +6145,25 @@ reinstall_install_gpgv() {
 # ---- 下载与校验 --------------------------------------------------------------
 
 # Judge gpgv by its status output, never by the exit code: at least one VALIDSIG; any BADSIG,
-# EXPKEYSIG, REVKEYSIG or EXPSIG fails; ERRSIG is tolerated only when gpgv also reports
-# NO_PUBKEY for the same key (a newer signing key missing from the local keyring).
+# EXPKEYSIG, REVKEYSIG or EXPSIG fails; ERRSIG is tolerated only when its return code field is
+# 9 (missing public key) and gpgv also reports NO_PUBKEY for the same key (a newer signing key
+# missing from the local keyring). ERRSIG <keyid> <pkalgo> <hashalgo> <class> <time> <rc> [<fpr>]
 reinstall_check_gpg_status() {
-  local status_file=$1 tag kw keyid valid=0 k n found
+  local status_file=$1 tag kw keyid err_rc valid=0 k n found
   local -a bad=() errsig=() nopub=() ignored=()
   [[ -r "$status_file" ]] || { warn "无法读取 gpgv 状态输出：$status_file"; return 1; }
-  while IFS=' ' read -r tag kw keyid _; do
+  while IFS=' ' read -r tag kw keyid _ _ _ _ err_rc _; do
     [[ "$tag" == '[GNUPG:]' ]] || continue
     case "$kw" in
       VALIDSIG) valid=$((valid + 1)) ;;
       BADSIG|EXPKEYSIG|REVKEYSIG|EXPSIG) bad+=("$kw ${keyid:-?}") ;;
-      ERRSIG) errsig+=("${keyid:-?}") ;;
+      ERRSIG)
+        if [[ "${err_rc:-}" == 9 ]]; then errsig+=("${keyid:-?}"); else bad+=("ERRSIG ${keyid:-?} rc=${err_rc:-?}"); fi ;;
       NO_PUBKEY) nopub+=("${keyid:-?}") ;;
     esac
   done <"$status_file"
   if (( ${#bad[@]} > 0 )); then
-    warn "InRelease 签名异常：${bad[*]}"
+    warn "InRelease 签名异常：$(reinstall_join "${bad[@]}")"
     return 1
   fi
   for k in "${errsig[@]}"; do
@@ -6071,7 +6172,7 @@ reinstall_check_gpg_status() {
       if [[ "$n" == "$k" ]]; then found=true; break; fi
     done
     if [[ "$found" == false ]]; then
-      warn "InRelease 签名无法校验（ERRSIG $k，且不是缺少公钥）"
+      warn "InRelease 签名无法校验（ERRSIG $k，没有对应的 NO_PUBKEY）"
       return 1
     fi
     ignored+=("$k")
@@ -6081,7 +6182,7 @@ reinstall_check_gpg_status() {
     return 1
   fi
   if (( ${#ignored[@]} > 0 )); then
-    log "InRelease 有 ${#ignored[@]} 个签名的公钥不在本机密钥环（${ignored[*]}），已忽略；其余 $valid 个签名有效"
+    log "InRelease 有 ${#ignored[@]} 个签名的公钥不在本机密钥环（$(reinstall_join "${ignored[@]}")），已忽略；其余 $valid 个签名有效"
   fi
 }
 
@@ -6683,7 +6784,9 @@ reinstall_countdown_and_reboot() {
   REINSTALL_ARMED=false
   log '正在重启...'
   if ! reboot; then
-    die "reboot 执行失败。GRUB 一次性启动项已设置，请手动重启；如要取消，重新运行 [9] 清除遗留。"
+    # Do not leave a one-shot entry that would wipe the disk on some later, unexpected reboot.
+    reinstall_cleanup || true
+    die 'reboot 执行失败，已清除启动项，系统未改变；可重新运行 [9]'
   fi
 }
 
