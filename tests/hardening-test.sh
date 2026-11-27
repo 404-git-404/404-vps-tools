@@ -337,14 +337,23 @@ dpkg-query() {
     *) return 1 ;;
   esac
 }
+check_audit_apt_cache_args() {
+  [[ "$1" == -o && "$2" == Dir::Cache::pkgcache= && "$3" == -o &&
+     "$4" == Dir::Cache::srcpkgcache= && "$5" == policy ]] || {
+    echo 'audit apt-cache must disable both disk caches' >>"$work/unexpected-apt-cache"
+    return 1
+  }
+}
 apt-cache() {
   local IFS=' '
+  check_audit_apt_cache_args "$@" || return 1
+  shift 4
   if [[ "$*" == policy ]]; then
     printf ' 500 https://deb.debian.org/debian stable/main amd64 Packages\n     release o=Debian,a=stable\n'
   elif [[ "$*" == *'external'* || "$*" == *'vendor-barad'* ]]; then
-    printf ' *** 1.0 100\n        500 https://vendor.invalid stable/main amd64 Packages\n'
+    printf '  Version table:\n *** 1.0 100\n        500 https://vendor.invalid stable/main amd64 Packages\n        100 /var/lib/dpkg/status\n     0.9 500 (phased 50%%)\n        500 https://deb.debian.org/debian stable/main amd64 Packages\n'
   else
-    printf ' *** 1.0 100\n        500 https://deb.debian.org/debian stable/main amd64 Packages\n'
+    printf '  Version table:\n *** 1.0 500 (phased 50%%)\n        500 https://deb.debian.org/debian stable/main amd64 Packages\n        100 /var/lib/dpkg/status\n'
   fi
 }
 systemctl() {
@@ -477,8 +486,10 @@ snapshot() { find "$root" -printf '%P %y %m %U %G %s %T@ %l\n'; find "$root" -ty
   }
   apt-cache() {
     if [[ "$*" == *'sing-box' ]]; then
-      printf '  Version table:\n     1e0 500\n        500 https://deb.sagernet.org/ * Packages\n *** 1.0 100\n        100 /var/lib/dpkg/status\n'
+      check_audit_apt_cache_args "$@" || return 1
+      printf '  Version table:\n *** 1.0 100\n        100 /var/lib/dpkg/status\n'
       if [[ -n "$installed_origin" ]]; then printf '        500 %s * Packages\n' "$installed_origin"; fi
+      printf '     1e0 500 (phased 50%%)\n        500 https://deb.sagernet.org/ * Packages\n'
     else
       fixture_apt-cache "$@"
     fi
@@ -495,6 +506,10 @@ snapshot() { find "$root" -printf '%P %y %m %U %G %s %T@ %l\n'; find "$root" -ty
   foreign='sing-box 来自 deb.sagernet.org，但源配置或密钥文件不是本工具写入的版本，请核实'
   package_finding() { has_finding $'^B\tpackage\t'"$1"$'\t'"$2"; }
 
+  # Exercise an unmarked version too. An unrelated line terminates its source rows.
+  apt_policy_fixture=$'        500 before-table\n  Version table:\n     1.0 500 (phased 50%)\n        500 repo-one\n          -1 repo-two\n       100 /var/lib/dpkg/status\n        100 after-unknown-line\n'
+  [[ "$(audit_apt_version_sources 1.0 "$apt_policy_fixture")" == $'        500 repo-one\n          -1 repo-two' ]]
+
   snapshot >"$work/sager-before"
   for installed_origin in 'https://deb.sagernet.org' 'https://deb.sagernet.org/'; do
     collect_security_audit
@@ -510,6 +525,14 @@ snapshot() { find "$root" -printf '%P %y %m %U %G %s %T@ %l\n'; find "$root" -ty
   done
 
   installed_origin='https://deb.sagernet.org/'
+  for extra_source in "$root/etc/apt/sources.list" "$root/etc/apt/sources.list.d/vendor.list" \
+    "$root/etc/apt/sources.list.d/vendor.sources"; do
+    printf 'deb https://DeB.SaGeRnEt.OrG/ stable main\n' >"$extra_source"
+    collect_security_audit
+    package_finding sing-box "$foreign" || fail "duplicate SagerNet reference was accepted: $extra_source"
+    rm "$extra_source"
+  done
+
   printf '\n' >>"$source_path"
   collect_security_audit
   package_finding sing-box "$foreign" || fail 'source with extra trailing newline was accepted'
@@ -540,6 +563,7 @@ snapshot >"$work/before"
 ) >"$work/audit-output"
 snapshot >"$work/after"
 cmp "$work/before" "$work/after"
+[[ ! -e "$work/unexpected-apt-cache" ]] || fail 'audit called apt-cache without disabling both disk caches'
 
 # [8] flow. Nothing is written before the risk notice is confirmed; with nothing to do
 # there is no backup directory; a cloud-init skip never stops the remaining items.

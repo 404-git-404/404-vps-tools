@@ -4176,33 +4176,48 @@ audit_unit_fragment() {
   printf '%s\n' "$path"
 }
 
+audit_apt_policy() {
+  LC_ALL=C apt-cache -o Dir::Cache::pkgcache= -o Dir::Cache::srcpkgcache= policy "$@" 2>/dev/null
+}
+
+audit_apt_version_sources() {
+  printf '%s\n' "$2" | awk -v version="$1" '
+    /^[ ]*Version table:[ ]*$/ { in_table=1; selected=0; next }
+    !in_table { next }
+    /^ \*\*\* / || /^     [^[:space:]]/ {
+      current=($1 == "***" ? $2 : $1)
+      selected=((current "") == (version ""))
+      next
+    }
+    /^        [ ]*-?[0-9]+([[:space:]]|$)/ { if (selected) print; next }
+    { selected=0 }
+  '
+}
+
 audit_debian_package() {
   # Require the *installed version* to have an official origin in the local APT cache.
   # No network access. Unknown/obsolete versions are intentionally reported for review.
   local version policy sources
   version=$(dpkg-query -W -f='${Version}' -- "$1" 2>/dev/null) || return 1
-  policy=$(apt-cache policy -- "$1" 2>/dev/null) || return 1
+  [[ -n "$version" ]] || return 1
+  policy=$(audit_apt_policy -- "$1") || return 1
   sources=$(awk '
     /^[ ]*[0-9]+ / {source=$0; sub(/^[ ]*[0-9]+ /,"",source)}
     /release / && /(^|[, ])o=Debian([, ]|$)/ {print source}
   ' <<<"$AUDIT_APT_SOURCES")
-  awk -v version="$version" -v sources="$sources" '
+  audit_apt_version_sources "$version" "$policy" | awk -v sources="$sources" '
     BEGIN {n=split(sources,s,"\n"); for(i=1;i<=n;i++) official[s[i]]=1}
-    $1=="***" {v=$2; next}
-    NF==2 && $2 ~ /^[0-9]+$/ {v=$1; next}
-    v==version && $1 ~ /^[0-9]+$/ {line=$0; sub(/^[ ]*[0-9]+ /,"",line); if(official[line]) ok=1}
-    END {exit !ok}' <<<"$policy"
+    {sub(/^[ ]*-?[0-9]+[ ]+/,""); if(official[$0]) ok=1}
+    END {exit !ok}'
 }
 
 audit_singbox_sagernet_origin() {
   local version policy
   version=$(dpkg-query -W -f='${Version}' -- sing-box 2>/dev/null) || return 1
   [[ -n "$version" ]] || return 1
-  policy=$(LC_ALL=C apt-cache -o Dir::Cache::pkgcache= -o Dir::Cache::srcpkgcache= policy -- sing-box 2>/dev/null) || return 1
-  printf '%s\n' "$policy" | awk -v version="$version" '
-    $1 == "***" { v=$2; next }
-    NF == 2 && $2 ~ /^-?[0-9]+$/ { v=$1; next }
-    (v "") == (version "") && $1 ~ /^-?[0-9]+$/ && $2 ~ /^https:\/\/deb\.sagernet\.org\/?$/ { found=1 }
+  policy=$(audit_apt_policy -- sing-box) || return 1
+  audit_apt_version_sources "$version" "$policy" | awk '
+    $2 ~ /^https:\/\/deb\.sagernet\.org\/?$/ { found=1 }
     END { exit !found }
   '
 }
@@ -4210,8 +4225,16 @@ audit_singbox_sagernet_origin() {
 audit_sagernet_repo_matches() {
   local source="$AUDIT_ROOT/etc/apt/sources.list.d/sagernet.sources"
   local key="$AUDIT_ROOT/etc/apt/keyrings/sagernet.gpg"
+  local file status
   [[ -f "$source" && ! -L "$source" && -f "$key" && ! -L "$key" && -s "$key" ]] &&
-    cmp -s -- "$source" <(sagernet_repo_source)
+    cmp -s -- "$source" <(sagernet_repo_source) || return 1
+  for file in "$AUDIT_ROOT/etc/apt/sources.list" \
+    "$AUDIT_ROOT/etc/apt/sources.list.d/"*.list "$AUDIT_ROOT/etc/apt/sources.list.d/"*.sources; do
+    [[ "$file" != "$source" && -f "$file" ]] || continue
+    status=0
+    LC_ALL=C grep -Fqi -- sagernet.org "$file" || status=$?
+    [[ "$status" == 1 ]] || return 1
+  done
 }
 
 audit_session_key() {
@@ -4456,7 +4479,7 @@ audit_agents() {
 collect_security_audit() {
   AUDIT_FINDINGS=()
   AUDIT_SESSION_KEY=$(audit_session_key) || AUDIT_SESSION_KEY=''
-  AUDIT_APT_SOURCES=$(apt-cache policy 2>/dev/null || true)
+  AUDIT_APT_SOURCES=$(audit_apt_policy || true)
   local file package status unit path uid user effective command keys listener pid exe cloud_detail exim4_found=false key_ok=true key_path
   local -a key_paths=()
   audit_keys
