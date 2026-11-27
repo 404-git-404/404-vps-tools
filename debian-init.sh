@@ -5819,21 +5819,21 @@ reinstall_check_keys() {
 
 # 11. IPv4（必须有）：恰好 1 条默认路由、默认网卡上恰好 1 个全局地址
 reinstall_check_ipv4() {
-  local -a routes=() addrs=()
+  local -a v4_routes=() v4_addrs=()
   local route cidr
-  mapfile -t routes < <(reinstall_ip -4 route show default | sed '/^[[:space:]]*$/d' || true)
-  (( ${#routes[@]} == 1 )) || reinstall_fail "IPv4 默认路由必须恰好 1 条（当前 ${#routes[@]} 条）"
-  route=${routes[0]}
+  mapfile -t v4_routes < <(reinstall_ip -4 route show default | sed '/^[[:space:]]*$/d' || true)
+  (( ${#v4_routes[@]} == 1 )) || reinstall_fail "IPv4 默认路由必须恰好 1 条（当前 ${#v4_routes[@]} 条）"
+  route=${v4_routes[0]}
   REINSTALL_V4_GW=$(reinstall_route_field via "$route")
   REINSTALL_V4_IFACE=$(reinstall_route_field dev "$route")
   if [[ -z "$REINSTALL_V4_GW" || -z "$REINSTALL_V4_IFACE" ]]; then
     reinstall_fail "无法解析 IPv4 默认路由的网关或网卡（$route）"
   fi
-  mapfile -t addrs < <(reinstall_ip -4 -o addr show scope global dev "$REINSTALL_V4_IFACE" | sed '/^[[:space:]]*$/d' || true)
-  if (( ${#addrs[@]} != 1 )); then
-    reinstall_fail "IPv4 默认网卡 $REINSTALL_V4_IFACE 上的全局地址必须恰好 1 个（当前 ${#addrs[@]} 个）"
+  mapfile -t v4_addrs < <(reinstall_ip -4 -o addr show scope global dev "$REINSTALL_V4_IFACE" | sed '/^[[:space:]]*$/d' || true)
+  if (( ${#v4_addrs[@]} != 1 )); then
+    reinstall_fail "IPv4 默认网卡 $REINSTALL_V4_IFACE 上的全局地址必须恰好 1 个（当前 ${#v4_addrs[@]} 个）"
   fi
-  cidr=$(awk '{ print $4 }' <<<"${addrs[0]}")
+  cidr=$(awk '{ print $4 }' <<<"${v4_addrs[0]}")
   REINSTALL_V4_ADDR=${cidr%/*}
   REINSTALL_V4_PREFIX=${cidr#*/}
   if [[ ! "$REINSTALL_V4_ADDR" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ || ! "$REINSTALL_V4_PREFIX" =~ ^[0-9]+$ ]] ||
@@ -5841,7 +5841,7 @@ reinstall_check_ipv4() {
     reinstall_fail "无法解析 IPv4 地址/前缀（$cidr）"
   fi
   REINSTALL_V4_NETMASK=$(reinstall_prefix_to_mask4 "$REINSTALL_V4_PREFIX")
-  if grep -qw dynamic <<<"${addrs[0]}"; then
+  if grep -qw dynamic <<<"${v4_addrs[0]}"; then
     REINSTALL_V4_MODE='dhcp'
   else
     REINSTALL_V4_MODE='static'
@@ -5854,34 +5854,34 @@ reinstall_check_ipv4() {
 
 # 12. IPv6（可选）：0 条默认路由不配置，多于 1 条拒绝
 reinstall_check_ipv6() {
-  local -a routes=() addrs=() cidrs=() extras=()
+  local -a v6_routes=() v6_addrs=() cidrs=() extras=()
   local route line dynamic=false src c
   REINSTALL_V6_MODE='none' REINSTALL_V6_IFACE='' REINSTALL_V6_ADDR='' REINSTALL_V6_GW='' REINSTALL_V6_EXTRA=''
-  mapfile -t routes < <(reinstall_ip -6 route show default | sed '/^[[:space:]]*$/d' || true)
-  if (( ${#routes[@]} == 0 )); then
+  mapfile -t v6_routes < <(reinstall_ip -6 route show default | sed '/^[[:space:]]*$/d' || true)
+  if (( ${#v6_routes[@]} == 0 )); then
     log '未检测到 IPv6 默认路由，重装后不配置 IPv6'
     return 0
   fi
-  (( ${#routes[@]} == 1 )) || reinstall_fail "存在多条 IPv6 默认路由（当前 ${#routes[@]} 条）"
-  route=${routes[0]}
+  (( ${#v6_routes[@]} == 1 )) || reinstall_fail "存在多条 IPv6 默认路由（当前 ${#v6_routes[@]} 条）"
+  route=${v6_routes[0]}
   REINSTALL_V6_GW=$(reinstall_route_field via "$route")
   REINSTALL_V6_IFACE=$(reinstall_route_field dev "$route")
   if [[ -z "$REINSTALL_V6_GW" || -z "$REINSTALL_V6_IFACE" ]]; then
     reinstall_fail "无法解析 IPv6 默认路由的网关或网卡（$route）"
   fi
-  mapfile -t addrs < <(reinstall_ip -6 -o addr show scope global dev "$REINSTALL_V6_IFACE" |
+  mapfile -t v6_addrs < <(reinstall_ip -6 -o addr show scope global dev "$REINSTALL_V6_IFACE" |
     grep -Evw 'temporary|deprecated|tentative' | sed '/^[[:space:]]*$/d' || true)
-  (( ${#addrs[@]} > 0 )) || reinstall_fail "IPv6 默认网卡 $REINSTALL_V6_IFACE 上没有可用的全局 IPv6 地址"
-  for line in "${addrs[@]}"; do
+  (( ${#v6_addrs[@]} > 0 )) || reinstall_fail "IPv6 默认网卡 $REINSTALL_V6_IFACE 上没有可用的全局 IPv6 地址"
+  for line in "${v6_addrs[@]}"; do
     if grep -qw dynamic <<<"$line"; then dynamic=true; break; fi
   done
   if [[ "$dynamic" == true ]]; then
     REINSTALL_V6_MODE='auto'
-    REINSTALL_V6_ADDR=$(awk '{ print $4 }' <<<"${addrs[0]}")
+    REINSTALL_V6_ADDR=$(awk '{ print $4 }' <<<"${v6_addrs[0]}")
     return 0
   fi
   REINSTALL_V6_MODE='static'
-  for line in "${addrs[@]}"; do cidrs+=("$(awk '{ print $4 }' <<<"$line")"); done
+  for line in "${v6_addrs[@]}"; do cidrs+=("$(awk '{ print $4 }' <<<"$line")"); done
   src=$(reinstall_ip -6 route get 2001:4860:4860::8888 2>/dev/null || true)
   src=$(reinstall_route_field src "$src")
   if [[ -n "$src" ]]; then
