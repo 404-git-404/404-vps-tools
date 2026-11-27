@@ -70,6 +70,7 @@ readonly DNS_PROBE_HOST='deb.debian.org'
 readonly AUTO_RESTORE_MARK='# IPv6 restored by Auto: overrides unmanaged disable_ipv6 settings'
 
 CURRENT_STEP='启动'
+LOCK_HELD=false
 TMP_DIR=''
 BACKUP_DIR=''
 SSH_PORT="$DEFAULT_SSH_PORT"
@@ -457,7 +458,8 @@ usage() {
   bash debian-init.sh
   bash debian-init.sh [选项]
 
-交互菜单：1 快速初始化、2 自定义初始化、3 SmartDNS、4 安装/升级 sing-box、5 Fail2ban、6 系统更新、7 清理、8 安全加固、0 退出（9 预留）。
+交互菜单：1 快速初始化、2 自定义初始化、3 SmartDNS、4 安装/升级 sing-box、5 Fail2ban、6 系统更新、7 清理、8 安全加固、9 重装为官方 Debian 13（会清空整机）、0 退出。
+选项 9 只能从菜单进入：仅 KVM + BIOS + amd64，保留当前 IPv4/IPv6 和 root 公钥，确认主机名后下载校验官方安装器并重启。
 选项 4 安装或升级 sing-box，配置通过检查后才重启；完整初始化只安装 sing-box，不创建节点。
 
 默认流程：
@@ -593,6 +595,7 @@ make_mutable() {
 cleanup() {
   local rc=$?
   set +e
+  if [[ "${REINSTALL_ARMED:-false}" == true ]]; then reinstall_abort_cleanup; fi
   policy_rc_d_restore
   restore_update_package_holds
   restore_ssh_package_holds
@@ -729,6 +732,7 @@ on_signal() {
   # Rollback must finish: ignore repeated signals from here on, and put policy-rc.d back first.
   trap - ERR
   trap '' HUP INT TERM
+  if [[ "${REINSTALL_ARMED:-false}" == true ]]; then reinstall_abort_cleanup || true; fi
   policy_rc_d_restore || true
   restore_ipv6_probe_state || true
   rollback_ufw || true
@@ -747,6 +751,7 @@ die() {
   else
     printf '[ERROR] 步骤“%s”：%s\n' "$CURRENT_STEP" "$*" >&2
   fi
+  if [[ "${REINSTALL_ARMED:-false}" == true ]]; then reinstall_abort_cleanup || true; fi
   exit 1
 }
 
@@ -810,9 +815,12 @@ parse_args() {
 }
 
 acquire_lock() {
+  # Option 9 may take the lock early to clear leftovers; re-opening fd 9 would drop it briefly.
+  [[ "$LOCK_HELD" == false ]] || return 0
   install -d -m 0755 /run/lock
   exec 9>"$LOCK_FILE"
   flock -n 9 || die '已有另一个 vps-init.sh 正在运行。'
+  LOCK_HELD=true
 }
 
 preflight() {
@@ -4932,12 +4940,13 @@ select_install_mode() {
         ui_menu_item 6 '仅更新系统'
         ui_menu_item 7 '系统清理'
         ui_menu_item 8 '安全加固（体检 → 建议 → 确认后执行）' "$C_YELLOW"
+        ui_menu_item 9 '重装为官方 Debian 13（会清空整机）' "${C_BOLD}${C_RED}"
         ui_menu_item 0 '退出' "$C_DIM"
         ui_box_bottom
       } >/dev/tty
       ui_use_target out
     fi
-    read_tty '请选择 [0-8]: ' choice
+    read_tty '请选择 [0-9]: ' choice
     case "$choice" in
       1) INSTALL_MODE=quick; return 0 ;;
       2) INSTALL_MODE=custom; return 0 ;;
@@ -4948,6 +4957,7 @@ select_install_mode() {
       6) INSTALL_MODE=update; return 0 ;;
       7) INSTALL_MODE=cleanup; return 0 ;;
       8) INSTALL_MODE=hardening; return 0 ;;
+      9) INSTALL_MODE=reinstall; return 0 ;;
       *) printf '无效选择。\n' >/dev/tty ;;
     esac
   done
@@ -5477,9 +5487,1341 @@ run_system_cleanup() {
     "$SAFE_CLEANUP_APT" "$SAFE_CLEANUP_JOURNAL" "$SAFE_CLEANUP_TMPFILES" "$orphans" "$kernels"
 }
 
+# ==============================================================================
+# 菜单 [9]：重装为官方 Debian 13（trixie）amd64，仅 KVM + BIOS，GPT 分区，无 swap。
+# 只能从菜单进入，没有命令行参数。
+#
+# 测试专用开关：只读环境变量 VPS_INIT_REINSTALL_TEST（不写进 --help 和 README）
+#   dry-run         完成检查、确认、下载校验和应答生成，打印 preseed、net.env 和网卡配置预览；
+#                   不改 GRUB、不重启，结束时自动清理 /boot/404-reinstall*
+#   selfcheck-fail  预期扇区数故意加 1，安装器分区前自检失败，等待 SELFCHECK_DELAY（120 秒）后重启回旧系统
+#   no-reboot       完成全部准备（包括 GRUB 一次性启动项），但不重启
+#   为空或未设置时正常运行；其他取值直接 die。
+# ==============================================================================
+readonly REINSTALL_SUITE='trixie'
+readonly REINSTALL_ARCH='amd64'
+readonly REINSTALL_MIRROR='https://deb.debian.org/debian'
+readonly REINSTALL_GRUB_ENTRY_ID='reinstall-debian13'
+readonly REINSTALL_MARK_BEGIN='### BEGIN 404-reinstall ###'
+readonly REINSTALL_MARK_END='### END 404-reinstall ###'
+readonly REINSTALL_SELFCHECK_TEST_DELAY=120
+readonly REINSTALL_MIN_SECTORS=8388608
+readonly -a REINSTALL_CURL_OPTS=(--proto '=https' --tlsv1.2 -fsSL --retry 3 --connect-timeout 15)
+# Paths are plain variables (not readonly) so offline tests can point them at a temporary tree.
+REINSTALL_SYS_ROOT='/sys'
+REINSTALL_KEYRING_DIR='/usr/share/keyrings'
+REINSTALL_KEYRING=''
+REINSTALL_BOOT_DIR='/boot/404-reinstall'
+REINSTALL_BOOT_TMP_DIR='/boot/404-reinstall.tmp'
+REINSTALL_GRUB_CFG='/boot/grub/grub.cfg'
+REINSTALL_CUSTOM_CFG='/boot/grub/custom.cfg'
+REINSTALL_CUSTOM_BAK='/boot/grub/custom.cfg.404bak'
+REINSTALL_KEXEC_DEFAULT='/etc/default/kexec'
+REINSTALL_AUTHORIZED_KEYS=$AUTHORIZED_KEYS
+
+REINSTALL_TEST_MODE=''
+# true from the start of the download until right before reboot: every failure, Ctrl+C, HUP or
+# TERM in that window runs reinstall_cleanup through the existing cleanup/die/on_signal paths.
+REINSTALL_ARMED=false
+REINSTALL_STAGE_DIR=''
+REINSTALL_HOST=''
+REINSTALL_NEW_HOST=''
+REINSTALL_HOST_VALID=true
+REINSTALL_NEED_GPGV=false
+REINSTALL_DISK=''
+REINSTALL_DISK_SECTORS=0
+REINSTALL_DISK_SIZE=''
+REINSTALL_GRUB_FS=''
+REINSTALL_V4_MODE=''
+REINSTALL_V4_IFACE=''
+REINSTALL_V4_ADDR=''
+REINSTALL_V4_PREFIX=''
+REINSTALL_V4_NETMASK=''
+REINSTALL_V4_GW=''
+REINSTALL_V4_MAC=''
+REINSTALL_V6_MODE='none'
+REINSTALL_V6_IFACE=''
+REINSTALL_V6_ADDR=''
+REINSTALL_V6_GW=''
+REINSTALL_V6_EXTRA=''
+REINSTALL_V6_MAC=''
+REINSTALL_KEYS_DISCARDED=0
+REINSTALL_ROOT_PASS=''
+REINSTALL_ROOT_HASH=''
+declare -a REINSTALL_KEYS=() REINSTALL_KEY_FPS=() REINSTALL_KEY_HAS_OPTS=() REINSTALL_LEFTOVERS=() REINSTALL_CUSTOM_TMPS=()
+
+# Overridable wrapper so offline tests can feed recorded `ip` output.
+reinstall_ip() {
+  ip "$@"
+}
+
+reinstall_fail() {
+  local IFS=' '
+  die "无法重装：$*"
+}
+
+# Join arguments with single spaces. The script runs with IFS=$'\n\t', so a bare "${arr[*]}"
+# would put each element on its own line.
+reinstall_join() {
+  local IFS=' '
+  printf '%s' "$*"
+}
+
+# Dotted-quad IPv4 with four fields of 0-255.
+reinstall_is_ipv4() {
+  local IFS=. part
+  local -a parts=()
+  [[ "$1" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]] || return 1
+  read -r -a parts <<<"$1"
+  for part in "${parts[@]}"; do
+    (( 10#$part <= 255 )) || return 1
+  done
+}
+
+reinstall_parse_test_mode() {
+  case "${VPS_INIT_REINSTALL_TEST:-}" in
+    '') REINSTALL_TEST_MODE='' ;;
+    dry-run|selfcheck-fail|no-reboot) REINSTALL_TEST_MODE=$VPS_INIT_REINSTALL_TEST ;;
+    *) die "VPS_INIT_REINSTALL_TEST 取值无效：${VPS_INIT_REINSTALL_TEST}（仅支持 dry-run、selfcheck-fail、no-reboot）。" ;;
+  esac
+}
+
+# ---- 遗留检测与清理 ----------------------------------------------------------
+
+reinstall_strip_mark_block() {
+  awk -v b="$REINSTALL_MARK_BEGIN" -v e="$REINSTALL_MARK_END" '
+    $0 == b { skip = 1; next }
+    $0 == e { skip = 0; next }
+    !skip { print }
+  ' "$1"
+}
+
+reinstall_custom_cfg_has_mark() {
+  [[ -f "$REINSTALL_CUSTOM_CFG" ]] && grep -Fxq -- "$REINSTALL_MARK_BEGIN" "$REINSTALL_CUSTOM_CFG"
+}
+
+reinstall_next_entry_is_ours() {
+  command -v grub-editenv >/dev/null 2>&1 || return 1
+  grub-editenv list 2>/dev/null | grep -Fxq -- "next_entry=$REINSTALL_GRUB_ENTRY_ID"
+}
+
+# Temporary custom.cfg rewrites (mktemp next to custom.cfg) left behind by an interrupted run.
+reinstall_custom_tmp_files() {
+  local f
+  REINSTALL_CUSTOM_TMPS=()
+  for f in "$REINSTALL_CUSTOM_CFG".404tmp.*; do
+    if [[ -e "$f" || -L "$f" ]]; then REINSTALL_CUSTOM_TMPS+=("$f"); fi
+  done
+  (( ${#REINSTALL_CUSTOM_TMPS[@]} > 0 ))
+}
+
+# Fill REINSTALL_LEFTOVERS; succeed when any of the six signals is present. The custom.cfg
+# backup is tested with -f here and in reinstall_cleanup alike.
+reinstall_detect_leftover() {
+  REINSTALL_LEFTOVERS=()
+  if [[ -e "$REINSTALL_BOOT_DIR" ]]; then REINSTALL_LEFTOVERS+=("$REINSTALL_BOOT_DIR"); fi
+  if [[ -e "$REINSTALL_BOOT_TMP_DIR" ]]; then REINSTALL_LEFTOVERS+=("$REINSTALL_BOOT_TMP_DIR"); fi
+  if reinstall_custom_cfg_has_mark; then REINSTALL_LEFTOVERS+=("$REINSTALL_CUSTOM_CFG 中的 404-reinstall 启动项"); fi
+  if reinstall_next_entry_is_ours; then REINSTALL_LEFTOVERS+=("GRUB next_entry=$REINSTALL_GRUB_ENTRY_ID"); fi
+  if [[ -f "$REINSTALL_CUSTOM_BAK" ]]; then REINSTALL_LEFTOVERS+=("$REINSTALL_CUSTOM_BAK（custom.cfg 备份）"); fi
+  if reinstall_custom_tmp_files; then REINSTALL_LEFTOVERS+=("${REINSTALL_CUSTOM_TMPS[@]}"); fi
+  (( ${#REINSTALL_LEFTOVERS[@]} > 0 ))
+}
+
+# Remove everything a reinstall preparation may have created. Safe to run repeatedly, and it
+# only touches custom.cfg / next_entry when they carry this script's marker or entry id.
+reinstall_cleanup() {
+  local tmp
+  if [[ -n "$REINSTALL_STAGE_DIR" ]]; then rm -rf -- "$REINSTALL_STAGE_DIR"; fi
+  REINSTALL_STAGE_DIR=''
+  rm -rf -- "$REINSTALL_BOOT_DIR" "$REINSTALL_BOOT_TMP_DIR"
+  if reinstall_custom_tmp_files; then
+    rm -f -- "${REINSTALL_CUSTOM_TMPS[@]}"
+    log '已删除中断留下的 custom.cfg 临时文件'
+  fi
+  if [[ -f "$REINSTALL_CUSTOM_BAK" ]]; then
+    mv -f -- "$REINSTALL_CUSTOM_BAK" "$REINSTALL_CUSTOM_CFG"
+    log "已从备份还原 $REINSTALL_CUSTOM_CFG"
+  elif reinstall_custom_cfg_has_mark; then
+    tmp=$(mktemp "$REINSTALL_CUSTOM_CFG.404tmp.XXXXXX")
+    reinstall_strip_mark_block "$REINSTALL_CUSTOM_CFG" >"$tmp"
+    if grep -q '[^[:space:]]' "$tmp"; then
+      chmod 0644 -- "$tmp"
+      mv -f -- "$tmp" "$REINSTALL_CUSTOM_CFG"
+      log "已移除 $REINSTALL_CUSTOM_CFG 中的 404-reinstall 启动项"
+    else
+      rm -f -- "$tmp" "$REINSTALL_CUSTOM_CFG"
+      log "已删除只含 404-reinstall 启动项的 $REINSTALL_CUSTOM_CFG"
+    fi
+  fi
+  if reinstall_next_entry_is_ours; then
+    grub-editenv - unset next_entry
+    log '已清除 GRUB next_entry'
+  fi
+}
+
+# Called from cleanup, die and on_signal while REINSTALL_ARMED is true.
+reinstall_abort_cleanup() {
+  [[ "${REINSTALL_ARMED:-false}" == true ]] || return 0
+  REINSTALL_ARMED=false
+  trap '' HUP INT TERM
+  warn '重装准备未完成，正在清理已下载的文件和 GRUB 启动项。'
+  reinstall_cleanup || true
+  if reinstall_detect_leftover; then
+    warn "仍有遗留：$(reinstall_join "${REINSTALL_LEFTOVERS[@]}")；请重新运行 [9] 清除，或手动删除后再重启。"
+  else
+    warn '已清理，系统启动项未改变。'
+  fi
+}
+
+reinstall_check_leftover() {
+  local item
+  reinstall_detect_leftover || return 0
+  warn '检测到上次未完成的重装准备（下次重启可能会清空整机）'
+  for item in "${REINSTALL_LEFTOVERS[@]}"; do warn "  - $item"; done
+  if ! ask_yes_no '是否清除这些遗留？' true; then
+    log '已保留上次的重装准备，未做任何修改。'
+    exit 0
+  fi
+  acquire_lock
+  reinstall_cleanup
+  if reinstall_detect_leftover; then
+    reinstall_fail "清除后仍有遗留：$(reinstall_join "${REINSTALL_LEFTOVERS[@]}")"
+  fi
+  log '已清除上次的重装准备。'
+}
+
+# ---- 环境检查（只读） --------------------------------------------------------
+
+reinstall_ip4_to_int() {
+  local IFS=.
+  local a b c d
+  read -r a b c d <<<"$1"
+  printf '%u\n' $(( (a << 24) + (b << 16) + (c << 8) + d ))
+}
+
+reinstall_prefix_to_mask4() {
+  local p=$1 mask=0
+  if (( p > 0 )); then mask=$(( (0xFFFFFFFF << (32 - p)) & 0xFFFFFFFF )); fi
+  printf '%d.%d.%d.%d\n' $(( (mask >> 24) & 255 )) $(( (mask >> 16) & 255 )) $(( (mask >> 8) & 255 )) $(( mask & 255 ))
+}
+
+reinstall_ipv4_in_subnet() {
+  local ip_i gw_i mask_i=0 prefix=$2
+  ip_i=$(reinstall_ip4_to_int "$1")
+  gw_i=$(reinstall_ip4_to_int "$3")
+  if (( prefix > 0 )); then mask_i=$(( (0xFFFFFFFF << (32 - prefix)) & 0xFFFFFFFF )); fi
+  (( (ip_i & mask_i) == (gw_i & mask_i) ))
+}
+
+# Print the word after $1 in the route line $2 (e.g. "via", "dev", "src").
+reinstall_route_field() {
+  awk -v k="$1" '{ for (i = 1; i < NF; i++) if ($i == k) { print $(i + 1); exit } }' <<<"$2"
+}
+
+# 1. root（已在入口检查）、Debian 12/13、amd64
+reinstall_check_system() {
+  local os_id='' os_ver='' arch
+  [[ -r /etc/os-release ]] || reinstall_fail '无法读取 /etc/os-release'
+  os_id=$(awk -F= '$1 == "ID" { gsub(/"/, "", $2); print $2 }' /etc/os-release)
+  os_ver=$(awk -F= '$1 == "VERSION_ID" { gsub(/"/, "", $2); print $2 }' /etc/os-release)
+  if [[ "$os_id" != debian || ! "$os_ver" =~ ^(12|13)$ ]]; then
+    reinstall_fail "仅支持 Debian 12 或 13（当前 ID=${os_id:-未知} VERSION_ID=${os_ver:-未知}）"
+  fi
+  command -v dpkg >/dev/null 2>&1 || reinstall_fail '缺少 dpkg，无法确认架构'
+  arch=$(dpkg --print-architecture 2>/dev/null || true)
+  [[ "$arch" == amd64 ]] || reinstall_fail "仅支持 amd64 架构（当前 ${arch:-未知}）"
+}
+
+# 2. KVM、非容器、无 /proc/vz
+reinstall_check_virt() {
+  local virt
+  command -v systemd-detect-virt >/dev/null 2>&1 || reinstall_fail '缺少 systemd-detect-virt，无法确认虚拟化环境'
+  virt=$(systemd-detect-virt 2>/dev/null || true)
+  [[ "$virt" == kvm ]] || reinstall_fail "仅支持 KVM 虚拟化（当前 systemd-detect-virt=${virt:-unknown}）"
+  if systemd-detect-virt -qc 2>/dev/null; then reinstall_fail '不支持容器环境'; fi
+  [[ ! -e /proc/vz ]] || reinstall_fail '不支持 OpenVZ 环境（检测到 /proc/vz）'
+}
+
+# 3. 仅 BIOS
+reinstall_check_firmware() {
+  [[ ! -d "$REINSTALL_SYS_ROOT/firmware/efi" ]] || reinstall_fail "检测到 $REINSTALL_SYS_ROOT/firmware/efi（当前仅支持 BIOS 启动）"
+}
+
+# 4. 内存 >= 512 MiB
+reinstall_check_memory() {
+  local mem_kb
+  mem_kb=$(awk '$1 == "MemTotal:" { print $2 }' /proc/meminfo)
+  if [[ ! "$mem_kb" =~ ^[0-9]+$ ]] || (( mem_kb < 524288 )); then
+    reinstall_fail "内存不足 512 MiB（MemTotal=${mem_kb:-0} KiB）"
+  fi
+}
+
+# 5b. 目标盘 >= 4 GiB，且同扇区数的块设备恰好 1 块（读 REINSTALL_SYS_ROOT）
+reinstall_check_disk_sizes() {
+  local disk=$1 sectors blk name size count=0
+  [[ -r "$REINSTALL_SYS_ROOT/block/$disk/size" ]] || reinstall_fail "无法读取目标盘 /dev/$disk 的扇区数"
+  sectors=$(<"$REINSTALL_SYS_ROOT/block/$disk/size")
+  if [[ ! "$sectors" =~ ^[0-9]+$ ]] || (( sectors < REINSTALL_MIN_SECTORS )); then
+    reinstall_fail "目标盘 /dev/$disk 小于 4 GiB（扇区数 ${sectors:-0}）"
+  fi
+  for blk in "$REINSTALL_SYS_ROOT"/block/*; do
+    [[ -r "$blk/size" ]] || continue
+    name=${blk##*/}
+    case "$name" in loop*|ram*|zram*|sr*|nbd*|fd*) continue ;; esac
+    size=$(<"$blk/size")
+    if [[ "$size" == "$sectors" ]]; then count=$((count + 1)); fi
+  done
+  if (( count != 1 )); then
+    reinstall_fail "与目标盘 /dev/$disk 扇区数（$sectors）相同的块设备有 $count 块，要求恰好 1 块"
+  fi
+  REINSTALL_DISK=$disk
+  REINSTALL_DISK_SECTORS=$sectors
+}
+
+# 5. 根分区必须是普通分区，取其所在整盘
+reinstall_check_disk() {
+  local root_src disk size
+  root_src=$(findmnt -n -o SOURCE / 2>/dev/null || true)
+  [[ -n "$root_src" ]] || reinstall_fail '无法识别根分区设备'
+  if [[ ! "$root_src" =~ ^/dev/(vd[a-z]+[0-9]+|sd[a-z]+[0-9]+|nvme[0-9]+n[0-9]+p[0-9]+)$ ]]; then
+    reinstall_fail "根分区不是普通分区（当前 $root_src，不支持 dm/md 等设备）"
+  fi
+  disk=$(lsblk -no PKNAME "$root_src" 2>/dev/null | head -n 1 || true)
+  [[ -n "$disk" ]] || reinstall_fail "无法获取根分区所在整盘（root=$root_src）"
+  reinstall_check_disk_sizes "$disk"
+  size=$(lsblk -ndo SIZE "/dev/$disk" 2>/dev/null | tr -d '[:space:]' || true)
+  REINSTALL_DISK_SIZE=${size:-"$REINSTALL_DISK_SECTORS 扇区"}
+}
+
+# 6. GRUB：工具、next_entry 与 41_custom 逻辑、无抽象层、ext2/xfs
+reinstall_check_grub() {
+  local cmd abstraction
+  for cmd in grub-reboot grub-editenv grub-probe grub-mkrelpath; do
+    command -v "$cmd" >/dev/null 2>&1 || reinstall_fail "缺少 GRUB 工具：$cmd"
+  done
+  [[ -r "$REINSTALL_GRUB_CFG" ]] || reinstall_fail "缺少 $REINSTALL_GRUB_CFG"
+  grep -Fq 'next_entry' "$REINSTALL_GRUB_CFG" || reinstall_fail "$REINSTALL_GRUB_CFG 中没有 next_entry 逻辑"
+  grep -Fq '41_custom' "$REINSTALL_GRUB_CFG" || reinstall_fail "$REINSTALL_GRUB_CFG 中没有 41_custom"
+  abstraction=$(grub-probe --target=abstraction /boot/grub 2>/dev/null || true)
+  [[ -z "$abstraction" ]] || reinstall_fail "/boot/grub 使用了不支持的抽象层（$abstraction）"
+  REINSTALL_GRUB_FS=$(grub-probe --target=fs /boot/grub 2>/dev/null || true)
+  if [[ "$REINSTALL_GRUB_FS" != ext2 && "$REINSTALL_GRUB_FS" != xfs ]]; then
+    reinstall_fail "/boot/grub 文件系统不支持（当前 ${REINSTALL_GRUB_FS:-unknown}，仅支持 ext2/3/4 和 xfs）"
+  fi
+}
+
+# 7. kexec 不能绕过 GRUB
+# Matches LOAD_KEXEC=true, LOAD_KEXEC="true" and LOAD_KEXEC='true'.
+reinstall_check_kexec() {
+  if [[ -f "$REINSTALL_KEXEC_DEFAULT" ]] &&
+    grep -Eq "^[[:space:]]*LOAD_KEXEC[[:space:]]*=[[:space:]]*[\"']?true[\"']?" "$REINSTALL_KEXEC_DEFAULT"; then
+    reinstall_fail "$REINSTALL_KEXEC_DEFAULT 启用了 LOAD_KEXEC=true，重启会绕过 GRUB"
+  fi
+}
+
+# Prefer debian-archive-keyring.gpg, fall back to the .pgp next to it (Debian 13 ships .pgp).
+reinstall_pick_keyring() {
+  local candidate
+  REINSTALL_KEYRING=''
+  for candidate in "$REINSTALL_KEYRING_DIR/debian-archive-keyring.gpg" "$REINSTALL_KEYRING_DIR/debian-archive-keyring.pgp"; do
+    if [[ -r "$candidate" ]]; then
+      REINSTALL_KEYRING=$candidate
+      return 0
+    fi
+  done
+  reinstall_fail "缺少 Debian 密钥环：$REINSTALL_KEYRING_DIR/debian-archive-keyring.gpg 或 .pgp"
+}
+
+# 8. 工具与密钥环。gpgv 不是必需项：Debian 13 的 apt 改用 sqv，缺少时确认后再安装。
+reinstall_check_tools() {
+  local cmd
+  for cmd in curl cpio gzip sha256sum openssl ssh-keygen wc stty; do
+    command -v "$cmd" >/dev/null 2>&1 || reinstall_fail "缺少必要工具：$cmd"
+  done
+  REINSTALL_NEED_GPGV=false
+  if ! command -v gpgv >/dev/null 2>&1; then REINSTALL_NEED_GPGV=true; fi
+  reinstall_pick_keyring
+}
+
+# 9. /boot 所在文件系统剩余 >= 200 MiB
+reinstall_check_boot_space() {
+  local avail
+  avail=$(df -Pk /boot 2>/dev/null | awk 'NR == 2 { print $4 }')
+  if [[ ! "$avail" =~ ^[0-9]+$ ]] || (( avail < 204800 )); then
+    reinstall_fail "/boot 所在文件系统剩余空间不足 200 MiB（当前 $(( ${avail:-0} / 1024 )) MiB）"
+  fi
+}
+
+# Print the options field of an authorized_keys line (empty when the line starts with the key
+# type). The field ends at the first whitespace outside double quotes; \" inside quotes is kept.
+reinstall_key_options() {
+  local line=$1 first ch opts='' quoted=false i
+  line=${line#"${line%%[![:space:]]*}"}
+  first=${line%%[[:space:]]*}
+  if [[ "$first" =~ ^(ssh-|ecdsa-|sk-) ]]; then return 0; fi
+  for (( i = 0; i < ${#line}; i++ )); do
+    ch=${line:i:1}
+    if [[ "$quoted" == true && "$ch" == "\\" ]]; then
+      opts+=${line:i:2}
+      i=$((i + 1))
+      continue
+    fi
+    if [[ "$ch" == '"' ]]; then
+      if [[ "$quoted" == true ]]; then quoted=false; else quoted=true; fi
+    elif [[ "$quoted" == false && ( "$ch" == ' ' || "$ch" == $'\t' ) ]]; then
+      break
+    fi
+    opts+=$ch
+  done
+  printf '%s' "$opts"
+}
+
+# Succeed when an options field contains command= or restrict (option names are case-insensitive).
+reinstall_key_options_restricted() {
+  local opts=$1 ch name='' in_name=true quoted=false i
+  for (( i = 0; i <= ${#opts}; i++ )); do
+    ch=${opts:i:1}
+    if [[ "$quoted" == true ]]; then
+      if [[ "$ch" == "\\" ]]; then i=$((i + 1)); elif [[ "$ch" == '"' ]]; then quoted=false; fi
+      continue
+    fi
+    if [[ -z "$ch" || "$ch" == ',' ]]; then
+      name=${name,,}
+      if [[ "$name" == command || "$name" == restrict ]]; then return 0; fi
+      name='' in_name=true
+      continue
+    fi
+    if [[ "$ch" == '"' ]]; then quoted=true; continue; fi
+    if [[ "$ch" == '=' ]]; then in_name=false; continue; fi
+    if [[ "$in_name" == true ]]; then name+=$ch; fi
+  done
+  return 1
+}
+
+# 10. root 的 authorized_keys：有效行原样保留（含 options），且至少一把不带 command=/restrict
+reinstall_check_keys() {
+  local line fp opts usable=0
+  REINSTALL_KEYS=() REINSTALL_KEY_FPS=() REINSTALL_KEY_HAS_OPTS=() REINSTALL_KEYS_DISCARDED=0
+  [[ -r "$REINSTALL_AUTHORIZED_KEYS" ]] || reinstall_fail "不存在可读的 $REINSTALL_AUTHORIZED_KEYS"
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line=${line%$'\r'}
+    if [[ -z "${line//[[:space:]]/}" || "$line" =~ ^[[:space:]]*# ]]; then
+      REINSTALL_KEYS_DISCARDED=$((REINSTALL_KEYS_DISCARDED + 1))
+      continue
+    fi
+    if fp=$(printf '%s\n' "$line" | ssh-keygen -l -f - 2>/dev/null) && [[ -n "$fp" ]]; then
+      opts=$(reinstall_key_options "$line")
+      REINSTALL_KEYS+=("$line")
+      REINSTALL_KEY_FPS+=("$fp")
+      if [[ -n "$opts" ]]; then REINSTALL_KEY_HAS_OPTS+=(true); else REINSTALL_KEY_HAS_OPTS+=(false); fi
+      if [[ -z "$opts" ]] || ! reinstall_key_options_restricted "$opts"; then usable=$((usable + 1)); fi
+    else
+      REINSTALL_KEYS_DISCARDED=$((REINSTALL_KEYS_DISCARDED + 1))
+    fi
+  done <"$REINSTALL_AUTHORIZED_KEYS"
+  log "公钥检查：有效 ${#REINSTALL_KEYS[@]} 把（可交互登录 $usable 把），丢弃空行/注释/无效行 $REINSTALL_KEYS_DISCARDED 行"
+  (( ${#REINSTALL_KEYS[@]} > 0 )) || reinstall_fail "$REINSTALL_AUTHORIZED_KEYS 中没有有效的 SSH 公钥"
+  (( usable > 0 )) || reinstall_fail '没有可用于交互登录的公钥（全部带有 command= 或 restrict 限制）'
+}
+
+# 11. IPv4（必须有）：恰好 1 条默认路由、默认网卡上恰好 1 个全局地址
+reinstall_check_ipv4() {
+  local -a v4_routes=() v4_addrs=()
+  local route cidr
+  mapfile -t v4_routes < <(reinstall_ip -4 route show default | sed '/^[[:space:]]*$/d' || true)
+  (( ${#v4_routes[@]} == 1 )) || reinstall_fail "IPv4 默认路由必须恰好 1 条（当前 ${#v4_routes[@]} 条）"
+  route=${v4_routes[0]}
+  REINSTALL_V4_GW=$(reinstall_route_field via "$route")
+  REINSTALL_V4_IFACE=$(reinstall_route_field dev "$route")
+  if [[ -z "$REINSTALL_V4_GW" || -z "$REINSTALL_V4_IFACE" ]]; then
+    reinstall_fail "无法解析 IPv4 默认路由的网关或网卡（$route）"
+  fi
+  # e.g. RFC 5549 "default via inet6 fe80::1": the word after via is not an IPv4 address.
+  reinstall_is_ipv4 "$REINSTALL_V4_GW" || reinstall_fail 'IPv4 默认路由的网关不是 IPv4 地址，暂不支持'
+  mapfile -t v4_addrs < <(reinstall_ip -4 -o addr show scope global dev "$REINSTALL_V4_IFACE" | sed '/^[[:space:]]*$/d' || true)
+  if (( ${#v4_addrs[@]} != 1 )); then
+    reinstall_fail "IPv4 默认网卡 $REINSTALL_V4_IFACE 上的全局地址必须恰好 1 个（当前 ${#v4_addrs[@]} 个）"
+  fi
+  cidr=$(awk '{ print $4 }' <<<"${v4_addrs[0]}")
+  REINSTALL_V4_ADDR=${cidr%/*}
+  REINSTALL_V4_PREFIX=${cidr#*/}
+  reinstall_is_ipv4 "$REINSTALL_V4_ADDR" || reinstall_fail "IPv4 地址不是合法的 IPv4 地址（$cidr），暂不支持"
+  if [[ "$cidr" != */* || ! "$REINSTALL_V4_PREFIX" =~ ^[0-9]{1,2}$ ]] || (( 10#$REINSTALL_V4_PREFIX > 32 )); then
+    reinstall_fail "无法解析 IPv4 地址/前缀（$cidr）"
+  fi
+  REINSTALL_V4_PREFIX=$((10#$REINSTALL_V4_PREFIX))
+  REINSTALL_V4_NETMASK=$(reinstall_prefix_to_mask4 "$REINSTALL_V4_PREFIX")
+  if grep -qw dynamic <<<"${v4_addrs[0]}"; then
+    REINSTALL_V4_MODE='dhcp'
+  else
+    REINSTALL_V4_MODE='static'
+    if (( REINSTALL_V4_PREFIX != 32 )) &&
+      ! reinstall_ipv4_in_subnet "$REINSTALL_V4_ADDR" "$REINSTALL_V4_PREFIX" "$REINSTALL_V4_GW"; then
+      reinstall_fail 'IPv4 网关不在本网段，第一版不支持'
+    fi
+  fi
+}
+
+# 12. IPv6（可选）：0 条默认路由不配置，多于 1 条拒绝
+reinstall_check_ipv6() {
+  local -a v6_routes=() v6_addrs=() cidrs=() extras=()
+  local route line dynamic=false src c
+  REINSTALL_V6_MODE='none' REINSTALL_V6_IFACE='' REINSTALL_V6_ADDR='' REINSTALL_V6_GW='' REINSTALL_V6_EXTRA=''
+  mapfile -t v6_routes < <(reinstall_ip -6 route show default | sed '/^[[:space:]]*$/d' || true)
+  if (( ${#v6_routes[@]} == 0 )); then
+    log '未检测到 IPv6 默认路由，重装后不配置 IPv6'
+    return 0
+  fi
+  (( ${#v6_routes[@]} == 1 )) || reinstall_fail "存在多条 IPv6 默认路由（当前 ${#v6_routes[@]} 条）"
+  route=${v6_routes[0]}
+  REINSTALL_V6_GW=$(reinstall_route_field via "$route")
+  REINSTALL_V6_IFACE=$(reinstall_route_field dev "$route")
+  if [[ -z "$REINSTALL_V6_GW" || -z "$REINSTALL_V6_IFACE" ]]; then
+    reinstall_fail "无法解析 IPv6 默认路由的网关或网卡（$route）"
+  fi
+  mapfile -t v6_addrs < <(reinstall_ip -6 -o addr show scope global dev "$REINSTALL_V6_IFACE" |
+    grep -Evw 'temporary|deprecated|tentative' | sed '/^[[:space:]]*$/d' || true)
+  (( ${#v6_addrs[@]} > 0 )) || reinstall_fail "IPv6 默认网卡 $REINSTALL_V6_IFACE 上没有可用的全局 IPv6 地址"
+  for line in "${v6_addrs[@]}"; do
+    if grep -qw dynamic <<<"$line"; then dynamic=true; break; fi
+  done
+  if [[ "$dynamic" == true ]]; then
+    REINSTALL_V6_MODE='auto'
+    REINSTALL_V6_ADDR=$(awk '{ print $4 }' <<<"${v6_addrs[0]}")
+    return 0
+  fi
+  REINSTALL_V6_MODE='static'
+  for line in "${v6_addrs[@]}"; do cidrs+=("$(awk '{ print $4 }' <<<"$line")"); done
+  src=$(reinstall_ip -6 route get 2001:4860:4860::8888 2>/dev/null || true)
+  src=$(reinstall_route_field src "$src")
+  if [[ -n "$src" ]]; then
+    for c in "${cidrs[@]}"; do
+      if [[ "${c%/*}" == "$src" ]]; then REINSTALL_V6_ADDR=$c; break; fi
+    done
+  fi
+  REINSTALL_V6_ADDR=${REINSTALL_V6_ADDR:-${cidrs[0]}}
+  for c in "${cidrs[@]}"; do
+    if [[ "$c" != "$REINSTALL_V6_ADDR" ]]; then extras+=("$c"); fi
+  done
+  if (( ${#extras[@]} > 0 )); then
+    REINSTALL_V6_EXTRA=$(printf '%s ' "${extras[@]}")
+    REINSTALL_V6_EXTRA=${REINSTALL_V6_EXTRA% }
+  fi
+}
+
+# 13. 网卡 MAC 与短主机名
+reinstall_check_identity() {
+  local path="$REINSTALL_SYS_ROOT/class/net/$REINSTALL_V4_IFACE/address"
+  [[ -r "$path" ]] || reinstall_fail "无法读取 IPv4 网卡 $REINSTALL_V4_IFACE 的 MAC 地址"
+  REINSTALL_V4_MAC=$(tr '[:upper:]' '[:lower:]' <"$path")
+  REINSTALL_V6_MAC=''
+  if [[ "$REINSTALL_V6_MODE" != none ]]; then
+    path="$REINSTALL_SYS_ROOT/class/net/$REINSTALL_V6_IFACE/address"
+    [[ -r "$path" ]] || reinstall_fail "无法读取 IPv6 网卡 $REINSTALL_V6_IFACE 的 MAC 地址"
+    REINSTALL_V6_MAC=$(tr '[:upper:]' '[:lower:]' <"$path")
+  fi
+  REINSTALL_HOST=$(hostname -s 2>/dev/null || true)
+  [[ -n "$REINSTALL_HOST" ]] || reinstall_fail '无法获取本机短主机名（hostname -s）'
+  reinstall_pick_new_hostname
+}
+
+# The new system gets the lowercased short hostname when it is a valid label, otherwise "debian".
+# Confirmation still asks for the current `hostname -s` as typed.
+reinstall_pick_new_hostname() {
+  local lower=${REINSTALL_HOST,,}
+  if [[ "$lower" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]]; then
+    REINSTALL_NEW_HOST=$lower
+    REINSTALL_HOST_VALID=true
+  else
+    REINSTALL_NEW_HOST='debian'
+    REINSTALL_HOST_VALID=false
+  fi
+}
+
+# Read-only checks. Unlike preflight, this creates no backup directory or temporary files.
+reinstall_preflight() {
+  CURRENT_STEP='重装环境检查'
+  reinstall_parse_test_mode
+  # Same rule as preflight: gpgv may have to be installed through apt_get later.
+  if [[ ! "$APT_WAIT_MAX" =~ ^[0-9]+$ ]] || (( APT_WAIT_MAX < 60 )); then die 'VPS_INIT_APT_WAIT 必须是 >=60 的整数秒。'; fi
+  (( EUID == 0 )) || reinstall_fail '必须以 root 身份运行'
+  reinstall_check_leftover
+  CURRENT_STEP='重装环境检查'
+  log '开始重装环境检查（只读）...'
+  reinstall_check_system
+  reinstall_check_virt
+  reinstall_check_firmware
+  reinstall_check_memory
+  reinstall_check_disk
+  reinstall_check_grub
+  reinstall_check_kexec
+  reinstall_check_tools
+  reinstall_check_boot_space
+  reinstall_check_keys
+  reinstall_check_ipv4
+  reinstall_check_ipv6
+  reinstall_check_identity
+  log '重装环境检查全部通过。'
+}
+
+# ---- 摘要与确认 --------------------------------------------------------------
+
+reinstall_generate_password() {
+  local buf=''
+  while (( ${#buf} < 20 )); do
+    buf+=$(dd if=/dev/urandom bs=512 count=1 2>/dev/null | LC_ALL=C tr -dc 'A-Za-z0-9' || true)
+  done
+  REINSTALL_ROOT_PASS=${buf:0:20}
+  REINSTALL_ROOT_HASH=$(printf '%s' "$REINSTALL_ROOT_PASS" | openssl passwd -6 -stdin)
+  [[ "$REINSTALL_ROOT_HASH" == \$6\$* ]] || die '生成 root 密码哈希失败。'
+}
+
+reinstall_print_summary() {
+  local fp i v4="静态 $REINSTALL_V4_ADDR/$REINSTALL_V4_PREFIX，网关 $REINSTALL_V4_GW"
+  if [[ "$REINSTALL_V4_MODE" == dhcp ]]; then v4="DHCP（当前 $REINSTALL_V4_ADDR/$REINSTALL_V4_PREFIX）"; fi
+  ui_use_target out
+  printf '\n'
+  ui_box_top '重装摘要'
+  ui_box_line_color "${C_BOLD}${C_RED}" "将清空 /dev/$REINSTALL_DISK（$REINSTALL_DISK_SIZE）上的全部数据"
+  ui_box_line "目标系统：Debian 13 ($REINSTALL_SUITE) $REINSTALL_ARCH，BIOS / GPT，无 swap"
+  if [[ -n "$REINSTALL_TEST_MODE" ]]; then
+    ui_box_line_color "$C_YELLOW" "测试模式：$REINSTALL_TEST_MODE"
+  fi
+  if [[ "$REINSTALL_HOST_VALID" == true ]]; then
+    ui_box_line "主机名：$REINSTALL_NEW_HOST"
+  else
+    ui_box_line_color "$C_YELLOW" '当前主机名不合法，新系统将使用 debian'
+  fi
+  if [[ "$REINSTALL_NEED_GPGV" == true ]]; then
+    ui_box_line '将先安装 gpgv（Debian 官方包，用于校验安装文件签名）'
+  fi
+  ui_box_line "IPv4：$v4；MAC $REINSTALL_V4_MAC（当前网卡 $REINSTALL_V4_IFACE）"
+  case "$REINSTALL_V6_MODE" in
+    none) ui_box_line 'IPv6：不配置' ;;
+    auto) ui_box_line "IPv6：自动（SLAAC/RA，当前 $REINSTALL_V6_ADDR）；MAC $REINSTALL_V6_MAC（当前网卡 $REINSTALL_V6_IFACE）" ;;
+    *) ui_box_line "IPv6：静态 $REINSTALL_V6_ADDR，网关 $REINSTALL_V6_GW；MAC $REINSTALL_V6_MAC（当前网卡 $REINSTALL_V6_IFACE）" ;;
+  esac
+  if [[ -n "$REINSTALL_V6_EXTRA" ]]; then ui_box_line "IPv6 附加地址：$REINSTALL_V6_EXTRA"; fi
+  ui_box_line "重装后 SSH：端口 22，root 仅公钥登录；公钥 ${#REINSTALL_KEYS[@]} 把（丢弃 $REINSTALL_KEYS_DISCARDED 行）"
+  for i in "${!REINSTALL_KEY_FPS[@]}"; do
+    fp=${REINSTALL_KEY_FPS[i]}
+    if [[ "${REINSTALL_KEY_HAS_OPTS[i]:-false}" == true ]]; then fp+='（带限制选项）'; fi
+    ui_box_line "  $fp"
+  done
+  ui_box_line "root 密码：$REINSTALL_ROOT_PASS" "root 密码：${C_BOLD}${C_YELLOW}${REINSTALL_ROOT_PASS}${C_RESET}"
+  ui_box_line '仅用于 VNC 控制台登录，请存进密码管理器；商家面板显示的旧密码会失效'
+  ui_box_bottom
+}
+
+reinstall_confirm() {
+  local answer=''
+  CURRENT_STEP='重装确认'
+  reinstall_generate_password
+  reinstall_print_summary
+  read_tty "请输入本机主机名 $REINSTALL_HOST 以确认清空整机并重装：" answer
+  if [[ "$answer" != "$REINSTALL_HOST" ]]; then
+    log '已取消，未做任何修改'
+    exit 0
+  fi
+  log '主机名确认通过。'
+}
+
+# Runs after the hostname confirmation and before anything is written under /boot, so a failure
+# leaves no boot entry behind. dry-run installs gpgv as well: the download and signature check
+# are part of the dry run.
+reinstall_install_gpgv() {
+  [[ "$REINSTALL_NEED_GPGV" == true ]] || return 0
+  CURRENT_STEP='安装 gpgv'
+  log '安装 gpgv（Debian 官方包，用于校验安装文件签名）...'
+  # Package lists may be missing (cleared in images) or stale; refresh them first.
+  apt_get update || die '更新软件包索引失败，无法安装 gpgv；尚未改动任何启动项。'
+  apt_get install -y --no-install-recommends gpgv || die '安装 gpgv 失败；尚未改动任何启动项。'
+  command -v gpgv >/dev/null 2>&1 || die '安装后仍找不到 gpgv；尚未改动任何启动项。'
+  REINSTALL_NEED_GPGV=false
+  log 'gpgv 已安装。'
+}
+
+# ---- 下载与校验 --------------------------------------------------------------
+
+# Judge gpgv by its status output, never by the exit code: at least one VALIDSIG; any BADSIG,
+# EXPKEYSIG, REVKEYSIG or EXPSIG fails; ERRSIG is tolerated only when its return code field is
+# 9 (missing public key) and gpgv also reports NO_PUBKEY for the same key (a newer signing key
+# missing from the local keyring). ERRSIG <keyid> <pkalgo> <hashalgo> <class> <time> <rc> [<fpr>]
+reinstall_check_gpg_status() {
+  local status_file=$1 tag kw keyid err_rc valid=0 k n found
+  local -a bad=() errsig=() nopub=() ignored=()
+  [[ -r "$status_file" ]] || { warn "无法读取 gpgv 状态输出：$status_file"; return 1; }
+  while IFS=' ' read -r tag kw keyid _ _ _ _ err_rc _; do
+    [[ "$tag" == '[GNUPG:]' ]] || continue
+    case "$kw" in
+      VALIDSIG) valid=$((valid + 1)) ;;
+      BADSIG|EXPKEYSIG|REVKEYSIG|EXPSIG) bad+=("$kw ${keyid:-?}") ;;
+      ERRSIG)
+        if [[ "${err_rc:-}" == 9 ]]; then errsig+=("${keyid:-?}"); else bad+=("ERRSIG ${keyid:-?} rc=${err_rc:-?}"); fi ;;
+      NO_PUBKEY) nopub+=("${keyid:-?}") ;;
+    esac
+  done <"$status_file"
+  if (( ${#bad[@]} > 0 )); then
+    warn "InRelease 签名异常：$(reinstall_join "${bad[@]}")"
+    return 1
+  fi
+  for k in "${errsig[@]}"; do
+    found=false
+    for n in "${nopub[@]}"; do
+      if [[ "$n" == "$k" ]]; then found=true; break; fi
+    done
+    if [[ "$found" == false ]]; then
+      warn "InRelease 签名无法校验（ERRSIG $k，没有对应的 NO_PUBKEY）"
+      return 1
+    fi
+    ignored+=("$k")
+  done
+  if (( valid < 1 )); then
+    warn 'InRelease 没有任何有效签名（VALIDSIG）'
+    return 1
+  fi
+  if (( ${#ignored[@]} > 0 )); then
+    log "InRelease 有 ${#ignored[@]} 个签名的公钥不在本机密钥环（$(reinstall_join "${ignored[@]}")），已忽略；其余 $valid 个签名有效"
+  fi
+}
+
+reinstall_fetch() {
+  curl "${REINSTALL_CURL_OPTS[@]}" "$1" -o "$2" || die "下载失败：$1"
+}
+
+reinstall_verify_sha256() {
+  local expected=$1 file=$2 label=$3 actual
+  [[ "$expected" =~ ^[0-9a-f]{64}$ ]] || die "$label 的期望 SHA256 格式无效。"
+  actual=$(sha256sum -- "$file" | awk '{ print $1 }')
+  [[ "$actual" == "$expected" ]] || die "$label SHA256 校验失败（期望 $expected，实际 $actual）。"
+  log "$label SHA256 校验通过"
+}
+
+reinstall_download_and_verify() {
+  local tmp=$REINSTALL_BOOT_TMP_DIR codename sums_hash linux_hash initrd_hash
+  local dist="$REINSTALL_MIRROR/dists/$REINSTALL_SUITE"
+  local entry="main/installer-$REINSTALL_ARCH/current/images/SHA256SUMS"
+  local netboot="$dist/main/installer-$REINSTALL_ARCH/current/images/netboot/debian-installer/$REINSTALL_ARCH"
+  CURRENT_STEP='下载并校验安装器'
+  log "下载并校验 Debian $REINSTALL_SUITE $REINSTALL_ARCH 官方 netboot..."
+  rm -rf -- "$tmp"
+  install -d -m 0700 -- "$tmp"
+
+  reinstall_fetch "$dist/InRelease" "$tmp/InRelease"
+  gpgv --status-fd 3 --keyring "$REINSTALL_KEYRING" --output "$tmp/Release.verified" "$tmp/InRelease" \
+    3>"$tmp/gpgv.status" 2>"$tmp/gpgv.log" || true
+  if ! reinstall_check_gpg_status "$tmp/gpgv.status"; then
+    cat -- "$tmp/gpgv.log" >&2 || true
+    die 'InRelease GPG 签名校验失败。'
+  fi
+  [[ -s "$tmp/Release.verified" ]] || die 'gpgv 没有输出已验证的 Release 正文。'
+  codename=$(awk '$1 == "Codename:" { print $2; exit }' "$tmp/Release.verified")
+  [[ "$codename" == "$REINSTALL_SUITE" ]] || die "Release 的 Codename 不是 $REINSTALL_SUITE（实际 ${codename:-空}）。"
+  log "InRelease 签名有效，Codename=$codename"
+
+  sums_hash=$(awk -v t="$entry" '
+    /^SHA256:/ { in_sha = 1; next }
+    /^[^ ]/ { in_sha = 0 }
+    in_sha && $3 == t { print $1; exit }
+  ' "$tmp/Release.verified")
+  [[ -n "$sums_hash" ]] || die "已验证的 Release 中没有 $entry 的 SHA256。"
+  reinstall_fetch "$dist/$entry" "$tmp/SHA256SUMS"
+  reinstall_verify_sha256 "$sums_hash" "$tmp/SHA256SUMS" 'installer SHA256SUMS'
+
+  linux_hash=$(awk -v p="./netboot/debian-installer/$REINSTALL_ARCH/linux" '$2 == p { print $1; exit }' "$tmp/SHA256SUMS")
+  initrd_hash=$(awk -v p="./netboot/debian-installer/$REINSTALL_ARCH/initrd.gz" '$2 == p { print $1; exit }' "$tmp/SHA256SUMS")
+  [[ -n "$linux_hash" && -n "$initrd_hash" ]] || die 'SHA256SUMS 中没有 netboot linux 或 initrd.gz。'
+  reinstall_fetch "$netboot/linux" "$tmp/linux"
+  reinstall_verify_sha256 "$linux_hash" "$tmp/linux" 'netboot linux'
+  reinstall_fetch "$netboot/initrd.gz" "$tmp/initrd.gz"
+  reinstall_verify_sha256 "$initrd_hash" "$tmp/initrd.gz" 'netboot initrd.gz'
+
+  rm -f -- "$tmp/InRelease" "$tmp/Release.verified" "$tmp/SHA256SUMS" "$tmp/gpgv.status" "$tmp/gpgv.log"
+  rm -rf -- "$REINSTALL_BOOT_DIR"
+  mv -- "$tmp" "$REINSTALL_BOOT_DIR"
+  chmod 0700 -- "$REINSTALL_BOOT_DIR"
+  log "下载与三级校验全部通过：$REINSTALL_BOOT_DIR"
+}
+
+# ---- preseed 与追加包 --------------------------------------------------------
+
+reinstall_sh_quote() {
+  local s=$1
+  printf "'%s'" "${s//\'/\'\\\'\'}"
+}
+
+reinstall_env_line() {
+  printf '%s=%s\n' "$1" "$(reinstall_sh_quote "$2")"
+}
+
+reinstall_write_net_env() {
+  local out=$1 expected=$REINSTALL_DISK_SECTORS delay=0
+  if [[ "$REINSTALL_TEST_MODE" == selfcheck-fail ]]; then
+    expected=$((REINSTALL_DISK_SECTORS + 1))
+    delay=$REINSTALL_SELFCHECK_TEST_DELAY
+  fi
+  {
+    reinstall_env_line TARGET_DISK "$REINSTALL_DISK"
+    reinstall_env_line EXPECTED_SECTORS "$expected"
+    reinstall_env_line SELFCHECK_DELAY "$delay"
+    reinstall_env_line IPV4_MODE "$REINSTALL_V4_MODE"
+    reinstall_env_line IPV4_ADDR "$REINSTALL_V4_ADDR"
+    reinstall_env_line IPV4_PREFIX "$REINSTALL_V4_PREFIX"
+    reinstall_env_line IPV4_NETMASK "$REINSTALL_V4_NETMASK"
+    reinstall_env_line IPV4_GW "$REINSTALL_V4_GW"
+    reinstall_env_line IPV4_MAC "$REINSTALL_V4_MAC"
+    reinstall_env_line IPV4_IFACE_OLD "$REINSTALL_V4_IFACE"
+    reinstall_env_line IPV6_MODE "$REINSTALL_V6_MODE"
+    reinstall_env_line IPV6_ADDR "$REINSTALL_V6_ADDR"
+    reinstall_env_line IPV6_GW "$REINSTALL_V6_GW"
+    reinstall_env_line IPV6_EXTRA_ADDRS "$REINSTALL_V6_EXTRA"
+    reinstall_env_line IPV6_MAC "$REINSTALL_V6_MAC"
+  } >"$out"
+}
+
+reinstall_write_preseed() {
+  local out=$1
+  {
+    cat <<EOF
+# Localization & time
+d-i debian-installer/language string en
+d-i debian-installer/country string US
+d-i debian-installer/locale string en_US.UTF-8
+d-i keyboard-configuration/xkb-keymap select us
+d-i time/zone string UTC
+d-i clock-setup/utc boolean true
+d-i clock-setup/ntp boolean true
+
+# Early MAC-based NIC selection before netcfg
+d-i preseed/early_command string sh /404/early.sh net
+
+# Network (installer stage: IPv4 only)
+d-i netcfg/do_not_use_netplan boolean true
+d-i netcfg/choose_interface select auto
+EOF
+    if [[ "$REINSTALL_V4_MODE" == static ]]; then
+      cat <<EOF
+d-i netcfg/disable_autoconfig boolean true
+d-i netcfg/get_ipaddress string $REINSTALL_V4_ADDR
+d-i netcfg/get_netmask string $REINSTALL_V4_NETMASK
+d-i netcfg/get_gateway string $REINSTALL_V4_GW
+d-i netcfg/get_nameservers string 1.1.1.1 8.8.8.8
+d-i netcfg/confirm_static boolean true
+EOF
+    else
+      printf '%s\n' 'd-i netcfg/disable_autoconfig boolean false'
+    fi
+    cat <<EOF
+d-i netcfg/get_hostname string $REINSTALL_NEW_HOST
+d-i netcfg/get_domain string
+d-i netcfg/hostname string $REINSTALL_NEW_HOST
+d-i hw-detect/load_firmware boolean true
+
+# Mirror & APT setup
+d-i mirror/country string manual
+d-i mirror/http/hostname string deb.debian.org
+d-i mirror/http/directory string /debian
+d-i mirror/http/proxy string
+d-i mirror/suite string $REINSTALL_SUITE
+d-i apt-setup/non-free-firmware boolean true
+d-i apt-setup/contrib boolean false
+d-i apt-setup/non-free boolean false
+d-i apt-setup/enable-source-repositories boolean false
+d-i apt-setup/services-select multiselect security, updates
+
+# Account setup
+d-i passwd/root-login boolean true
+d-i passwd/make-user boolean false
+d-i passwd/root-password-crypted password $REINSTALL_ROOT_HASH
+
+# Pre-partition self-check
+d-i partman/early_command string sh /404/early.sh check
+
+# Partitioning (BIOS + GPT, 1M biosgrub + ext4 /, no swap)
+d-i partman-auto/disk string /dev/$REINSTALL_DISK
+d-i partman-auto/method string regular
+d-i partman-partitioning/choose_label string gpt
+d-i partman-partitioning/default_label string gpt
+d-i partman/default_filesystem string ext4
+d-i partman-auto/expert_recipe string \\
+    404root :: \\
+        1 1 1 free \\
+            \$iflabel{ gpt } \\
+            \$reusemethod{ } \\
+            method{ biosgrub } \\
+        . \\
+        1024 1024 -1 ext4 \\
+            method{ format } \\
+            format{ } \\
+            use_filesystem{ } \\
+            filesystem{ ext4 } \\
+            mountpoint{ / } \\
+        .
+d-i partman-auto/choose_recipe select 404root
+d-i partman-basicfilesystems/no_swap boolean false
+d-i partman-lvm/device_remove_lvm boolean true
+d-i partman-lvm/confirm boolean true
+d-i partman-lvm/confirm_nooverwrite boolean true
+d-i partman-md/device_remove_md boolean true
+d-i partman-md/confirm boolean true
+d-i partman-md/confirm_nooverwrite boolean true
+d-i partman-partitioning/confirm_write_new_label boolean true
+d-i partman/choose_partition select finish
+d-i partman/confirm boolean true
+d-i partman/confirm_nooverwrite boolean true
+
+# Base system & packages
+d-i base-installer/kernel/image string linux-image-$REINSTALL_ARCH
+d-i base-installer/install-recommends boolean false
+tasksel tasksel/first multiselect ssh-server
+d-i pkgsel/include string ifupdown curl ca-certificates systemd-timesyncd
+d-i pkgsel/upgrade select safe-upgrade
+popularity-contest popularity-contest/participate boolean false
+
+# Bootloader
+d-i grub-installer/only_debian boolean true
+d-i grub-installer/with_other_os boolean false
+d-i grub-installer/bootdev string /dev/$REINSTALL_DISK
+d-i debian-installer/add-kernel-opts string net.ifnames=0 biosdevname=0
+
+# Finish
+d-i finish-install/reboot_in_progress note
+d-i preseed/late_command string sh /404/late.sh
+EOF
+  } >"$out"
+}
+
+# Shared POSIX sh: locate a NIC by MAC, skipping lo and enslaved (e.g. SR-IOV VF) devices.
+reinstall_emit_find_iface_lib() {
+  cat <<'EOF'
+find_iface_by_mac() {
+    target_mac=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
+    for p in /sys/class/net/*; do
+        [ -r "$p/address" ] || continue
+        name=${p##*/}
+        [ "$name" = "lo" ] && continue
+        [ -e "$p/master" ] && continue
+        mac=$(tr '[:upper:]' '[:lower:]' < "$p/address")
+        if [ "$mac" = "$target_mac" ]; then
+            printf '%s\n' "$name"
+            return 0
+        fi
+    done
+    return 1
+}
+EOF
+}
+
+# POSIX sh used by late.sh (and the dry-run preview): print /etc/network/interfaces from the
+# net.env variables for the given IPv4 and IPv6 interface names.
+reinstall_emit_render_lib() {
+  cat <<'EOF'
+render_interfaces() {
+    r_v4_if=$1
+    r_v6_if=$2
+    printf 'source /etc/network/interfaces.d/*\n\n'
+    printf 'auto lo\n'
+    printf 'iface lo inet loopback\n\n'
+    printf 'auto %s\n' "$r_v4_if"
+    if [ "$IPV4_MODE" = "static" ]; then
+        printf 'iface %s inet static\n' "$r_v4_if"
+        printf '    address %s/%s\n' "$IPV4_ADDR" "$IPV4_PREFIX"
+        printf '    gateway %s\n' "$IPV4_GW"
+    else
+        printf 'iface %s inet dhcp\n' "$r_v4_if"
+    fi
+    if [ "$IPV6_MODE" != "none" ]; then
+        if [ "$r_v6_if" != "$r_v4_if" ]; then
+            printf '\nauto %s\n' "$r_v6_if"
+        fi
+        if [ "$IPV6_MODE" = "static" ]; then
+            printf 'iface %s inet6 static\n' "$r_v6_if"
+            printf '    address %s\n' "$IPV6_ADDR"
+            printf '    gateway %s\n' "$IPV6_GW"
+            printf '    accept_ra 0\n'
+            printf '    autoconf 0\n'
+            if [ -n "$IPV6_EXTRA_ADDRS" ]; then
+                for r_extra in $IPV6_EXTRA_ADDRS; do
+                    printf '    up ip -6 addr add %s dev %s || true\n' "$r_extra" "$r_v6_if"
+                    printf '    down ip -6 addr del %s dev %s || true\n' "$r_extra" "$r_v6_if"
+                done
+            fi
+        else
+            printf 'iface %s inet6 auto\n' "$r_v6_if"
+        fi
+    fi
+}
+EOF
+}
+
+reinstall_write_early_sh() {
+  local out=$1
+  {
+    cat <<'EOF'
+#!/bin/sh
+set -eu
+
+# shellcheck source=/dev/null
+. /404/net.env
+
+log_msg() {
+    logger -t 404-reinstall "$*" || true
+    printf '404-reinstall: %s\n' "$*" >&2
+}
+
+EOF
+    reinstall_emit_find_iface_lib
+    cat <<'EOF'
+
+abort_and_reboot() {
+    log_msg "SELFCHECK FAILED: $1 - rebooting without touching disk"
+    if [ "${SELFCHECK_DELAY:-0}" -gt 0 ]; then
+        log_msg "test mode: waiting ${SELFCHECK_DELAY}s before reboot"
+        sleep "$SELFCHECK_DELAY"
+    fi
+    sync || true
+    reboot || true
+    sleep 10
+    reboot -f || true
+    sleep 60
+    exit 1
+}
+
+mode=${1:-}
+case "$mode" in
+    net)
+        v4_if=""
+        i=0
+        while [ "$i" -lt 15 ]; do
+            if v4_if=$(find_iface_by_mac "$IPV4_MAC"); then
+                break
+            fi
+            i=$((i + 1))
+            sleep 1
+        done
+        if [ -n "$v4_if" ]; then
+            log_msg "early net: matched IPv4 MAC $IPV4_MAC -> $v4_if"
+            debconf-set netcfg/choose_interface "$v4_if"
+        elif printf '%s\n' "${IPV4_IFACE_OLD:-}" | grep -Eq '^eth[0-9]+$'; then
+            log_msg "early net: IPv4 MAC $IPV4_MAC not found after 15s, fallback to old name $IPV4_IFACE_OLD"
+            debconf-set netcfg/choose_interface "$IPV4_IFACE_OLD"
+        else
+            log_msg "early net: IPv4 MAC $IPV4_MAC not found after 15s, old name ${IPV4_IFACE_OLD:-empty} invalid for fallback, keeping auto"
+        fi
+        ;;
+    check)
+        if [ ! -r "/sys/block/$TARGET_DISK/size" ]; then
+            abort_and_reboot "disk /sys/block/$TARGET_DISK/size missing"
+        fi
+        actual_sectors=$(cat "/sys/block/$TARGET_DISK/size")
+        if [ "$actual_sectors" != "$EXPECTED_SECTORS" ]; then
+            abort_and_reboot "disk $TARGET_DISK sectors mismatch: actual=$actual_sectors expected=$EXPECTED_SECTORS"
+        fi
+        if ! v4_if=$(find_iface_by_mac "$IPV4_MAC"); then
+            abort_and_reboot "IPv4 MAC $IPV4_MAC not found"
+        fi
+        v6_if="none"
+        if [ "$IPV6_MODE" != "none" ]; then
+            if ! v6_if=$(find_iface_by_mac "$IPV6_MAC"); then
+                abort_and_reboot "IPv6 MAC $IPV6_MAC not found"
+            fi
+        fi
+        log_msg "selfcheck OK: disk=$TARGET_DISK sectors=$actual_sectors v4_if=$v4_if v6_if=$v6_if"
+        ;;
+    *)
+        log_msg "unknown mode: $mode"
+        exit 1
+        ;;
+esac
+EOF
+  } >"$out"
+  chmod 0755 -- "$out"
+}
+
+reinstall_write_late_sh() {
+  local out=$1
+  {
+    cat <<'EOF'
+#!/bin/sh
+set -eu
+
+# shellcheck source=/dev/null
+. /404/net.env
+
+log_msg() {
+    logger -t 404-reinstall "$*" || true
+    printf '404-reinstall: %s\n' "$*"
+}
+
+EOF
+    reinstall_emit_find_iface_lib
+    printf '\n'
+    reinstall_emit_render_lib
+    cat <<'EOF'
+
+v4_if=$(find_iface_by_mac "$IPV4_MAC")
+v6_if=""
+if [ "$IPV6_MODE" != "none" ]; then
+    v6_if=$(find_iface_by_mac "$IPV6_MAC")
+fi
+
+log_msg "late.sh: v4_if=$v4_if v6_if=${v6_if:-none}"
+
+# 1. /target/etc/network/interfaces
+mkdir -p /target/etc/network /target/etc/network/interfaces.d
+render_interfaces "$v4_if" "$v6_if" > /target/etc/network/interfaces
+
+# 2. /target/etc/resolv.conf
+{
+    printf 'nameserver 1.1.1.1\n'
+    printf 'nameserver 8.8.8.8\n'
+    if [ "$IPV6_MODE" != "none" ]; then
+        printf 'nameserver 2606:4700:4700::1111\n'
+    fi
+} > /target/etc/resolv.conf
+
+# 3. /target/root/.ssh/authorized_keys
+mkdir -p /target/root/.ssh
+chmod 700 /target/root/.ssh
+cp /404/authorized_keys /target/root/.ssh/authorized_keys
+chmod 600 /target/root/.ssh/authorized_keys
+chown -R 0:0 /target/root/.ssh
+
+# 4. /target/etc/ssh/sshd_config.d/00-404-reinstall.conf
+mkdir -p /target/etc/ssh/sshd_config.d
+cat <<'SSHEOF' > /target/etc/ssh/sshd_config.d/00-404-reinstall.conf
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PermitRootLogin prohibit-password
+SSHEOF
+chmod 644 /target/etc/ssh/sshd_config.d/00-404-reinstall.conf
+
+# 5. Dump generated files into installer log
+log_msg "=== /target/etc/network/interfaces ==="
+cat /target/etc/network/interfaces
+log_msg "=== /target/etc/resolv.conf ==="
+cat /target/etc/resolv.conf
+log_msg "=== /target/etc/ssh/sshd_config.d/00-404-reinstall.conf ==="
+cat /target/etc/ssh/sshd_config.d/00-404-reinstall.conf
+log_msg "=== /target/root/.ssh/authorized_keys ==="
+ls -la /target/root/.ssh/authorized_keys
+cat /target/root/.ssh/authorized_keys
+log_msg "late.sh finished successfully."
+EOF
+  } >"$out"
+  chmod 0755 -- "$out"
+}
+
+# finish-install hook, ordered after the installer's 08hw-detect (which adds qemu-guest-agent on
+# KVM). in-target sends stdout to syslog unless --pass-stdout is given, so the status query needs
+# it. Every step only logs on failure: this hook must never make the installation fail.
+reinstall_write_finish_cleanup() {
+  local out=$1
+  cat <<'EOF' >"$out"
+#!/bin/sh
+set -u
+
+log_msg() {
+    logger -t 404-reinstall "$*" 2>/dev/null || true
+}
+
+candidates="qemu-guest-agent os-prober installation-report laptop-detect task-english iamerican ibritish ienglish-common ispell wamerican dictionaries-common emacsen-common"
+installed=""
+log_msg "finish cleanup: checking installed packages"
+for pkg in $candidates; do
+    # shellcheck disable=SC2016 # ${Status} is a dpkg-query format field.
+    status=$(in-target --pass-stdout dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null) || status=""
+    case "$status" in
+        *" installed") installed="$installed $pkg" ;;
+    esac
+done
+
+if [ -n "$installed" ]; then
+    log_msg "finish cleanup: purging$installed"
+    # shellcheck disable=SC2086 # The package list is split on purpose.
+    if in-target apt-get -y purge $installed; then
+        log_msg "finish cleanup: purge OK"
+    else
+        log_msg "finish cleanup: purge failed (rc=$?), continuing"
+    fi
+else
+    log_msg "finish cleanup: nothing to purge"
+fi
+
+if in-target apt-get -y autoremove --purge; then
+    log_msg "finish cleanup: autoremove OK"
+else
+    log_msg "finish cleanup: autoremove failed (rc=$?), continuing"
+fi
+
+log_msg "finish cleanup: done"
+exit 0
+EOF
+  chmod 0755 -- "$out"
+}
+
+reinstall_write_authorized_keys() {
+  local out=$1 key
+  : >"$out"
+  for key in "${REINSTALL_KEYS[@]}"; do printf '%s\n' "$key" >>"$out"; done
+  chmod 0600 -- "$out"
+}
+
+# Print the interfaces file late.sh would write, using the same POSIX sh renderer.
+reinstall_render_interfaces_preview() {
+  local net_env=$1 v4_if=$2 v6_if=$3
+  # shellcheck disable=SC2016 # Expanded by the inner sh.
+  sh -c '. "$1"; eval "$2"; render_interfaces "$3" "$4"' sh "$net_env" "$(reinstall_emit_render_lib)" "$v4_if" "$v6_if"
+}
+
+reinstall_build_overlay() {
+  local stage overlay="$REINSTALL_BOOT_DIR/overlay.cpio.gz"
+  CURRENT_STEP='生成安装应答'
+  log '生成 preseed 与追加 cpio 包...'
+  REINSTALL_STAGE_DIR=$(mktemp -d "$REINSTALL_BOOT_DIR/overlay.XXXXXX")
+  stage=$REINSTALL_STAGE_DIR
+  install -d -m 0700 -- "$stage/404"
+  # These directories already exist in the installer initrd; the kernel applies the archive's
+  # mode to them, so they must stay 0755.
+  install -d -m 0755 -- "$stage/usr" "$stage/usr/lib" "$stage/usr/lib/finish-install.d"
+  reinstall_write_preseed "$stage/preseed.cfg"
+  reinstall_write_net_env "$stage/404/net.env"
+  reinstall_write_early_sh "$stage/404/early.sh"
+  reinstall_write_late_sh "$stage/404/late.sh"
+  reinstall_write_authorized_keys "$stage/404/authorized_keys"
+  reinstall_write_finish_cleanup "$stage/usr/lib/finish-install.d/50404-reinstall-cleanup"
+
+  if [[ "$REINSTALL_TEST_MODE" == dry-run ]]; then
+    printf '\n'
+    log '==================== preseed.cfg ===================='
+    cat -- "$stage/preseed.cfg"
+    log '==================== 404/net.env ===================='
+    cat -- "$stage/404/net.env"
+    log '==================== 网卡配置预览（按当前网卡名示意，安装时按 MAC 定位） ===================='
+    reinstall_render_interfaces_preview "$stage/404/net.env" "$REINSTALL_V4_IFACE" "${REINSTALL_V6_IFACE:-$REINSTALL_V4_IFACE}"
+    log '====================================================='
+    printf '\n'
+  fi
+
+  (
+    cd -- "$stage"
+    printf '%s\n' preseed.cfg 404 404/authorized_keys 404/net.env 404/early.sh 404/late.sh \
+      usr usr/lib usr/lib/finish-install.d usr/lib/finish-install.d/50404-reinstall-cleanup |
+      cpio -o -H newc -R 0:0 --quiet | gzip -9 >"$overlay"
+  )
+  cat -- "$overlay" >>"$REINSTALL_BOOT_DIR/initrd.gz"
+  rm -f -- "$overlay"
+  rm -rf -- "$stage"
+  REINSTALL_STAGE_DIR=''
+  chmod 0600 -- "$REINSTALL_BOOT_DIR/linux" "$REINSTALL_BOOT_DIR/initrd.gz"
+  log "已将追加包拼接到 $REINSTALL_BOOT_DIR/initrd.gz"
+}
+
+# ---- GRUB 一次性启动与重启 ---------------------------------------------------
+
+# Back up an existing custom.cfg once, drop any older 404-reinstall block and append a new one.
+reinstall_write_custom_cfg() {
+  local uuid=$1 rel=$2 fs_mod=$3 tmp
+  if [[ -f "$REINSTALL_CUSTOM_CFG" ]]; then
+    if [[ ! -f "$REINSTALL_CUSTOM_BAK" ]]; then
+      cp -a -- "$REINSTALL_CUSTOM_CFG" "$REINSTALL_CUSTOM_BAK"
+      log "已备份 $REINSTALL_CUSTOM_CFG 到 $REINSTALL_CUSTOM_BAK"
+    fi
+    tmp=$(mktemp "$REINSTALL_CUSTOM_CFG.404tmp.XXXXXX")
+    reinstall_strip_mark_block "$REINSTALL_CUSTOM_CFG" >"$tmp"
+    mv -f -- "$tmp" "$REINSTALL_CUSTOM_CFG"
+  fi
+  cat <<EOF >>"$REINSTALL_CUSTOM_CFG"
+$REINSTALL_MARK_BEGIN
+menuentry '404-reinstall Debian 13 installer' --id $REINSTALL_GRUB_ENTRY_ID {
+  insmod part_gpt; insmod part_msdos; insmod $fs_mod
+  search --no-floppy --fs-uuid --set=root $uuid
+  linux $rel/linux auto=true priority=critical lowmem/low=1 net.ifnames=0 biosdevname=0 language=en country=US locale=en_US.UTF-8 keymap=us
+  initrd $rel/initrd.gz
+}
+$REINSTALL_MARK_END
+EOF
+  chmod 0644 -- "$REINSTALL_CUSTOM_CFG"
+}
+
+reinstall_configure_grub() {
+  local uuid rel fs_mod=ext2
+  CURRENT_STEP='配置 GRUB 一次性启动'
+  log '配置 GRUB 一次性启动项...'
+  uuid=$(grub-probe --target=fs_uuid "$REINSTALL_BOOT_DIR")
+  rel=$(grub-mkrelpath "$REINSTALL_BOOT_DIR")
+  [[ -n "$uuid" && -n "$rel" ]] || die "无法计算 $REINSTALL_BOOT_DIR 的文件系统 UUID 或 GRUB 相对路径。"
+  if [[ "$REINSTALL_GRUB_FS" == xfs ]]; then fs_mod=xfs; fi
+  reinstall_write_custom_cfg "$uuid" "$rel" "$fs_mod"
+  grub-reboot "$REINSTALL_GRUB_ENTRY_ID"
+  reinstall_next_entry_is_ours || die "grub-editenv 未确认 next_entry=$REINSTALL_GRUB_ENTRY_ID。"
+  log "已设置 GRUB next_entry=$REINSTALL_GRUB_ENTRY_ID"
+}
+
+reinstall_print_ready() {
+  ui_use_target out
+  printf '\n'
+  ui_box_top '准备就绪'
+  ui_box_line "重装完成后登录：ssh -p 22 root@$REINSTALL_V4_ADDR"
+  ui_box_line "root 密码：$REINSTALL_ROOT_PASS" "root 密码：${C_BOLD}${C_YELLOW}${REINSTALL_ROOT_PASS}${C_RESET}"
+  ui_box_line 'root 密码仅用于 VNC 控制台登录；商家面板显示的旧密码会失效'
+  ui_box_line "清除旧主机指纹：ssh-keygen -R $REINSTALL_V4_ADDR"
+  ui_box_line '下一步：用 README 的一键命令运行 [1] 快速初始化'
+  ui_box_line '安装大约需要 5～20 分钟，安装期间 SSH 连不上属于正常现象'
+  ui_box_bottom
+}
+
+reinstall_countdown_and_reboot() {
+  local sec
+  CURRENT_STEP='重启进入安装器'
+  log '10 秒后重启进入安装器；按 Ctrl+C 可取消，取消后自动清理。'
+  for (( sec = 10; sec >= 1; sec-- )); do
+    printf '%s...\n' "$sec"
+    sleep 1
+  done
+  trap '' HUP INT TERM
+  REINSTALL_ARMED=false
+  log '正在重启...'
+  if ! reboot; then
+    # Do not leave a one-shot entry that would wipe the disk on some later, unexpected reboot.
+    reinstall_cleanup || true
+    die 'reboot 执行失败，已清除启动项，系统未改变；可重新运行 [9]'
+  fi
+}
+
+run_reinstall() {
+  reinstall_confirm
+  reinstall_install_gpgv
+  REINSTALL_ARMED=true
+  reinstall_download_and_verify
+  reinstall_build_overlay
+  if [[ "$REINSTALL_TEST_MODE" == dry-run ]]; then
+    reinstall_cleanup
+    REINSTALL_ARMED=false
+    log 'dry-run 完成：已清理下载文件，未修改 GRUB，未重启。'
+    return 0
+  fi
+  reinstall_configure_grub
+  reinstall_print_ready
+  if [[ "$REINSTALL_TEST_MODE" == no-reboot ]]; then
+    REINSTALL_ARMED=false
+    log 'no-reboot 测试模式：启动项已保留，未重启。下次重启会进入安装器；重新运行 [9] 可清除。'
+    return 0
+  fi
+  reinstall_countdown_and_reboot
+}
+
 main() {
   parse_args "$@"
   select_install_mode
+  if [[ "$INSTALL_MODE" == reinstall ]]; then
+    # Not preflight: that creates a backup directory. No ensure_system_dns either.
+    reinstall_preflight
+    acquire_lock
+    run_reinstall
+    return 0
+  fi
   if [[ "$INSTALL_MODE" == audit ]]; then
     (( EUID == 0 )) || die '完整只读体检需要 root。'
     collect_security_audit

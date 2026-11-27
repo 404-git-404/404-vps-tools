@@ -12,7 +12,7 @@ cd "$(mktemp -d)" && B=https://github.com/404-git-404/404-vps-tools/releases/lat
 
 以上命令下载最新发布的版本，校验 SHA256SUMS 通过后才运行；校验失败不会执行。想锁定版本，见对应 Release 的说明。`bash debian-init.sh --version` 查看版本。
 
-第一条命令以 root 在 Debian 12/13（amd64/arm64、systemd）运行，菜单：1 快速初始化、2 自定义初始化、3 SmartDNS、4 安装/升级 sing-box、5 Fail2ban、6 系统更新、7 清理、8 安全加固、0 退出；9 预留。本地运行 `bash debian-init.sh`。
+第一条命令以 root 在 Debian 12/13（amd64/arm64、systemd）运行，菜单：1 快速初始化、2 自定义初始化、3 SmartDNS、4 安装/升级 sing-box、5 Fail2ban、6 系统更新、7 清理、8 安全加固、9 重装为官方 Debian 13（会清空整机）、0 退出。本地运行 `bash debian-init.sh`。
 
 快速安装选择 SSH 单端口和网络策略，直接回车默认使用 53651 与 Auto。`--ssh-port PORT` 和 `--network-stack auto|ipv4|dual` 分别跳过对应菜单。使用 `--ssh-port PORT --keep-22` 可兼容旧部署的备用 22。
 

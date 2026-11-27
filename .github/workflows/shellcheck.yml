@@ -49,6 +49,7 @@ jobs:
             tests/cloudflare-ips-test.sh
             tests/version-test.sh
             tests/ui-test.sh
+            tests/reinstall-test.sh
             tests/release-checks-test.sh
             tests/readme-commands-test.sh
             .github/scripts/ci-fetch.sh
@@ -85,6 +86,7 @@ jobs:
             tests/cloudflare-ips-test.sh \
             tests/version-test.sh \
             tests/ui-test.sh \
+            tests/reinstall-test.sh \
             tests/release-checks-test.sh \
             tests/readme-commands-test.sh \
             .github/scripts/release-checks.sh \
@@ -149,7 +151,7 @@ jobs:
       - name: Install ShellCheck, jq, and mawk
         run: |
           sudo apt-get update
-          sudo apt-get install --yes shellcheck jq mawk openssh-client
+          sudo apt-get install --yes shellcheck jq mawk openssh-client cpio
 
       - name: Run offline tests
         run: |
@@ -174,6 +176,7 @@ jobs:
           PATH="$RUNNER_TEMP/mawk-bin:$PATH" bash tests/cloudflare-ips-test.sh
           PATH="$RUNNER_TEMP/mawk-bin:$PATH" bash tests/version-test.sh
           PATH="$RUNNER_TEMP/mawk-bin:$PATH" bash tests/ui-test.sh
+          PATH="$RUNNER_TEMP/mawk-bin:$PATH" bash tests/reinstall-test.sh
           PATH="$RUNNER_TEMP/mawk-bin:$PATH" bash tests/release-checks-test.sh
 
       - name: Validate Actions workflows and inline shell
@@ -266,6 +269,7 @@ jobs:
             tests/cloudflare-ips-test.sh \
             tests/version-test.sh \
             tests/ui-test.sh \
+            tests/reinstall-test.sh \
             tests/release-checks-test.sh \
             tests/readme-commands-test.sh \
             .github/scripts/ci-fetch.sh \
