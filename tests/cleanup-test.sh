@@ -154,6 +154,8 @@ GRUB
   expect_unsafe_grub 'different firmware title' 's/UEFI Firmware Settings/Custom Firmware Settings/'
   expect_unsafe_grub 'wrong firmware directory marker' '/30_uefi-firmware/s/grub\.d/grubXd/'
   expect_unsafe_grub 'missing 10_linux END' '/^### END .*\/10_linux ###$/d'
+  sed -n '/^### BEGIN .*\/30_uefi-firmware/,/^### END .*\/30_uefi-firmware/p' "$root/grub.cfg.orig" >"$root/firmware-stanza"
+  expect_unsafe_grub 'two complete firmware sections' "\$r $root/firmware-stanza"
 TEST
 )
 

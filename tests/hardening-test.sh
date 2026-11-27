@@ -349,11 +349,11 @@ apt-cache() {
   check_audit_apt_cache_args "$@" || return 1
   shift 4
   if [[ "$*" == policy ]]; then
-    printf ' 500 https://deb.debian.org/debian stable/main amd64 Packages\n     release o=Debian,a=stable\n'
+    printf '1001 https://deb.debian.org/debian trixie/main amd64 Packages\n     release o=Debian,a=stable,n=trixie\n'
   elif [[ "$*" == *'external'* || "$*" == *'vendor-barad'* ]]; then
-    printf '  Version table:\n *** 1.0 100\n        500 https://vendor.invalid stable/main amd64 Packages\n        100 /var/lib/dpkg/status\n     0.9 500 (phased 50%%)\n        500 https://deb.debian.org/debian stable/main amd64 Packages\n'
+    printf '  Version table:\n *** 1.0 100\n        500 https://vendor.invalid stable/main amd64 Packages\n        100 /var/lib/dpkg/status\n     0.9 1001 (phased 50%%)\n       1001 https://deb.debian.org/debian trixie/main amd64 Packages\n'
   else
-    printf '  Version table:\n *** 1.0 500 (phased 50%%)\n        500 https://deb.debian.org/debian stable/main amd64 Packages\n        100 /var/lib/dpkg/status\n'
+    printf '  Version table:\n *** 1.0 1001 (phased 50%%)\n       1001 https://deb.debian.org/debian trixie/main amd64 Packages\n        100 /var/lib/dpkg/status\n'
   fi
 }
 systemctl() {
@@ -470,6 +470,7 @@ touch "$root/etc/cloud/cloud-init.disabled"
 rm -r "$root/usr/local/aegis"
 collect_security_audit
 [[ ${#AUDIT_FINDINGS[@]} == 0 ]] || { print_security_audit full; fail 'negative fixture has findings'; }
+audit_debian_package official || fail 'seven-space Debian origin at priority 1001 was rejected'
 
 # --audit dispatch has no writes, even to lock/backup/DNS; compare content + metadata
 # across the entire fixture, including hidden files and symlinks. Audit emits to stdout.
@@ -488,7 +489,7 @@ snapshot() { find "$root" -printf '%P %y %m %U %G %s %T@ %l\n'; find "$root" -ty
     if [[ "$*" == *'sing-box' ]]; then
       check_audit_apt_cache_args "$@" || return 1
       printf '  Version table:\n *** 1.0 100\n        100 /var/lib/dpkg/status\n'
-      if [[ -n "$installed_origin" ]]; then printf '        500 %s * Packages\n' "$installed_origin"; fi
+      if [[ -n "$installed_origin" ]]; then printf '       1001 %s * Packages\n' "$installed_origin"; fi
       printf '     1e0 500 (phased 50%%)\n        500 https://deb.sagernet.org/ * Packages\n'
     else
       fixture_apt-cache "$@"
@@ -507,11 +508,13 @@ snapshot() { find "$root" -printf '%P %y %m %U %G %s %T@ %l\n'; find "$root" -ty
   package_finding() { has_finding $'^B\tpackage\t'"$1"$'\t'"$2"; }
 
   # Exercise an unmarked version too. An unrelated line terminates its source rows.
-  apt_policy_fixture=$'        500 before-table\n  Version table:\n     1.0 500 (phased 50%)\n        500 repo-one\n          -1 repo-two\n       100 /var/lib/dpkg/status\n        100 after-unknown-line\n'
-  [[ "$(audit_apt_version_sources 1.0 "$apt_policy_fixture")" == $'        500 repo-one\n          -1 repo-two' ]]
+  apt_policy_fixture=$'        500 before-table\n  Version table:\n     1.0 1001 (phased 50%)\n       1001 https://deb.debian.org/debian trixie/main amd64 Packages\n        500 repo-one\n       -100 repo-two\n       unexpected text\n        100 after-unknown-line\n'
+  [[ "$(audit_apt_version_sources 1.0 "$apt_policy_fixture")" == \
+    $'       1001 https://deb.debian.org/debian trixie/main amd64 Packages\n        500 repo-one\n       -100 repo-two' ]]
 
   snapshot >"$work/sager-before"
   for installed_origin in 'https://deb.sagernet.org' 'https://deb.sagernet.org/'; do
+    audit_singbox_sagernet_origin || fail 'seven-space SagerNet origin at priority 1001 was rejected'
     collect_security_audit
     if package_finding sing-box ''; then fail 'managed sing-box was reported'; fi
     package_finding external "$generic" || fail 'other third-party package was omitted'

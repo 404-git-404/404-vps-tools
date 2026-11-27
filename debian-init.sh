@@ -4189,7 +4189,7 @@ audit_apt_version_sources() {
       selected=((current "") == (version ""))
       next
     }
-    /^        [ ]*-?[0-9]+([[:space:]]|$)/ { if (selected) print; next }
+    /^       [ ]*-?[0-9]+([[:space:]]|$)/ { if (selected) print; next }
     { selected=0 }
   '
 }
@@ -4232,7 +4232,7 @@ audit_sagernet_repo_matches() {
     "$AUDIT_ROOT/etc/apt/sources.list.d/"*.list "$AUDIT_ROOT/etc/apt/sources.list.d/"*.sources; do
     [[ "$file" != "$source" && -f "$file" ]] || continue
     status=0
-    LC_ALL=C grep -Fqi -- sagernet.org "$file" || status=$?
+    LC_ALL=C grep -Fqi -- sagernet.org "$file" 2>/dev/null || status=$?
     [[ "$status" == 1 ]] || return 1
   done
 }
@@ -5420,7 +5420,6 @@ cleanup_parse_grub() {
       } else if ($0 ~ /^### BEGIN \/etc\/grub\.d\/30_uefi-firmware ###$/) {
         if (!linux_done) unsafe=1
         firmware=1
-        firmware_entries=0
       }
       if (standard || firmware) {
         section_end=$0
