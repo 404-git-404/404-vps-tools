@@ -258,6 +258,20 @@ grep -Fxq '请输入 y 确认，或 n 跳过/取消（Ctrl+C 退出）' "$work/t
 # default=true is unchanged: Enter means yes.
 # shellcheck disable=SC2016 # Evaluated inside the isolated fixture.
 run_in_bash 'read_tty() { [[ "$1" == "保留？ [Y/n] " ]] || fail "prompt: $1"; printf -v "$2" ""; }; ask_yes_no "保留？" true' || fail '[Y/n] Enter is not yes'
+# default=true also compares without surrounding blanks: blanks only mean yes.
+yes_no_true_case() {
+  local expected=$1 replies=$2
+  run_in_bash "
+    replies=($replies) asks=0
+    read_tty() { printf -v \"\$2\" '%s' \"\${replies[asks]}\"; asks=\$((asks + 1)); }
+    if ask_yes_no '保留？' true; then rc=0; else rc=1; fi
+    [[ \$rc == $expected && \$asks == \${#replies[@]} ]] || fail \"[Y/n] [$replies] returned \$rc after \$asks asks\"
+  " || fail "[Y/n] case [$replies]"
+}
+yes_no_true_case 0 "'   '"
+yes_no_true_case 1 "' n '"
+yes_no_true_case 0 "' YES '"
+yes_no_true_case 1 "maybe ' No '"
 # End of input dies instead of asking forever: the real read_tty reads the (exhausted) terminal file.
 # shellcheck disable=SC2016 # Evaluated inside the isolated fixture.
 expect_bash_failure '读取交互输入失败' ': >"$work/tty"; CONFIG_CONFIRMED=false; ask_yes_no "确认删除 fixture？" false'

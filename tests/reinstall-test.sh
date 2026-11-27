@@ -1073,6 +1073,12 @@ expect_ok 'no valid key: paste needed' t_keys "$work/ak-none"
 grep -Fxq "paste=true reason=$work/ak-none 中没有有效的 SSH 公钥" "$work/last.out" || fail 'no valid key reason'
 expect_ok 'missing authorized_keys: paste needed' t_keys "$work/no-such-ak"
 grep -Fxq "paste=true reason=不存在可读的 $work/no-such-ak" "$work/last.out" || fail 'missing file reason'
+# A directory is no key file (it would make read fail); a readable non-directory such as /dev/null is read.
+mkdir -p "$work/ak-dir"
+expect_ok 'authorized_keys path is a directory: paste needed' t_keys "$work/ak-dir"
+grep -Fxq "paste=true reason=不存在可读的 $work/ak-dir" "$work/last.out" || fail 'directory reason'
+expect_ok 'authorized_keys is /dev/null: read as empty' t_keys /dev/null
+grep -Fxq 'paste=true reason=/dev/null 中没有有效的 SSH 公钥' "$work/last.out" || fail '/dev/null reason'
 {
   printf 'command="/bin/false" %s\n' "$pub"
   printf '# comment\r\n\r\nnot-a-key\r\n%s\r\n' "$pub"
@@ -1182,6 +1188,30 @@ expect_ok 'drain buffered terminal input' t_drain
 paste_prompt='粘贴 SSH 公钥（直接回车放弃）: '
 use_prompt='是否使用这把公钥？ [y/n] '
 prompt_count() { grep -Fxc -- "$1" "$work/paste.prompts" || true; }
+# The whole preflight with every other check replaced: a usable key never shows the paste flow;
+# without one the paste comes after the identity check. The root check is the only reinstall_fail
+# waived, since the offline tests do not run as root.
+t_preflight() {
+  local check
+  unset VPS_INIT_REINSTALL_TEST VPS_INIT_REINSTALL_KEYS_FILE
+  REINSTALL_AUTHORIZED_KEYS=$1
+  shift
+  for check in leftover system virt firmware memory disk grub kexec tools boot_space ipv4 ipv6 identity; do
+    eval "reinstall_check_$check() { log 'check $check'; }"
+  done
+  reinstall_fail() { [[ "$*" == '必须以 root 身份运行' ]] || die "无法重装：$*"; }
+  REPLIES=("$@")
+  paste_fakes
+  reinstall_preflight
+  (( REPLY_I == ${#REPLIES[@]} )) || fail "only $REPLY_I of ${#REPLIES[@]} replies used"
+}
+expect_ok 'preflight with a usable key: no paste' t_preflight "$work/ak-mixed"
+grep -Fq '重装环境检查全部通过。' "$work/last.out" || fail 'preflight did not finish'
+grep -Fq 'check identity' "$work/last.out" || fail 'preflight checks not run'
+if grep -Fq '粘贴' "$work/last.out" || [[ -s "$work/paste.prompts" ]]; then fail 'paste flow shown although a usable key exists'; fi
+expect_ok 'preflight without a usable key: paste after the checks' t_preflight "$work/ak-command" "$paste_pub" y
+awk '/check identity/ {i=NR} /本机 root 没有可用的 SSH 公钥/ {p=NR} /重装环境检查全部通过/ {d=NR} END {exit !(i && p && d && i < p && p < d)}' "$work/last.out" ||
+  fail 'paste not between the identity check and the end of the preflight'
 
 expect_ok 'paste: missing file, valid key, y' t_paste "$work/no-such-ak" "$paste_pub" y
 grep -Fq "本机 root 没有可用的 SSH 公钥（不存在可读的 $work/no-such-ak）。" "$work/last.out" || fail 'paste intro reason'
@@ -1324,7 +1354,12 @@ grep -Fq 'STTY=same' "$work/pty-private.out.txt" || fail 'PTY paste: terminal mo
 
 # ---- test switch for the key file -----------------------------------------------
 t_keys_file_alone() { unset VPS_INIT_REINSTALL_TEST; VPS_INIT_REINSTALL_KEYS_FILE="$work/ak-none"; reinstall_parse_test_mode; }
-expect_die 'keys file without a test mode' 'VPS_INIT_REINSTALL_KEYS_FILE 只能与 VPS_INIT_REINSTALL_TEST 一起使用。' t_keys_file_alone
+expect_die 'keys file without a test mode' 'VPS_INIT_REINSTALL_KEYS_FILE 只能与 VPS_INIT_REINSTALL_TEST=dry-run 一起使用。' t_keys_file_alone
+# Only dry-run: the other modes write a real boot entry, which must never carry a test key file.
+t_keys_file_mode() { VPS_INIT_REINSTALL_TEST=$1 VPS_INIT_REINSTALL_KEYS_FILE="$work/ak-none"; reinstall_parse_test_mode; }
+for mode in no-reboot selfcheck-fail; do
+  expect_die "keys file with $mode" 'VPS_INIT_REINSTALL_KEYS_FILE 只能与 VPS_INIT_REINSTALL_TEST=dry-run 一起使用。' t_keys_file_mode "$mode"
+done
 t_keys_file_dry() {
   use_host
   UI_WIDTH=200

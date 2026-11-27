@@ -338,6 +338,22 @@ PROBE
   yes_no_probe '\n' true "$work/pty-yn-default.out" -u NO_COLOR TERM=xterm-256color
   grep -Fq $'[\033[1m\033[36mY\033[0m/n] ' "$work/pty-yn-default.out.txt" || fail '[Y/n] prompt changed'
   grep -Fq 'RESULT=yes' "$work/pty-yn-default.out.txt" || fail '[Y/n] Enter is not yes'
+
+  # /dev/tty is opened for real: available inside a PTY ...
+  printf '' | timeout 20 script -qec \
+    "bash -c 'source \"$repo/debian-init.sh\"; trap - EXIT ERR HUP INT TERM; if tty_available; then echo TTY=yes; else echo TTY=no; fi'" \
+    /dev/null >"$work/pty-avail.out" || fail 'tty_available PTY probe did not finish'
+  grep -Fq 'TTY=yes' "$work/pty-avail.out" || fail 'tty_available false inside a PTY'
+  # ... and not without a controlling terminal, although /dev/tty's permission bits allow it.
+  if command -v setsid >/dev/null 2>&1; then
+    # shellcheck disable=SC2016 # Expanded by the inner bash.
+    no_ctty=$(setsid -w bash -c 'source "$1"; trap - EXIT ERR HUP INT TERM
+      if tty_available; then echo TTY=yes; else echo TTY=no; fi
+      CONFIG_CONFIRMED=false; read_tty "Q: " answer; echo READ=returned' _ "$repo/debian-init.sh" </dev/null 2>&1 || true)
+    grep -Fq 'TTY=no' <<<"$no_ctty" || fail "tty_available true without a controlling terminal: $no_ctty"
+    grep -Fq '需要交互输入，但当前没有可用 /dev/tty。' <<<"$no_ctty" || fail "read_tty did not die without a controlling terminal: $no_ctty"
+    if grep -Fq 'READ=returned' <<<"$no_ctty"; then fail 'read_tty returned without a terminal'; fi
+  fi
 fi
 
 echo 'PASS: UI color gates, NO_COLOR/TERM=dumb, Unicode/ASCII box widths, wrapping and PTY checks'

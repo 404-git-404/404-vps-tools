@@ -508,7 +508,7 @@ EOF
 read_tty() {
   local prompt=$1 var=$2 style=${3:-}
   [[ "$CONFIG_CONFIRMED" == false ]] || die "执行阶段出现未预收集的交互：$prompt"
-  [[ -r /dev/tty && -w /dev/tty ]] || die '需要交互输入，但当前没有可用 /dev/tty。'
+  { : </dev/tty && : >>/dev/tty; } 2>/dev/null || die '需要交互输入，但当前没有可用 /dev/tty。'
   if [[ -n "$C_TTY_BOLD" ]]; then
     if [[ "$prompt" == *' [Y/n] ' ]]; then
       printf '%s%s%s [%sY%s/n] ' "$C_TTY_BOLD" "${prompt%' [Y/n] '}" "$C_TTY_RESET" "${C_TTY_BOLD}${C_TTY_CYAN}" "$C_TTY_RESET" >/dev/tty
@@ -523,28 +523,28 @@ read_tty() {
   IFS= read -r "${var?}" </dev/tty || die '读取交互输入失败。'
 }
 
-# default=true: [Y/n], Enter means yes. default=false: [y/n] without a default; Enter or any
-# other answer asks again. EOF or a missing /dev/tty still dies inside read_tty.
+# Answers are compared without surrounding blanks. default=true: [Y/n], an empty answer means yes.
+# default=false: [y/n] without a default; an empty or any other answer asks again. EOF or a
+# missing /dev/tty still dies inside read_tty.
 ask_yes_no() {
   local prompt=$1 default=$2 answer=''
   while true; do
     if [[ "$default" == true ]]; then
       read_tty "$prompt [Y/n] " answer
-      answer=${answer:-Y}
-      case "${answer,,}" in
-        y|yes) return 0 ;;
-        n|no) return 1 ;;
-        *) printf '请输入 y 或 n。\n' >/dev/tty ;;
-      esac
     else
       read_tty "$prompt [y/n] " answer
-      answer=${answer#"${answer%%[![:space:]]*}"}
-      answer=${answer%"${answer##*[![:space:]]}"}
-      case "${answer,,}" in
-        y|yes) return 0 ;;
-        n|no) return 1 ;;
-        *) printf '请输入 y 确认，或 n 跳过/取消（Ctrl+C 退出）\n' >/dev/tty ;;
-      esac
+    fi
+    answer=${answer#"${answer%%[![:space:]]*}"}
+    answer=${answer%"${answer##*[![:space:]]}"}
+    if [[ "$default" == true ]]; then answer=${answer:-Y}; fi
+    case "${answer,,}" in
+      y|yes) return 0 ;;
+      n|no) return 1 ;;
+    esac
+    if [[ "$default" == true ]]; then
+      printf '请输入 y 或 n。\n' >/dev/tty
+    else
+      printf '请输入 y 确认，或 n 跳过/取消（Ctrl+C 退出）\n' >/dev/tty
     fi
   done
 }
@@ -1778,8 +1778,9 @@ detect_network_stack() {
   log "网络模式：$NETWORK_STACK（请求：$NETWORK_REQUEST）"
 }
 
+# Open /dev/tty for real: the permission bits say nothing about a controlling terminal.
 tty_available() {
-  [[ -r /dev/tty && -w /dev/tty ]]
+  { : </dev/tty && : >>/dev/tty; } 2>/dev/null
 }
 
 systemd_sysctl_path() {
@@ -5509,7 +5510,7 @@ run_system_cleanup() {
 #   为空或未设置时正常运行；其他取值直接 die。
 # 测试专用开关：只读环境变量 VPS_INIT_REINSTALL_KEYS_FILE（不写进 --help 和 README）
 #   非空时改读这个路径作为 root 的 authorized_keys（可以不存在，用来模拟没有公钥）；
-#   必须与 VPS_INIT_REINSTALL_TEST 一起使用，否则直接 die。
+#   只能与 VPS_INIT_REINSTALL_TEST=dry-run 一起使用（dry-run 不改 GRUB、不重启），否则直接 die。
 # ==============================================================================
 readonly REINSTALL_SUITE='trixie'
 readonly REINSTALL_ARCH='amd64'
@@ -5605,7 +5606,7 @@ reinstall_parse_test_mode() {
   esac
   REINSTALL_KEYS_FILE_OVERRIDE=''
   if [[ -n "${VPS_INIT_REINSTALL_KEYS_FILE:-}" ]]; then
-    [[ -n "${VPS_INIT_REINSTALL_TEST:-}" ]] || die 'VPS_INIT_REINSTALL_KEYS_FILE 只能与 VPS_INIT_REINSTALL_TEST 一起使用。'
+    [[ "${VPS_INIT_REINSTALL_TEST:-}" == dry-run ]] || die 'VPS_INIT_REINSTALL_KEYS_FILE 只能与 VPS_INIT_REINSTALL_TEST=dry-run 一起使用。'
     REINSTALL_KEYS_FILE_OVERRIDE=$VPS_INIT_REINSTALL_KEYS_FILE
     REINSTALL_AUTHORIZED_KEYS=$VPS_INIT_REINSTALL_KEYS_FILE
   fi
@@ -6015,7 +6016,7 @@ reinstall_drain_tty() {
 # empty answer exits 0 like the hostname confirmation.
 reinstall_collect_pasted_key() {
   local line='' first fps fp
-  if ! tty_available || ! { : </dev/tty; } 2>/dev/null; then
+  if ! tty_available; then
     reinstall_fail "${REINSTALL_KEYS_PASTE_REASON}，且没有交互终端可粘贴公钥"
   fi
   printf '本机 root 没有可用的 SSH 公钥（%s）。\n' "$REINSTALL_KEYS_PASTE_REASON"
