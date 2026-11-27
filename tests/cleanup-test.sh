@@ -205,17 +205,30 @@ for scenario in yes no kernel critical changed; do
   )
 done
 
-[[ "$(format_mib 511)" == '0 MiB' ]]
+[[ "$(format_mib 0)" == '0 MiB' ]]
+[[ "$(format_mib -5)" == '0 MiB' ]]
+[[ "$(format_mib 1)" == '<1 MiB' ]]
+[[ "$(format_mib 511)" == '<1 MiB' ]]
 [[ "$(format_mib 512)" == '1 MiB' ]]
-[[ "$(format_mib 1048575)" == '1024 MiB' ]]
+[[ "$(format_mib 1048063)" == '1023 MiB' ]]
+[[ "$(format_mib 1048064)" == '1.0 GiB' ]]
 [[ "$(format_mib 1048576)" == '1.0 GiB' ]]
 [[ "$(format_mib 1310720)" == '1.3 GiB' ]]
+[[ "$(format_mib 1099511627776)" == '1048576.0 GiB' ]]
 
 (
   trace="$test_dir/automatic"
   cleanup_preflight() { VERSION_ID=13; }
   preflight() { fail 'cleanup reached installer preflight'; }
-  root_free_kib() { if [[ -s "$trace" ]]; then echo "$after_cleanup"; else echo 665600; fi; }
+  root_free_kib() {
+    if [[ -s "$trace" ]]; then
+      if grep -Fq '系统清理报告' "$test_dir/report"; then fail 'reported before reading free space'; fi
+      [[ "$after_cleanup" != unreadable ]] || return 1
+      echo "$after_cleanup"
+    else
+      echo 665600
+    fi
+  }
   df() { printf 'header\n/dev/test 5138022 4000000 665600 90%% /\n'; }
   apt-get() { [[ "$1" == clean ]]; echo apt >>"$trace"; }
   journalctl() { [[ "$1" == --vacuum-size=50M ]]; echo journal >>"$trace"; return 1; }
@@ -242,19 +255,29 @@ done
   [[ "$(cat "$trace")" == $'apt\njournal\ntmpfiles' ]]
   grep -Fq '系统清理报告' "$test_dir/report"
   for line in '系统：Debian 13' '清理前可用：650 MiB' '清理后可用：1.0 GiB' \
-    '实际增加可用空间：374 MiB' '安装所需 2GiB 空间：FAIL，还需释放 1024 MiB' \
+    '实际增加可用空间：374 MiB' '安装所需 2GiB 空间：FAIL，还需释放 1\.0 GiB' \
     'APT 缓存：完成' 'Journal：失败' '临时文件：完成' '无用软件包：' '旧内核：' 'Swap：未修改'; do
     grep -Eq "^(│|\|) $line.*(│|\|)$" "$test_dir/report" || fail "missing cleanup report row: $line"
   done
   for after_cleanup in 665600 663552 2097152; do
     : >"$trace"
     run_system_cleanup >"$test_dir/report"
-    if (( after_cleanup < MIN_ROOT_FREE_KIB )); then
-      grep -Fq '实际增加可用空间：约 0（清理期间有其他写入）' "$test_dir/report"
-    else
-      grep -Fq '安装所需 2GiB 空间：PASS' "$test_dir/report"
-    fi
+    case "$after_cleanup" in
+      665600) grep -Eq '^(│|\|) 实际增加可用空间：0 MiB +(│|\|)$' "$test_dir/report" ;;
+      663552) grep -Fq '实际增加可用空间：约 0（清理期间有其他写入）' "$test_dir/report" ;;
+      2097152) grep -Fq '安装所需 2GiB 空间：PASS' "$test_dir/report" ;;
+    esac
   done
+  : >"$trace"
+  after_cleanup=unreadable
+  run_system_cleanup >"$test_dir/report" 2>&1
+  grep -Eq '^(│|\|) 清理后可用：读取失败 +(│|\|)$' "$test_dir/report"
+  if grep -Eq '实际增加可用空间|安装所需 2GiB 空间' "$test_dir/report"; then
+    fail 'unavailable disk figures appeared in report'
+  fi
+  awk '/^(╰|\+)/ { bottom=NR }
+       /\[WARN\] 无法读取清理后的根分区空间。/ { warning=NR }
+       END { exit !(bottom && warning > bottom) }' "$test_dir/report" || fail 'missing warning after cleanup frame'
 )
 
 (

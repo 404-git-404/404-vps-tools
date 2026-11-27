@@ -915,7 +915,10 @@ root_free_kib() {
 
 format_mib() {
   LC_ALL=C awk -v kib="$1" 'BEGIN {
-    if (kib < 1048576) printf "%.0f MiB\n", int(kib/1024 + 0.5)
+    mib=int(kib/1024 + 0.5)
+    if (kib <= 0) print "0 MiB"
+    else if (kib < 512) print "<1 MiB"
+    else if (mib < 1024) printf "%.0f MiB\n", mib
     else printf "%.1f GiB\n", int(kib*10/1048576 + 0.5)/10
   }'
 }
@@ -5501,10 +5504,12 @@ run_safe_cleanup() {
 run_system_cleanup() {
   CURRENT_STEP='系统清理'
   local before after total used orphans kernels gained swaps=''
+  local before_display after_display='' space_status enough_space=false
   local CLEANUP_RESULT
   before=$(root_free_kib) || die '无法读取清理前的根分区空间。'
   IFS=' ' read -r total used < <(df -Pk / | awk 'NR == 2 { print $2, $3 }') || die '无法读取根分区容量。'
-  printf '磁盘总容量：%s\n已用空间：%s\n可用空间：%s\n' "$(format_mib "$total")" "$(format_mib "$used")" "$(format_mib "$before")"
+  before_display=$(format_mib "$before")
+  printf '磁盘总容量：%s\n已用空间：%s\n可用空间：%s\n' "$(format_mib "$total")" "$(format_mib "$used")" "$before_display"
   if command -v swapon >/dev/null && swaps=$(swapon --show=NAME,SIZE --bytes); then
     printf '活动 Swap（容量以字节显示）\n%s\n' "${swaps:-无}"
   else
@@ -5518,26 +5523,38 @@ run_system_cleanup() {
   else
     orphans='跳过（无交互终端）'; kernels=$orphans
   fi
+  if after=$(root_free_kib); then
+    after_display=$(format_mib "$after")
+    if (( after > before )); then
+      gained=$(format_mib "$((after - before))")
+    elif (( after == before )); then
+      gained='0 MiB'
+    else
+      gained='约 0（清理期间有其他写入）'
+    fi
+    if (( after >= MIN_ROOT_FREE_KIB )); then
+      enough_space=true
+      space_status='PASS'
+    else
+      space_status="FAIL，还需释放 $(format_mib "$((MIN_ROOT_FREE_KIB - after))")"
+    fi
+  fi
+
   printf '\n'
   ui_use_target out
   ui_box_top '系统清理报告'
   ui_box_line "系统：Debian $VERSION_ID"
-  ui_box_line "清理前可用：$(format_mib "$before")"
-  if after=$(root_free_kib); then
-    ui_box_line "清理后可用：$(format_mib "$after")"
-    if (( after > before )); then
-      gained=$(format_mib "$((after - before))")
-    else
-      gained='约 0（清理期间有其他写入）'
-    fi
+  ui_box_line "清理前可用：$before_display"
+  if [[ -n "$after_display" ]]; then
+    ui_box_line "清理后可用：$after_display"
     ui_box_line "实际增加可用空间：$gained"
-    if (( after >= MIN_ROOT_FREE_KIB )); then
-      ui_box_line_color "$C_GREEN" '安装所需 2GiB 空间：PASS'
+    if [[ "$enough_space" == true ]]; then
+      ui_box_line_color "$C_GREEN" "安装所需 2GiB 空间：$space_status"
     else
-      ui_box_line_color "$C_RED" "安装所需 2GiB 空间：FAIL，还需释放 $(format_mib "$((MIN_ROOT_FREE_KIB - after))")"
+      ui_box_line_color "$C_RED" "安装所需 2GiB 空间：$space_status"
     fi
   else
-    warn '无法读取清理后的根分区空间。'
+    ui_box_line_color "$C_YELLOW" '清理后可用：读取失败'
   fi
   ui_box_line "APT 缓存：$SAFE_CLEANUP_APT"
   ui_box_line "Journal：$SAFE_CLEANUP_JOURNAL"
@@ -5546,6 +5563,7 @@ run_system_cleanup() {
   ui_box_line "旧内核：$kernels"
   ui_box_line 'Swap：未修改'
   ui_box_bottom
+  if [[ -z "$after_display" ]]; then warn '无法读取清理后的根分区空间。'; fi
 }
 
 # ==============================================================================
