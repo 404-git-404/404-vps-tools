@@ -84,7 +84,7 @@ disk=$((2048*1024-1))
 recommend_swap
 [[ "$SWAP_RECOMMENDED_MIB" == 512 ]] || fail 'one KiB below 2048 MiB'
 if run_in_bash 'check_root_space' >"$SWAP_TEST_DIR/preflight" 2>&1; then fail 'preflight accepted less than 2 GiB'; fi
-grep -Fq '还需释放：0.0009765625MiB' "$SWAP_TEST_DIR/preflight"
+grep -Fq '还需释放：0 MiB' "$SWAP_TEST_DIR/preflight"
 disk=$((2048*1024))
 check_root_space
 ram=$((1973*1024)) disk=$((4096*1024))

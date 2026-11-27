@@ -465,6 +465,70 @@ collect_security_audit
 # --audit dispatch has no writes, even to lock/backup/DNS; compare content + metadata
 # across the entire fixture, including hidden files and symlinks. Audit emits to stdout.
 snapshot() { find "$root" -printf '%P %y %m %U %G %s %T@ %l\n'; find "$root" -type f -exec sha256sum {} +; }
+(
+  eval "fixture_$(declare -f dpkg-query)"
+  eval "fixture_$(declare -f apt-cache)"
+  dpkg-query() {
+    if [[ "$1" == -W && "$2" == '-f=${binary:Package}\t${db:Status-Status}\n' ]]; then
+      printf 'sing-box\tinstalled\nexternal\tinstalled\n'
+    else
+      fixture_dpkg-query "$@"
+    fi
+  }
+  apt-cache() {
+    if [[ "$*" == *'sing-box' ]]; then
+      printf '  Version table:\n     2.0 500\n        500 https://deb.sagernet.org/ * Packages\n *** 1.0 100\n        100 /var/lib/dpkg/status\n'
+      if [[ -n "$installed_origin" ]]; then printf '        500 %s * Packages\n' "$installed_origin"; fi
+    else
+      fixture_apt-cache "$@"
+    fi
+  }
+  curl() { fail 'audit attempted a download'; }
+  gpg() { fail 'audit invoked gpg'; }
+  mktemp() { fail 'audit created a temporary file'; }
+  source_path="$root/etc/apt/sources.list.d/sagernet.sources"
+  key_path="$root/etc/apt/keyrings/sagernet.gpg"
+  mkdir -p "${source_path%/*}" "${key_path%/*}"
+  sagernet_repo_source >"$source_path"
+  printf 'key fixture\n' >"$key_path"
+  generic='本地缓存不能证明已安装版本来自 Debian 官方源'
+  foreign='sing-box 来自 deb.sagernet.org，但源配置或密钥文件不是本工具写入的版本，请核实'
+  package_finding() { has_finding $'^B\tpackage\t'"$1"$'\t'"$2"; }
+
+  snapshot >"$work/sager-before"
+  for installed_origin in 'https://deb.sagernet.org' 'https://deb.sagernet.org/'; do
+    collect_security_audit
+    if package_finding sing-box ''; then fail 'managed sing-box was reported'; fi
+    package_finding external "$generic" || fail 'other third-party package was omitted'
+  done
+  snapshot >"$work/sager-after"
+  cmp "$work/sager-before" "$work/sager-after"
+
+  for installed_origin in '' 'https://deb.sagernet.org.example.invalid' 'https://deb.sagernet.org/other'; do
+    collect_security_audit
+    package_finding sing-box "$generic" || fail 'unverified installed origin did not get the ordinary warning'
+  done
+
+  installed_origin='https://deb.sagernet.org/'
+  printf '\n' >>"$source_path"
+  collect_security_audit
+  package_finding sing-box "$foreign" || fail 'source with extra trailing newline was accepted'
+  sagernet_repo_source >"$source_path"
+  mv "$source_path" "$source_path.real"
+  ln -s "$source_path.real" "$source_path"
+  collect_security_audit
+  package_finding sing-box "$foreign" || fail 'symlinked sources file was accepted'
+  rm "$source_path"
+  mv "$source_path.real" "$source_path"
+  : >"$key_path"
+  collect_security_audit
+  package_finding sing-box "$foreign" || fail 'empty key was accepted'
+  printf 'key fixture\n' >"$key_path"
+  mv "$key_path" "$key_path.real"
+  ln -s "$key_path.real" "$key_path"
+  collect_security_audit
+  package_finding sing-box "$foreign" || fail 'symlinked key was accepted'
+)
 snapshot >"$work/before"
 (
   preflight() { fail 'audit preflight wrote state'; }

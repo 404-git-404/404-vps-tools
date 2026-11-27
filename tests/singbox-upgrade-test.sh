@@ -247,6 +247,7 @@ gate_is_new
 [[ "$(cat "$c/enabled")" == yes && "$(cat "$c/active")" == no ]]
 out_has '未安装 → 1.13.0'
 out_has '未检查（首次安装）'
+grep -Eq '^(╭|\+).*sing-box 安装/升级报告' "$c/output" || fail 'sing-box report has no frame'
 policy_clean
 
 # 2. Configured and running, check passes: restart only after the restart block is gone.
@@ -306,6 +307,8 @@ expect_fail
 out_has '服务已中断，当前未运行'
 out_has '服务中断，回退后仍未能启动'
 out_has '已降级：是（1.13.0 → 1.12.0）'
+awk '/^(╰|\+)/ { bottom=NR } /!!! sing-box 服务已中断，当前未运行 !!!/ { alert=NR } END { exit !(bottom && alert > bottom) }' "$c/output" ||
+  fail 'sing-box alert did not follow the report frame'
 [[ "$(cat "$c/version")" == 1.12.0 && "$(cat "$c/active")" == no ]]
 policy_clean
 
