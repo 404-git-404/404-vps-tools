@@ -74,18 +74,18 @@ fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
 errexit_probe() { echo 'errexit probe'; false; echo 'unexpected continuation'; }
 expect_bash_failure 'errexit probe' errexit_probe
 
-# Actual menu, including invalid reserved 9 and exit 0.
-for mapping in 1:quick 2:custom 3:smartdns 4:singbox 5:fail2ban 6:update 7:cleanup 8:hardening; do
+# Actual menu, including an invalid choice and exit 0.
+for mapping in 1:quick 2:custom 3:smartdns 4:singbox 5:fail2ban 6:update 7:cleanup 8:hardening 9:reinstall; do
   INSTALL_MODE=''
   read_tty() { printf -v "$2" '%s' "${mapping%%:*}"; }
   select_install_mode
   [[ "$INSTALL_MODE" == "${mapping#*:}" ]] || fail "menu $mapping"
 done
 grep -Fq '0. 退出' "$work/tty"
-if grep -q '^9\.' "$work/tty"; then fail 'menu occupied reserved 9'; fi
+grep -Fq '9. 重装为官方 Debian 13（会清空整机）' "$work/tty" || fail 'menu lacks option 9'
 (
   INSTALL_MODE='' replies=0
-  read_tty() { replies=$((replies + 1)); if (( replies == 1 )); then printf -v "$2" 9; else printf -v "$2" 3; fi; }
+  read_tty() { replies=$((replies + 1)); if (( replies == 1 )); then printf -v "$2" 10; else printf -v "$2" 3; fi; }
   select_install_mode
   [[ "$INSTALL_MODE" == smartdns && "$replies" == 2 ]]
 )

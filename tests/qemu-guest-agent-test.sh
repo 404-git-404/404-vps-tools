@@ -71,7 +71,7 @@ for scenario in installed not-installed config-files repeat cancel extra simulat
     }
     read_tty() {
       case "$1" in
-        '请选择 [0-8]: ') printf -v "$2" 8 ;;
+        '请选择 [0-9]: ') printf -v "$2" 8 ;;
         '确认卸载 QEMU Guest Agent？ [y/N] ')
           echo confirm >>"$trace"
           if [[ "$scenario" == cancel ]]; then printf -v "$2" ''; else printf -v "$2" y; fi ;;
