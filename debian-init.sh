@@ -5924,13 +5924,41 @@ reinstall_key_options_restricted() {
   return 1
 }
 
-# 10. root 的 authorized_keys：有效行原样保留（含 options）。没有可读文件、没有有效公钥或全部带
-# command=/restrict 时不再失败，只记录原因，由 reinstall_collect_pasted_key 在全部只读检查后当场粘贴。
+# Print the key type of an authorized_keys line: the first field after the options field.
+reinstall_key_type() {
+  local line=$1 opts rest
+  line=${line#"${line%%[![:space:]]*}"}
+  opts=$(reinstall_key_options "$line")
+  rest=${line:${#opts}}
+  rest=${rest#"${rest%%[![:space:]]*}"}
+  printf '%s' "${rest%%[[:space:]]*}"
+}
+
+# Key types the new Debian 13 sshd accepts for login (ssh-dss is gone).
+reinstall_key_type_allowed() {
+  case "$1" in
+    ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp256|ecdsa-sha2-nistp384|ecdsa-sha2-nistp521|sk-ssh-ed25519@openssh.com|sk-ecdsa-sha2-nistp256@openssh.com) return 0 ;;
+  esac
+  return 1
+}
+
+# A line can log in to the new system: no command=/restrict option and an allowed key type.
+reinstall_key_loginable() {
+  local line=$1 opts
+  opts=$(reinstall_key_options "$line")
+  if [[ -n "$opts" ]] && reinstall_key_options_restricted "$opts"; then return 1; fi
+  reinstall_key_type_allowed "$(reinstall_key_type "$line")"
+}
+
+# 10. root 的 authorized_keys：有效行原样保留（含 options），可登录行在前、其余行在后（各自保持原顺序），
+# 因为 sshd 按文件顺序使用第一条匹配的行。没有可读文件、没有有效公钥或没有可登录行时不再失败，只记录
+# 原因，由 reinstall_collect_pasted_key 在全部只读检查后当场粘贴。
 reinstall_check_keys() {
-  local line fp opts usable=0
+  local line='' fp has_opts usable=0
+  local -a other_keys=() other_fps=() other_opts=()
   REINSTALL_KEYS=() REINSTALL_KEY_FPS=() REINSTALL_KEY_HAS_OPTS=() REINSTALL_KEYS_DISCARDED=0
   REINSTALL_KEYS_NEED_PASTE=false REINSTALL_KEYS_PASTE_REASON='' REINSTALL_KEY_PASTED_INDEX=-1
-  if [[ ! -r "$REINSTALL_AUTHORIZED_KEYS" ]]; then
+  if [[ ! -r "$REINSTALL_AUTHORIZED_KEYS" || -d "$REINSTALL_AUTHORIZED_KEYS" ]]; then
     REINSTALL_KEYS_NEED_PASTE=true
     REINSTALL_KEYS_PASTE_REASON="不存在可读的 $REINSTALL_AUTHORIZED_KEYS"
     return 0
@@ -5942,46 +5970,51 @@ reinstall_check_keys() {
       continue
     fi
     if fp=$(printf '%s\n' "$line" | ssh-keygen -l -f - 2>/dev/null) && [[ -n "$fp" ]]; then
-      opts=$(reinstall_key_options "$line")
-      REINSTALL_KEYS+=("$line")
-      REINSTALL_KEY_FPS+=("$fp")
-      if [[ -n "$opts" ]]; then REINSTALL_KEY_HAS_OPTS+=(true); else REINSTALL_KEY_HAS_OPTS+=(false); fi
-      if [[ -z "$opts" ]] || ! reinstall_key_options_restricted "$opts"; then usable=$((usable + 1)); fi
+      if [[ -n "$(reinstall_key_options "$line")" ]]; then has_opts=true; else has_opts=false; fi
+      if reinstall_key_loginable "$line"; then
+        REINSTALL_KEYS+=("$line") REINSTALL_KEY_FPS+=("$fp") REINSTALL_KEY_HAS_OPTS+=("$has_opts")
+        usable=$((usable + 1))
+      else
+        other_keys+=("$line") other_fps+=("$fp") other_opts+=("$has_opts")
+      fi
     else
       REINSTALL_KEYS_DISCARDED=$((REINSTALL_KEYS_DISCARDED + 1))
     fi
   done <"$REINSTALL_AUTHORIZED_KEYS"
+  REINSTALL_KEYS+=("${other_keys[@]}") REINSTALL_KEY_FPS+=("${other_fps[@]}") REINSTALL_KEY_HAS_OPTS+=("${other_opts[@]}")
   log "公钥检查：有效 ${#REINSTALL_KEYS[@]} 把（可交互登录 $usable 把），丢弃空行/注释/无效行 $REINSTALL_KEYS_DISCARDED 行"
   if (( ${#REINSTALL_KEYS[@]} == 0 )); then
     REINSTALL_KEYS_NEED_PASTE=true
     REINSTALL_KEYS_PASTE_REASON="$REINSTALL_AUTHORIZED_KEYS 中没有有效的 SSH 公钥"
   elif (( usable == 0 )); then
     REINSTALL_KEYS_NEED_PASTE=true
-    REINSTALL_KEYS_PASTE_REASON='已有公钥全部带 command=/restrict 限制，不能用于登录'
+    REINSTALL_KEYS_PASTE_REASON='已有公钥都不能用于新系统登录（带 command=/restrict 限制，或是 Debian 13 不再支持的 ssh-dss）'
   fi
 }
 
-# Discard whatever is still buffered on /dev/tty after a pasted line, so the rest of an
-# accidental multi-line paste (a private key, say) never answers a later question. Each read
-# waits at most 0.3 s and at most 256 lines are dropped. Succeeds when anything was discarded.
+# Discard whatever is still buffered on /dev/tty after the pasted line, so the rest of an
+# accidental multi-line paste (a private key, say) never answers a later question. read -N
+# switches the terminal to non-canonical mode for that read and bash restores it afterwards, so
+# a last line without a newline is read too. At most 64 reads of up to 4096 bytes, each waiting
+# at most 0.2 s; more than 256 KiB counts as multi-line straight away. Succeeds only when the
+# discarded input holds more than blanks: extra Enter presses and CRLF line ends just vanish.
 reinstall_drain_tty() {
-  local junk='' dropped=1 i
-  for (( i = 0; i < 256; i++ )); do
-    junk=''
-    if IFS= read -r -t 0.3 junk </dev/tty; then
-      dropped=0
-    else
-      if [[ -n "$junk" ]]; then dropped=0; fi
-      break
-    fi
+  local LC_ALL=C chunk buf='' i
+  for (( i = 0; i < 64; i++ )); do
+    chunk=''
+    IFS= read -r -t 0.2 -N 4096 chunk </dev/tty || true
+    buf+=$chunk
+    if (( ${#buf} > 262144 )); then return 0; fi
+    [[ -n "$chunk" ]] || break
   done
-  return "$dropped"
+  buf=${buf//[$' \t\r\n']/}
+  [[ -n "$buf" ]]
 }
 
 # No usable key on this machine: ask for one pasted line. Nothing is written anywhere here; an
 # empty answer exits 0 like the hostname confirmation.
 reinstall_collect_pasted_key() {
-  local line='' trimmed opts fps fp
+  local line='' first fps fp
   if ! tty_available || ! { : </dev/tty; } 2>/dev/null; then
     reinstall_fail "${REINSTALL_KEYS_PASTE_REASON}，且没有交互终端可粘贴公钥"
   fi
@@ -5991,41 +6024,53 @@ reinstall_collect_pasted_key() {
   while true; do
     line=''
     read_tty '粘贴 SSH 公钥（直接回车放弃）: ' line
-    trimmed=${line#"${line%%[![:space:]]*}"}
+    line=${line%$'\r'}
+    line=${line#"${line%%[![:space:]]*}"}
+    line=${line%"${line##*[![:space:]]}"}
     if reinstall_drain_tty; then
-      if [[ "$trimmed" == -----BEGIN* ]]; then
+      if [[ "$line" == -----BEGIN* ]]; then
         warn '这是私钥，不是公钥！请粘贴 .pub 文件的内容；这把私钥已经显示在屏幕上，建议更换'
       fi
       warn '检测到多行内容，请只粘贴一行公钥'
       continue
     fi
-    line=${line%$'\r'}
-    if [[ -z "${line//[[:space:]]/}" ]]; then
+    if [[ -z "$line" ]]; then
       log '已放弃，未做任何修改'
       exit 0
     fi
-    if [[ "$trimmed" == -----BEGIN* ]]; then
+    if [[ "$line" == -----BEGIN* ]]; then
       warn '这是私钥，不是公钥！请粘贴 .pub 文件的内容；这把私钥已经显示在屏幕上，建议更换'
       continue
     fi
+    # Only a bare public key line: its first field must be an allowed key type, no options.
+    first=${line%%[[:space:]]*}
+    if [[ "$first" == ssh-dss ]]; then
+      warn 'ssh-dss（DSA）公钥在 Debian 13 上已不能使用，请换一把 ed25519 或 RSA 公钥'
+      continue
+    fi
     fps=$(ssh_public_key_fingerprints <<<"$line" 2>/dev/null || true)
+    if ! reinstall_key_type_allowed "$first"; then
+      if [[ -n "$fps" && -n "$(reinstall_key_options "$line")" ]]; then
+        warn '请只粘贴 .pub 文件里的公钥，不要带 from=、command= 等选项'
+      else
+        warn '公钥无效，请重新粘贴（直接回车放弃）'
+      fi
+      continue
+    fi
     fp=$(printf '%s\n' "$line" | ssh-keygen -l -f - 2>/dev/null || true)
     if [[ -z "$fps" || "$fps" == *$'\n'* || -z "$fp" || "$fp" == *$'\n'* ]]; then
       warn '公钥无效，请重新粘贴（直接回车放弃）'
       continue
     fi
-    opts=$(reinstall_key_options "$line")
-    if [[ -n "$opts" ]] && reinstall_key_options_restricted "$opts"; then
-      warn '这把公钥带 command=/restrict 限制，不能用于登录，请换一把'
-      continue
-    fi
     printf '%s\n' "$fp"
     printf '请在你的电脑上运行 ssh-keygen -lf ~/.ssh/id_ed25519.pub（换成你的公钥文件），确认指纹一致\n'
     if ask_yes_no '是否使用这把公钥？' false; then
-      REINSTALL_KEYS+=("$line")
-      REINSTALL_KEY_FPS+=("$fp")
-      if [[ -n "$opts" ]]; then REINSTALL_KEY_HAS_OPTS+=(true); else REINSTALL_KEY_HAS_OPTS+=(false); fi
-      REINSTALL_KEY_PASTED_INDEX=$(( ${#REINSTALL_KEYS[@]} - 1 ))
+      # First line of the new authorized_keys: sshd uses the first matching line, so a restricted
+      # copy of the same key further down can no longer win.
+      REINSTALL_KEYS=("$line" "${REINSTALL_KEYS[@]}")
+      REINSTALL_KEY_FPS=("$fp" "${REINSTALL_KEY_FPS[@]}")
+      REINSTALL_KEY_HAS_OPTS=(false "${REINSTALL_KEY_HAS_OPTS[@]}")
+      REINSTALL_KEY_PASTED_INDEX=0
       return 0
     fi
   done
@@ -6217,6 +6262,7 @@ reinstall_print_summary() {
   ui_box_line "SSH 端口 22；公钥 ${#REINSTALL_KEYS[@]} 把（丢弃 $REINSTALL_KEYS_DISCARDED 行）"
   for i in "${!REINSTALL_KEY_FPS[@]}"; do
     fp=${REINSTALL_KEY_FPS[i]}
+    if [[ "$(reinstall_key_type "${REINSTALL_KEYS[i]}")" == ssh-dss ]]; then fp+='（ssh-dss，新系统不支持）'; fi
     if [[ "${REINSTALL_KEY_HAS_OPTS[i]:-false}" == true ]]; then fp+='（带限制选项）'; fi
     if (( i == REINSTALL_KEY_PASTED_INDEX )); then fp+='（当场粘贴）'; fi
     ui_box_line "  $fp"
