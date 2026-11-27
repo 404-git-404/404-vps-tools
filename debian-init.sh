@@ -9,7 +9,7 @@ export DEBIAN_FRONTEND=noninteractive
 export APT_LISTCHANGES_FRONTEND=none
 export LC_ALL=C
 
-readonly SCRIPT_VERSION='0.2.0'
+readonly SCRIPT_VERSION='0.2.1'
 readonly DEFAULT_SSH_PORT='53651'
 readonly APT_WAIT_MAX="${VPS_INIT_APT_WAIT:-1800}"
 readonly LOCK_FILE='/run/lock/vps-init.lock'
