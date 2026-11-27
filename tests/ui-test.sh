@@ -298,6 +298,62 @@ PROBE
     "bash \"$repo/debian-init.sh\" --help" /dev/null >"$work/pty-help.out"
   if has_escape "$work/pty-help.out"; then fail '--help emitted ANSI escapes'; fi
   if grep -Eq '[╭╮╰╯│─├┤]' "$work/pty-help.out"; then fail '--help drew box borders'; fi
+
+  # ask_yes_no in a real PTY. default=false: the whole "<question> [y/n] " is bold yellow; Enter
+  # and other words ask again with the hint; with NO_COLOR or TERM=dumb nothing is escaped.
+  yes_no_probe() {
+    local input=$1 default=$2 out=$3
+    shift 3
+    printf '%b' "$input" | timeout 20 env "$@" script -qec \
+      "bash -c 'source \"$repo/debian-init.sh\"; trap - EXIT ERR HUP INT TERM; if ask_yes_no 确认删除 $default; then echo RESULT=yes; else echo RESULT=no; fi'" \
+      /dev/null >"$out" || fail "ask_yes_no PTY probe did not finish: $input"
+    tr -d '\r' <"$out" >"$out.txt"
+  }
+  hint='请输入 y 确认，或 n 跳过/取消（Ctrl+C 退出）'
+  yes_no_probe '\nmaybe\nn\n' false "$work/pty-yn-no.out" -u NO_COLOR TERM=xterm-256color
+  grep -Fq $'\033[1m\033[33m确认删除 [y/n] \033[0m' "$work/pty-yn-no.out.txt" || fail '[y/n] prompt is not entirely bold yellow'
+  [[ "$(grep -Fo "$hint" "$work/pty-yn-no.out.txt" | wc -l)" == 2 ]] || fail 'Enter and an unknown word must both re-ask'
+  grep -Fq 'RESULT=no' "$work/pty-yn-no.out.txt" || fail 'n after re-asks is not no'
+  if grep -Fq '[y/N]' "$work/pty-yn-no.out.txt"; then fail 'old [y/N] prompt shown'; fi
+  yes_no_probe '\n Yes \n' false "$work/pty-yn-yes.out" -u NO_COLOR TERM=xterm-256color
+  grep -Fq 'RESULT=yes' "$work/pty-yn-yes.out.txt" || fail 'Enter then Yes is not yes'
+  for env_case in NO_COLOR=1 'TERM=dumb'; do
+    if [[ "$env_case" == NO_COLOR=1 ]]; then
+      yes_no_probe '\nn\n' false "$work/pty-yn-plain.out" NO_COLOR=1 TERM=xterm-256color
+    else
+      yes_no_probe '\nn\n' false "$work/pty-yn-plain.out" -u NO_COLOR TERM=dumb
+    fi
+    if has_escape "$work/pty-yn-plain.out"; then fail "[y/n] prompt escaped with $env_case"; fi
+    grep -Fq '确认删除 [y/n] ' "$work/pty-yn-plain.out.txt" || fail "plain [y/n] prompt missing with $env_case"
+    grep -Fq "$hint" "$work/pty-yn-plain.out.txt" || fail "plain re-ask hint missing with $env_case"
+    grep -Fq 'RESULT=no' "$work/pty-yn-plain.out.txt" || fail "plain n is not no with $env_case"
+  done
+  # read_tty's warn style (the [9] hostname confirmation) is bold yellow as a whole line.
+  printf 'vps-test\n' | timeout 20 env -u NO_COLOR TERM=xterm-256color script -qec \
+    "bash -c 'source \"$repo/debian-init.sh\"; trap - EXIT ERR HUP INT TERM; read_tty 请输入本机主机名： answer warn; echo ANSWER=\$answer'" \
+    /dev/null >"$work/pty-warn.out" || fail 'warn prompt probe did not finish'
+  tr -d '\r' <"$work/pty-warn.out" | grep -Fq $'\033[1m\033[33m请输入本机主机名：\033[0m' || fail 'warn prompt is not bold yellow'
+  tr -d '\r' <"$work/pty-warn.out" | grep -Fq 'ANSWER=vps-test' || fail 'warn prompt answer'
+  # default=true keeps [Y/n] (cyan Y) and Enter still means yes.
+  yes_no_probe '\n' true "$work/pty-yn-default.out" -u NO_COLOR TERM=xterm-256color
+  grep -Fq $'[\033[1m\033[36mY\033[0m/n] ' "$work/pty-yn-default.out.txt" || fail '[Y/n] prompt changed'
+  grep -Fq 'RESULT=yes' "$work/pty-yn-default.out.txt" || fail '[Y/n] Enter is not yes'
+
+  # /dev/tty is opened for real: available inside a PTY ...
+  printf '' | timeout 20 script -qec \
+    "bash -c 'source \"$repo/debian-init.sh\"; trap - EXIT ERR HUP INT TERM; if tty_available; then echo TTY=yes; else echo TTY=no; fi'" \
+    /dev/null >"$work/pty-avail.out" || fail 'tty_available PTY probe did not finish'
+  grep -Fq 'TTY=yes' "$work/pty-avail.out" || fail 'tty_available false inside a PTY'
+  # ... and not without a controlling terminal, although /dev/tty's permission bits allow it.
+  if command -v setsid >/dev/null 2>&1; then
+    # shellcheck disable=SC2016 # Expanded by the inner bash.
+    no_ctty=$(setsid -w bash -c 'source "$1"; trap - EXIT ERR HUP INT TERM
+      if tty_available; then echo TTY=yes; else echo TTY=no; fi
+      CONFIG_CONFIRMED=false; read_tty "Q: " answer; echo READ=returned' _ "$repo/debian-init.sh" </dev/null 2>&1 || true)
+    grep -Fq 'TTY=no' <<<"$no_ctty" || fail "tty_available true without a controlling terminal: $no_ctty"
+    grep -Fq '需要交互输入，但当前没有可用 /dev/tty。' <<<"$no_ctty" || fail "read_tty did not die without a controlling terminal: $no_ctty"
+    if grep -Fq 'READ=returned' <<<"$no_ctty"; then fail 'read_tty returned without a terminal'; fi
+  fi
 fi
 
 echo 'PASS: UI color gates, NO_COLOR/TERM=dumb, Unicode/ASCII box widths, wrapping and PTY checks'

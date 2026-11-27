@@ -72,9 +72,12 @@ for scenario in installed not-installed config-files repeat cancel extra simulat
     read_tty() {
       case "$1" in
         '请选择 [0-9]: ') printf -v "$2" 8 ;;
-        '确认卸载 QEMU Guest Agent？ [y/N] ')
+        '确认卸载 QEMU Guest Agent？ [y/n] ')
           echo confirm >>"$trace"
-          if [[ "$scenario" == cancel ]]; then printf -v "$2" ''; else printf -v "$2" y; fi ;;
+          # Cancelling: Enter has no default and asks again; then n.
+          if [[ "$scenario" != cancel ]]; then printf -v "$2" y
+          elif [[ "$(grep -Fxc confirm "$trace")" == 1 ]]; then printf -v "$2" ''
+          else printf -v "$2" n; fi ;;
         *) fail "unexpected prompt: $1" ;;
       esac
     }
@@ -104,7 +107,9 @@ for scenario in installed not-installed config-files repeat cancel extra simulat
     run_security_hardening() { INSTALL_MODE=qemu-agent-remove; remove_qemu_guest_agent; }
     IFS=' '
     main
-    grep -Fq '8. 安全加固' "$work/tty"
+    # The re-ask hint replaced the menu in the terminal file when cancelling.
+    if [[ "$scenario" == cancel ]]; then grep -Fxq '请输入 y 确认，或 n 跳过/取消（Ctrl+C 退出）' "$work/tty"
+    else grep -Fq '8. 安全加固' "$work/tty"; fi
     if [[ "$scenario" == repeat ]]; then remove_qemu_guest_agent; fi
   ) >"$output" 2>&1
   result=$?
@@ -114,7 +119,7 @@ for scenario in installed not-installed config-files repeat cancel extra simulat
   case "$scenario" in
     installed|repeat) expected+=$'\nsimulate\npreview\nconfirm\nremove'; grep -Fq 'qemu-guest-agent 已卸载。' "$output" ;;
     not-installed|config-files) grep -Fq 'qemu-guest-agent 未安装，无需卸载。' "$output" ;;
-    cancel) expected+=$'\nsimulate\npreview\nconfirm'; grep -Fq '已取消卸载' "$output" ;;
+    cancel) expected+=$'\nsimulate\npreview\nconfirm\nconfirm'; grep -Fq '已取消卸载' "$output" ;;
     extra) expected+=$'\nsimulate\npreview'; grep -Fq '已阻止执行' "$output" ;;
     simulation-failure) expected+=$'\nsimulate'; grep -Fq 'APT 模拟卸载 qemu-guest-agent 失败' "$output" ;;
     removal-failure) expected+=$'\nsimulate\npreview\nconfirm\nremove'; grep -Fq '卸载 qemu-guest-agent 失败' "$output" ;;
