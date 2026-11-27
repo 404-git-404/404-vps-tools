@@ -490,10 +490,12 @@ jobs:
           export -f df journalctl systemd-tmpfiles
           for run in 1 2; do
             bash /repo/debian-init.sh --cleanup-only | tee "/run/cleanup-$run.log"
-            grep -Fx '清理前可用：650MiB' "/run/cleanup-$run.log"
-            grep -Fx 'APT 缓存：完成' "/run/cleanup-$run.log"
-            grep -Fx 'Journal：完成（归档日志，目标 50MiB）' "/run/cleanup-$run.log"
-            grep -Fx '临时文件：完成' "/run/cleanup-$run.log"
+            grep -E '^(│|\|) 清理前可用：650 MiB +(│|\|)$' "/run/cleanup-$run.log"
+            grep -E '^(│|\|) 实际增加可用空间：约 0（清理期间有其他写入） +(│|\|)$' "/run/cleanup-$run.log"
+            grep -E '^(│|\|) 安装所需 2GiB 空间：FAIL，还需释放 1\.4 GiB +(│|\|)$' "/run/cleanup-$run.log"
+            grep -E '^(│|\|) APT 缓存：完成 +(│|\|)$' "/run/cleanup-$run.log"
+            grep -E '^(│|\|) Journal：完成（归档日志，目标 50MiB） +(│|\|)$' "/run/cleanup-$run.log"
+            grep -E '^(│|\|) 临时文件：完成 +(│|\|)$' "/run/cleanup-$run.log"
             test ! -e /var/cache/apt/archives/cleanup-fixture.deb
             sha256sum --check /root/cleanup-checksums
           done
