@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# shellcheck disable=SC2030,SC2031,SC2317,SC2329,SC2034,SC2016,SC1003 # Subshell isolation, mocks and literal fixtures are intentional.
+# shellcheck disable=SC2030,SC2031,SC2317,SC2329,SC2034,SC2016,SC1003,SC1091 # Subshell isolation, mocks and literal fixtures are intentional.
 set -Eeuo pipefail
 
 # Offline tests for menu option 9 (reinstall to official Debian 13). Nothing here touches the
@@ -15,12 +15,6 @@ fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
 declare -A FAKE_ADDR4=() FAKE_ADDR6=()
 FAKE_V4_ROUTE='' FAKE_V6_ROUTE='' FAKE_V6_GET=''
 FAKE_GRUBENV="$work/grubenv"
-
-load() {
-  # shellcheck disable=SC1091
-  source "$repo/debian-init.sh"
-  trap - EXIT ERR HUP INT TERM
-}
 
 install_fakes() {
   reinstall_ip() {
@@ -58,7 +52,7 @@ use_paths() {
 
 # Fixed host state using documentation addresses only (RFC 5737 / RFC 3849).
 use_host() {
-  REINSTALL_HOST='vps-test' REINSTALL_DISK='vda' REINSTALL_DISK_SECTORS=83886080 REINSTALL_DISK_SIZE='40G'
+  REINSTALL_HOST='vps-test' REINSTALL_NEW_HOST='vps-test' REINSTALL_HOST_VALID=true REINSTALL_DISK='vda' REINSTALL_DISK_SECTORS=83886080 REINSTALL_DISK_SIZE='40G'
   REINSTALL_GRUB_FS='ext2'
   REINSTALL_V4_MODE='static' REINSTALL_V4_IFACE='eth0' REINSTALL_V4_ADDR='203.0.113.10' REINSTALL_V4_PREFIX='32'
   REINSTALL_V4_NETMASK='255.255.255.255' REINSTALL_V4_GW='198.51.100.1' REINSTALL_V4_MAC='02:00:00:00:00:01'
@@ -74,7 +68,7 @@ expect_ok() {
   local name=$1 out rc
   shift
   set +e
-  out=$( (load; install_fakes; "$@") 2>&1 )
+  out=$( (source "$repo/debian-init.sh"; trap - EXIT ERR HUP INT TERM; install_fakes; "$@") 2>&1 )
   rc=$?
   set -e
   (( rc == 0 )) || { printf '%s\n' "$out" >&2; fail "$name (rc=$rc)"; }
@@ -86,7 +80,7 @@ expect_die() {
   local name=$1 msg=$2 out rc
   shift 2
   set +e
-  out=$( (load; install_fakes; "$@") 2>&1 )
+  out=$( (source "$repo/debian-init.sh"; trap - EXIT ERR HUP INT TERM; install_fakes; "$@") 2>&1 )
   rc=$?
   set -e
   (( rc != 0 )) || { printf '%s\n' "$out" >&2; fail "$name: expected failure"; }
@@ -253,6 +247,107 @@ expect_die 'root on device mapper' '无法重装：根分区不是普通分区' 
 
 t_efi() { use_paths "$work/efi"; mkdir -p "$REINSTALL_SYS_ROOT/firmware/efi"; reinstall_check_firmware; }
 expect_die 'EFI firmware' '无法重装：检测到' t_efi
+
+# ---- 3b. tools, keyring and hostname ------------------------------------------
+
+make_stub_path() {
+  local dir=$1 cmd
+  mkdir -p "$dir"
+  for cmd in curl cpio gzip sha256sum openssl ssh-keygen wc stty; do
+    printf '#!/bin/sh\nexit 0\n' >"$dir/$cmd"
+    chmod +x "$dir/$cmd"
+  done
+}
+
+t_tools_without_gpgv() {
+  make_stub_path "$work/stub-nogpgv"
+  mkdir -p "$work/keys-gpg"
+  : >"$work/keys-gpg/debian-archive-keyring.gpg"
+  : >"$work/keys-gpg/debian-archive-keyring.pgp"
+  REINSTALL_KEYRING_DIR="$work/keys-gpg"
+  make_stub_path "$work/stub-gpgv"
+  printf '#!/bin/sh\nexit 0\n' >"$work/stub-gpgv/gpgv"
+  chmod +x "$work/stub-gpgv/gpgv"
+  # shellcheck disable=SC2123 # The search path is replaced on purpose to hide gpgv.
+  PATH="$work/stub-nogpgv"
+  reinstall_check_tools
+  [[ "$REINSTALL_NEED_GPGV" == true ]] || fail 'missing gpgv not flagged'
+  [[ "$REINSTALL_KEYRING" == "$work/keys-gpg/debian-archive-keyring.gpg" ]] || fail "keyring preference: $REINSTALL_KEYRING"
+  # shellcheck disable=SC2123
+  PATH="$work/stub-gpgv"
+  reinstall_check_tools
+  [[ "$REINSTALL_NEED_GPGV" == false ]] || fail 'present gpgv flagged as missing'
+}
+expect_ok 'gpgv is optional and flagged when missing' t_tools_without_gpgv
+
+t_tools_missing_curl() {
+  make_stub_path "$work/stub-nocurl"
+  rm -f "$work/stub-nocurl/curl"
+  # shellcheck disable=SC2123 # The search path is replaced on purpose to hide curl.
+  PATH="$work/stub-nocurl"
+  reinstall_check_tools
+}
+expect_die 'other tools are still required' '无法重装：缺少必要工具：curl' t_tools_missing_curl
+
+t_keyring_pgp() {
+  mkdir -p "$work/keys-pgp"
+  : >"$work/keys-pgp/debian-archive-keyring.pgp"
+  REINSTALL_KEYRING_DIR="$work/keys-pgp"
+  reinstall_pick_keyring
+  [[ "$REINSTALL_KEYRING" == "$work/keys-pgp/debian-archive-keyring.pgp" ]] || fail "pgp fallback: $REINSTALL_KEYRING"
+}
+expect_ok 'keyring falls back to .pgp' t_keyring_pgp
+
+t_keyring_none() { mkdir -p "$work/keys-none"; REINSTALL_KEYRING_DIR="$work/keys-none"; reinstall_pick_keyring; }
+expect_die 'no keyring at all' '无法重装：缺少 Debian 密钥环' t_keyring_none
+
+t_hostname_rules() {
+  local input expected valid
+  while IFS='|' read -r input expected valid; do
+    REINSTALL_HOST=$input
+    reinstall_pick_new_hostname
+    [[ "$REINSTALL_NEW_HOST" == "$expected" && "$REINSTALL_HOST_VALID" == "$valid" ]] ||
+      fail "hostname [$input] -> [$REINSTALL_NEW_HOST] valid=$REINSTALL_HOST_VALID"
+  done <<EOF
+vps-6993|vps-6993|true
+VPS-Test|vps-test|true
+a|a|true
+9lives|9lives|true
+vps_test|debian|false
+-vps|debian|false
+vps-|debian|false
+vps.example|debian|false
+$(printf 'a%.0s' {1..63})|$(printf 'a%.0s' {1..63})|true
+$(printf 'a%.0s' {1..64})|debian|false
+EOF
+}
+expect_ok 'hostname is lowercased or replaced by debian' t_hostname_rules
+
+t_invalid_hostname_flow() {
+  use_host
+  REINSTALL_HOST='VPS_Test'
+  reinstall_pick_new_hostname
+  reinstall_write_preseed "$work/preseed-badhost.cfg"
+  grep -Fxq 'd-i netcfg/get_hostname string debian' "$work/preseed-badhost.cfg" || fail 'preseed get_hostname not debian'
+  grep -Fxq 'd-i netcfg/hostname string debian' "$work/preseed-badhost.cfg" || fail 'preseed hostname not debian'
+  reinstall_generate_password() { :; }
+  read_tty() { [[ "$1" == *'VPS_Test'* ]] || fail "confirm prompt: $1"; printf -v "$2" '%s' 'VPS_Test'; }
+  reinstall_confirm
+}
+expect_ok 'invalid hostname: summary, preseed and confirmation' t_invalid_hostname_flow
+grep -Fq '当前主机名不合法，新系统将使用 debian' "$work/last.out" || fail 'invalid hostname summary line'
+grep -Fq '主机名确认通过' "$work/last.out" || fail 'confirmation with the current hostname failed'
+
+t_valid_hostname_summary() {
+  use_host
+  REINSTALL_HOST='VPS-Test'
+  reinstall_pick_new_hostname
+  reinstall_print_summary
+}
+expect_ok 'valid hostname summary' t_valid_hostname_summary
+grep -Fq '主机名：vps-test' "$work/last.out" || fail 'lowercased hostname not shown'
+if grep -Fq '不合法' "$work/last.out"; then fail 'valid hostname reported as invalid'; fi
+if grep -Fq '将先安装 gpgv' "$work/last.out"; then fail 'gpgv line shown although gpgv is present'; fi
 
 # ---- 4. preseed and net.env ---------------------------------------------------
 
@@ -449,13 +544,22 @@ t_leftover_signals() {
   reinstall_cleanup
   [[ "$(cat "$FAKE_GRUBENV")" == 'saved_entry=0' ]] || fail 'next_entry not unset'
   if reinstall_detect_leftover; then fail 'leftover after cleanup'; fi
+  # Fifth signal: a custom.cfg backup without any marker block; cleanup restores it.
+  printf '# original\n' >"$REINSTALL_CUSTOM_BAK"
+  printf '# edited later\n' >"$REINSTALL_CUSTOM_CFG"
+  reinstall_detect_leftover || fail 'custom.cfg.404bak not detected'
+  [[ "${REINSTALL_LEFTOVERS[*]}" == *custom.cfg.404bak* ]] || fail "backup signal text: ${REINSTALL_LEFTOVERS[*]}"
+  reinstall_cleanup
+  [[ "$(cat "$REINSTALL_CUSTOM_CFG")" == '# original' && ! -e "$REINSTALL_CUSTOM_BAK" ]] || fail 'backup not restored'
+  if reinstall_detect_leftover; then fail 'leftover after restoring backup'; fi
+  rm -f -- "$REINSTALL_CUSTOM_CFG"
   # Someone else's next_entry is not ours: neither a leftover nor touched by cleanup.
   printf 'next_entry=1\n' >"$FAKE_GRUBENV"
   if reinstall_detect_leftover; then fail 'foreign next_entry counted as leftover'; fi
   reinstall_cleanup
   [[ "$(cat "$FAKE_GRUBENV")" == 'next_entry=1' ]] || fail 'cleanup touched a foreign next_entry'
 }
-expect_ok 'leftover detection recognises all four signals' t_leftover_signals
+expect_ok 'leftover detection recognises all five signals' t_leftover_signals
 
 t_leftover_prompt_no() {
   use_paths "$work/leftover-no"
@@ -598,6 +702,7 @@ install_download_fakes() {
   curl() {
     local IFS=' ' url='' out=''
     printf '%s\n' "$*" >>"$fix/curl.log"
+    printf 'curl\n' >>"$fix/order.log"
     while (( $# )); do
       case "$1" in
         -o) out=$2; shift 2 ;;
@@ -648,6 +753,45 @@ while IFS= read -r line; do
   [[ "$line" == "--proto =https --tlsv1.2 -fsSL --retry 3 --connect-timeout 15 https://deb.debian.org/debian/dists/trixie/"*' -o '* ]] ||
     fail "curl options: $line"
 done <"$fix/curl.log"
+
+t_missing_gpgv_flow() {
+  use_paths "$work/gpgv-install"
+  use_host
+  install_download_fakes
+  REINSTALL_TEST_MODE='dry-run'
+  REINSTALL_NEED_GPGV=true
+  reinstall_generate_password() { :; }
+  read_tty() { printf -v "$2" '%s' "$REINSTALL_HOST"; }
+  apt_get() {
+    local IFS=' '
+    printf 'apt_get %s\n' "$*" >>"$fix/order.log"
+    [[ "$REINSTALL_ARMED" == false && ! -e "$REINSTALL_BOOT_TMP_DIR" ]] || fail 'gpgv installed after arming'
+  }
+  run_reinstall
+  [[ "$REINSTALL_NEED_GPGV" == false ]] || fail 'gpgv still flagged after install'
+  [[ ! -e "$REINSTALL_BOOT_DIR" && ! -e "$REINSTALL_BOOT_TMP_DIR" ]] || fail 'dry-run with gpgv install left files'
+}
+rm -f "$fix/order.log" "$fix/curl.log"
+expect_ok 'missing gpgv: summary line, install before download' t_missing_gpgv_flow
+grep -Fq '将先安装 gpgv（Debian 官方包，用于校验安装文件签名）' "$work/last.out" || fail 'summary lacks the gpgv line'
+[[ "$(head -n 1 "$fix/order.log")" == 'apt_get install -y --no-install-recommends gpgv' ]] || fail "gpgv install call/order: $(cat "$fix/order.log")"
+[[ "$(grep -c '^apt_get' "$fix/order.log")" == 1 && "$(grep -c '^curl$' "$fix/order.log")" == 4 ]] || fail 'unexpected apt_get/curl calls'
+
+t_gpgv_install_fails() {
+  use_paths "$work/gpgv-fail"
+  use_host
+  install_download_fakes
+  REINSTALL_NEED_GPGV=true
+  reinstall_generate_password() { :; }
+  read_tty() { printf -v "$2" '%s' "$REINSTALL_HOST"; }
+  apt_get() { return 100; }
+  run_reinstall
+}
+rm -f "$fix/order.log"
+expect_die 'gpgv install failure stops before download' '安装 gpgv 失败；尚未改动任何启动项' t_gpgv_install_fails
+[[ ! -e "$fix/order.log" ]] || fail 'download started after a failed gpgv install'
+[[ ! -e "$work/gpgv-fail/boot/404-reinstall" && ! -e "$work/gpgv-fail/boot/404-reinstall.tmp" && ! -e "$work/gpgv-fail/boot/grub/custom.cfg" ]] ||
+  fail 'gpgv install failure left boot changes'
 
 t_bad_codename() {
   use_paths "$work/codename"

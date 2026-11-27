@@ -5509,7 +5509,8 @@ readonly REINSTALL_MIN_SECTORS=8388608
 readonly -a REINSTALL_CURL_OPTS=(--proto '=https' --tlsv1.2 -fsSL --retry 3 --connect-timeout 15)
 # Paths are plain variables (not readonly) so offline tests can point them at a temporary tree.
 REINSTALL_SYS_ROOT='/sys'
-REINSTALL_KEYRING='/usr/share/keyrings/debian-archive-keyring.gpg'
+REINSTALL_KEYRING_DIR='/usr/share/keyrings'
+REINSTALL_KEYRING=''
 REINSTALL_BOOT_DIR='/boot/404-reinstall'
 REINSTALL_BOOT_TMP_DIR='/boot/404-reinstall.tmp'
 REINSTALL_GRUB_CFG='/boot/grub/grub.cfg'
@@ -5522,6 +5523,9 @@ REINSTALL_TEST_MODE=''
 REINSTALL_ARMED=false
 REINSTALL_STAGE_DIR=''
 REINSTALL_HOST=''
+REINSTALL_NEW_HOST=''
+REINSTALL_HOST_VALID=true
+REINSTALL_NEED_GPGV=false
 REINSTALL_DISK=''
 REINSTALL_DISK_SECTORS=0
 REINSTALL_DISK_SIZE=''
@@ -5580,13 +5584,14 @@ reinstall_next_entry_is_ours() {
   grub-editenv list 2>/dev/null | grep -Fxq -- "next_entry=$REINSTALL_GRUB_ENTRY_ID"
 }
 
-# Fill REINSTALL_LEFTOVERS; succeed when any of the four signals is present.
+# Fill REINSTALL_LEFTOVERS; succeed when any of the five signals is present.
 reinstall_detect_leftover() {
   REINSTALL_LEFTOVERS=()
   if [[ -e "$REINSTALL_BOOT_DIR" ]]; then REINSTALL_LEFTOVERS+=("$REINSTALL_BOOT_DIR"); fi
   if [[ -e "$REINSTALL_BOOT_TMP_DIR" ]]; then REINSTALL_LEFTOVERS+=("$REINSTALL_BOOT_TMP_DIR"); fi
   if reinstall_custom_cfg_has_mark; then REINSTALL_LEFTOVERS+=("$REINSTALL_CUSTOM_CFG 中的 404-reinstall 启动项"); fi
   if reinstall_next_entry_is_ours; then REINSTALL_LEFTOVERS+=("GRUB next_entry=$REINSTALL_GRUB_ENTRY_ID"); fi
+  if [[ -e "$REINSTALL_CUSTOM_BAK" ]]; then REINSTALL_LEFTOVERS+=("$REINSTALL_CUSTOM_BAK（custom.cfg 备份）"); fi
   (( ${#REINSTALL_LEFTOVERS[@]} > 0 ))
 }
 
@@ -5777,13 +5782,28 @@ reinstall_check_kexec() {
   fi
 }
 
-# 8. 工具与密钥环
+# Prefer debian-archive-keyring.gpg, fall back to the .pgp next to it (Debian 13 ships .pgp).
+reinstall_pick_keyring() {
+  local candidate
+  REINSTALL_KEYRING=''
+  for candidate in "$REINSTALL_KEYRING_DIR/debian-archive-keyring.gpg" "$REINSTALL_KEYRING_DIR/debian-archive-keyring.pgp"; do
+    if [[ -r "$candidate" ]]; then
+      REINSTALL_KEYRING=$candidate
+      return 0
+    fi
+  done
+  reinstall_fail "缺少 Debian 密钥环：$REINSTALL_KEYRING_DIR/debian-archive-keyring.gpg 或 .pgp"
+}
+
+# 8. 工具与密钥环。gpgv 不是必需项：Debian 13 的 apt 改用 sqv，缺少时确认后再安装。
 reinstall_check_tools() {
   local cmd
-  for cmd in curl gpgv cpio gzip sha256sum openssl ssh-keygen wc stty; do
+  for cmd in curl cpio gzip sha256sum openssl ssh-keygen wc stty; do
     command -v "$cmd" >/dev/null 2>&1 || reinstall_fail "缺少必要工具：$cmd"
   done
-  [[ -r "$REINSTALL_KEYRING" ]] || reinstall_fail "缺少 Debian 密钥环：$REINSTALL_KEYRING"
+  REINSTALL_NEED_GPGV=false
+  if ! command -v gpgv >/dev/null 2>&1; then REINSTALL_NEED_GPGV=true; fi
+  reinstall_pick_keyring
 }
 
 # 9. /boot 所在文件系统剩余 >= 200 MiB
@@ -5912,6 +5932,20 @@ reinstall_check_identity() {
   fi
   REINSTALL_HOST=$(hostname -s 2>/dev/null || true)
   [[ -n "$REINSTALL_HOST" ]] || reinstall_fail '无法获取本机短主机名（hostname -s）'
+  reinstall_pick_new_hostname
+}
+
+# The new system gets the lowercased short hostname when it is a valid label, otherwise "debian".
+# Confirmation still asks for the current `hostname -s` as typed.
+reinstall_pick_new_hostname() {
+  local lower=${REINSTALL_HOST,,}
+  if [[ "$lower" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]]; then
+    REINSTALL_NEW_HOST=$lower
+    REINSTALL_HOST_VALID=true
+  else
+    REINSTALL_NEW_HOST='debian'
+    REINSTALL_HOST_VALID=false
+  fi
 }
 
 # Read-only checks. Unlike preflight, this creates no backup directory or temporary files.
@@ -5961,7 +5995,14 @@ reinstall_print_summary() {
   if [[ -n "$REINSTALL_TEST_MODE" ]]; then
     ui_box_line_color "$C_YELLOW" "测试模式：$REINSTALL_TEST_MODE"
   fi
-  ui_box_line "主机名：$REINSTALL_HOST"
+  if [[ "$REINSTALL_HOST_VALID" == true ]]; then
+    ui_box_line "主机名：$REINSTALL_NEW_HOST"
+  else
+    ui_box_line_color "$C_YELLOW" '当前主机名不合法，新系统将使用 debian'
+  fi
+  if [[ "$REINSTALL_NEED_GPGV" == true ]]; then
+    ui_box_line '将先安装 gpgv（Debian 官方包，用于校验安装文件签名）'
+  fi
   ui_box_line "IPv4：$v4；MAC $REINSTALL_V4_MAC（当前网卡 $REINSTALL_V4_IFACE）"
   case "$REINSTALL_V6_MODE" in
     none) ui_box_line 'IPv6：不配置' ;;
@@ -5987,6 +6028,19 @@ reinstall_confirm() {
     exit 0
   fi
   log '主机名确认通过。'
+}
+
+# Runs after the hostname confirmation and before anything is written under /boot, so a failure
+# leaves no boot entry behind. dry-run installs gpgv as well: the download and signature check
+# are part of the dry run.
+reinstall_install_gpgv() {
+  [[ "$REINSTALL_NEED_GPGV" == true ]] || return 0
+  CURRENT_STEP='安装 gpgv'
+  log '安装 gpgv（Debian 官方包，用于校验安装文件签名）...'
+  apt_get install -y --no-install-recommends gpgv || die '安装 gpgv 失败；尚未改动任何启动项。'
+  command -v gpgv >/dev/null 2>&1 || die '安装后仍找不到 gpgv；尚未改动任何启动项。'
+  REINSTALL_NEED_GPGV=false
+  log 'gpgv 已安装。'
 }
 
 # ---- 下载与校验 --------------------------------------------------------------
@@ -6158,9 +6212,9 @@ EOF
       printf '%s\n' 'd-i netcfg/disable_autoconfig boolean false'
     fi
     cat <<EOF
-d-i netcfg/get_hostname string $REINSTALL_HOST
+d-i netcfg/get_hostname string $REINSTALL_NEW_HOST
 d-i netcfg/get_domain string
-d-i netcfg/hostname string $REINSTALL_HOST
+d-i netcfg/hostname string $REINSTALL_NEW_HOST
 d-i hw-detect/load_firmware boolean true
 
 # Mirror & APT setup
@@ -6635,6 +6689,7 @@ reinstall_countdown_and_reboot() {
 
 run_reinstall() {
   reinstall_confirm
+  reinstall_install_gpgv
   REINSTALL_ARMED=true
   reinstall_download_and_verify
   reinstall_build_overlay
