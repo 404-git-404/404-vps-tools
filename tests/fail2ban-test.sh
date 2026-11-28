@@ -132,7 +132,7 @@ fi
     "$TEST_DIR/../debian-init.sh" >"$TEST_TMP/reality-installer"
   reality_config='{"inbounds":[{"type":"vless","tls":{"enabled":true,"reality":{"enabled":true}}}]}'
   other_config='{"inbounds":[{"type":"vless","tls":{"enabled":true,"reality":{"enabled":false}}}]}'
-  for scenario in single split no-reality malformed array non-list no-json ignore-backup symlink; do
+  for scenario in single split no-reality malformed array non-list non-object bad-tls non-utf8 no-json missing-dir ignore-backup symlink dangling-symlink; do
     config_dir="$TEST_TMP/reality-$scenario"
     mkdir "$config_dir"
     expected=0
@@ -147,17 +147,25 @@ fi
         printf '%s\n' "$other_config" >"$config_dir/config.json"
         expected=1
         ;;
-      malformed|array|non-list)
+      malformed|array|non-list|non-object|bad-tls|non-utf8)
         printf '%s\n' "$reality_config" >"$config_dir/10-in.json"
         case "$scenario" in
           malformed) echo '{' ;;
           array) echo '[]' ;;
           non-list) echo '{"inbounds":{}}' ;;
+          non-object) echo '{"inbounds":[123]}' ;;
+          bad-tls) echo '{"inbounds":[{"type":"vless","tls":null}]}' ;;
+          non-utf8) printf '\377\376' ;;
         esac >"$config_dir/config.json"
         expected=1
         ;;
       no-json)
         mkdir "$config_dir/directory.json"
+        ln -s missing.data "$config_dir/dangling.json"
+        expected=1
+        ;;
+      missing-dir)
+        rmdir "$config_dir"
         expected=1
         ;;
       ignore-backup)
@@ -167,6 +175,10 @@ fi
       symlink)
         printf '%s\n' "$reality_config" >"$config_dir/config.data"
         ln -s config.data "$config_dir/10-in.json"
+        ;;
+      dangling-symlink)
+        ln -s missing.data "$config_dir/00-dangling.json"
+        printf '%s\n' "$reality_config" >"$config_dir/config.json"
         ;;
     esac
     result=0

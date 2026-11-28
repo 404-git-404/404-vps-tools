@@ -3860,16 +3860,19 @@ try:
         if not isinstance(document, dict):
             sys.exit(1)
         entries = document.get("inbounds", [])
-        if not isinstance(entries, list):
+        if not isinstance(entries, list) or not all(isinstance(entry, dict) for entry in entries):
             sys.exit(1)
         inbounds.extend(entries)
 
-    sys.exit(not any(
-        inbound.get("type") == "vless"
-        and inbound.get("tls", {}).get("enabled") is True
-        and inbound["tls"].get("reality", {}).get("enabled") is True
-        for inbound in inbounds
-    ))
+    found = False
+    for inbound in inbounds:
+        if (
+            inbound.get("type") == "vless"
+            and inbound.get("tls", {}).get("enabled") is True
+            and inbound["tls"].get("reality", {}).get("enabled") is True
+        ):
+            found = True
+    sys.exit(0 if found else 1)
 except (OSError, ValueError, AttributeError, TypeError):
     sys.exit(1)
 PY

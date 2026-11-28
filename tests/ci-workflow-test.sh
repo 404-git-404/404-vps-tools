@@ -84,7 +84,7 @@ shopt -s nullglob
 uses_key="^[[:space:]]*(-[[:space:]]+)?['\"]?uses['\"]?[[:space:]]*:[[:space:]]*(.*)$"
 uses_value="^['\"]?([^[:space:]'\"#]+)['\"]?([[:space:]]+#.*|[[:space:]]*)$"
 for workflow in "$repo"/.github/workflows/*.{yml,yaml}; do
-  while IFS= read -r line; do
+  while IFS= read -r line || [[ -n "$line" ]]; do
     [[ "$line" =~ $uses_key ]] || continue
     value=${BASH_REMATCH[2]}
     [[ "$value" =~ $uses_value ]] || fail "$workflow: invalid uses entry: $line"
@@ -109,7 +109,7 @@ expected_publish_checkout=$(cat <<'YAML'
         run: test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
 YAML
 )
-[[ "$publish_job" == *"$expected_publish_checkout"$'\n'* ]] || fail 'publish must check out github.sha and verify HEAD before packaging'
+[[ "$publish_job" == *"$expected_publish_checkout"$'\n'*'      - name: Package scripts and checksums'* ]] || fail 'publish must check out github.sha and verify HEAD before packaging'
 echo 'PASS: workflow action SHA pins and verified release checkout'
 
 for scenario in ok transient network timeout bad-certificate local-io primary secondary forbidden redirect-forbidden unauthenticated throttled long-wait permanent missing allow-missing empty anonymous; do
