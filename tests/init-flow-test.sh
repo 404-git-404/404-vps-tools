@@ -227,22 +227,55 @@ done
     if [[ ${sysctl_fails:-false} == true ]]; then echo 'fixture permission denied' >&2; return 1; fi
   }
   expected=$'# 由 404-vps-tools 写入：UFW 拦截日志保留在 journal，避免刷屏控制台。\nkernel.printk = 4 4 1 7'
+  [[ ! -e "${PRINTK_SYSCTL%/*}" ]] || fail 'printk fixture must start without the parent directory'
   configure_console_logging
+  [[ -d "${PRINTK_SYSCTL%/*}" ]] || fail 'printk parent directory was not created'
   cmp "$PRINTK_SYSCTL" <(printf '%s\n' "$expected")
   [[ "$(stat -c %a "$PRINTK_SYSCTL")" == 644 ]]
   [[ ! -e "$BACKUP_DIR" ]]
+  [[ "$(wc -l <"$work/printk-applies")" == 1 ]]
   touch -d '2000-01-01' "$PRINTK_SYSCTL"
   before=$(stat -c '%i %y' "$PRINTK_SYSCTL")
   configure_console_logging
   [[ "$(stat -c '%i %y' "$PRINTK_SYSCTL")" == "$before" ]]
-  [[ "$(wc -l <"$work/printk-applies")" == 1 && ! -e "$BACKUP_DIR" ]]
+  [[ "$(wc -l <"$work/printk-applies")" == 2 && ! -e "$BACKUP_DIR" ]]
 
   printf 'kernel.printk = 7 4 1 7\n' >"$PRINTK_SYSCTL"
   sysctl_fails=true configure_console_logging 2>"$work/printk.warn"
   cmp "$PRINTK_SYSCTL" <(printf '%s\n' "$expected")
   grep -Fxq 'kernel.printk = 7 4 1 7' "$BACKUP_DIR/files$PRINTK_SYSCTL"
   grep -Fxq '[WARN] 控制台日志级别未能生效：fixture permission denied' "$work/printk.warn"
-  [[ "$(wc -l <"$work/printk-applies")" == 2 ]]
+  [[ "$(wc -l <"$work/printk-applies")" == 3 ]]
+
+  rm -- "$PRINTK_SYSCTL"
+  printf 'operator configuration\n' >"$work/printk-target"
+  for target in "$work/missing-printk-target" "$work/printk-target"; do
+    ln -s -- "$target" "$PRINTK_SYSCTL"
+    configure_console_logging 2>"$work/printk.warn"
+    grep -Fq '[WARN]' "$work/printk.warn"
+    [[ -L "$PRINTK_SYSCTL" && "$(readlink "$PRINTK_SYSCTL")" == "$target" ]]
+    rm -- "$PRINTK_SYSCTL"
+  done
+  [[ ! -e "$work/missing-printk-target" ]]
+  grep -Fxq 'operator configuration' "$work/printk-target"
+
+  mkdir -- "$PRINTK_SYSCTL"
+  configure_console_logging 2>"$work/printk.warn"
+  grep -Fq '[WARN]' "$work/printk.warn"
+  [[ -d "$PRINTK_SYSCTL" ]]
+  rmdir -- "$PRINTK_SYSCTL"
+
+  printf 'operator configuration\n' >"$PRINTK_SYSCTL"
+  (
+    make_mutable() {
+      [[ "$1" == "$PRINTK_SYSCTL" && "$2" == nonfatal ]] || fail 'printk must request a nonfatal backup'
+      return 1
+    }
+    configure_console_logging
+  ) 2>"$work/printk.warn"
+  grep -Fq '[WARN] 无法写入控制台日志配置' "$work/printk.warn"
+  grep -Fxq 'operator configuration' "$PRINTK_SYSCTL"
+  [[ "$(wc -l <"$work/printk-applies")" == 3 ]]
 )
 
 for scenario in ipv6-restore ipv6-keep; do

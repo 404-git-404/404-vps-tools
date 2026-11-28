@@ -40,7 +40,6 @@ HARDENING_KEY_DELETED=false
 HARDENING_MAIL_PURGED=false
 AUDIT_SESSION_KEY=''
 AUDIT_APT_SOURCES=''
-AUDIT_DEBIAN_SOURCES=''
 readonly SMARTDNS_CONF='/etc/smartdns/smartdns.conf'
 readonly SMARTDNS_CACHE='/var/cache/smartdns/smartdns.cache'
 readonly SMARTDNS_APT_PIN='/etc/apt/preferences.d/vps-init-smartdns'
@@ -3761,11 +3760,12 @@ configure_console_logging() {
     warn "$PRINTK_SYSCTL 不是普通文件，已跳过控制台日志配置。"
     return 0
   fi
-  if cmp -s -- "$PRINTK_SYSCTL" <(printf '%s\n' "$content"); then return 0; fi
-  if ! ensure_dir "${PRINTK_SYSCTL%/*}" || ! make_mutable "$PRINTK_SYSCTL" nonfatal ||
-    ! printf '%s\n' "$content" >"$PRINTK_SYSCTL" || ! chmod 0644 "$PRINTK_SYSCTL"; then
-    warn "无法写入控制台日志配置 $PRINTK_SYSCTL。"
-    return 0
+  if ! cmp -s -- "$PRINTK_SYSCTL" <(printf '%s\n' "$content"); then
+    if ! ensure_dir "${PRINTK_SYSCTL%/*}" || ! make_mutable "$PRINTK_SYSCTL" nonfatal ||
+      ! printf '%s\n' "$content" >"$PRINTK_SYSCTL" || ! chmod 0644 "$PRINTK_SYSCTL"; then
+      warn "无法写入控制台日志配置 $PRINTK_SYSCTL。"
+      return 0
+    fi
   fi
   if ! output=$(sysctl -q -p "$PRINTK_SYSCTL" 2>&1); then
     warn "控制台日志级别未能生效：$output"
@@ -4215,10 +4215,9 @@ audit_apt_policy() {
 }
 
 audit_preload_apt_policies() {
-  local arch=$1 batch policy line key
+  local arch=$1 batch line key
   shift
   for (( batch = 0; batch < $#; batch += 500 )); do
-    policy=$(audit_apt_policy -- "${@:batch+1:500}") || return 1
     key=''
     while IFS= read -r line; do
       if [[ "$line" =~ ^([a-z0-9][a-z0-9+.-]*(:[a-z0-9-]+)?):$ ]]; then
@@ -4227,7 +4226,8 @@ audit_preload_apt_policies() {
       elif [[ -n "$key" ]]; then
         AUDIT_APT_POLICIES[$key]+="$line"$'\n'
       fi
-    done <<<"$policy"
+    done < <(audit_apt_policy -- "${@:batch+1:500}")
+    wait "$!" || return 1
     [[ -n "$key" ]] || return 1
   done
   # APT omits the native architecture in its heading, even for e.g. libc6:amd64.
@@ -4276,13 +4276,25 @@ audit_apt_version_sources() {
   '
 }
 
+audit_debian_official_sources() {
+  printf '%s\n' "$AUDIT_APT_SOURCES" | awk '
+    /^[ ]*[0-9]+ / {source=$0; sub(/^[ ]*[0-9]+ /,"",source)}
+    /release / && /(^|[, ])o=Debian([, ]|$)/ {print source}
+  '
+}
+
 audit_debian_package() {
   # Require the *installed version* to have an official origin in the local APT cache.
   # No network access. Unknown/obsolete versions are intentionally reported for review.
-  local version policy
+  local version policy sources
   audit_read_package_version "$1" version || return 1
   audit_read_package_policy "$1" policy || return 1
-  audit_apt_version_sources "$version" "$policy" | awk -v sources="$AUDIT_DEBIAN_SOURCES" '
+  if [[ ${audit_cache_mode:-off} == off ]]; then
+    sources=$(audit_debian_official_sources) || return 1
+  else
+    sources=$AUDIT_DEBIAN_SOURCES
+  fi
+  audit_apt_version_sources "$version" "$policy" | awk -v sources="$sources" '
     BEGIN {n=split(sources,s,"\n"); for(i=1;i<=n;i++) official[s[i]]=1}
     {sub(/^[ ]*-?[0-9]+[ ]+/,""); if(official[$0]) ok=1}
     END {exit !ok}'
@@ -4318,7 +4330,7 @@ audit_smartdns_tool_origin() {
   installed=$(dpkg-query -W -f='${db:Status-Status}\t${Version}' -- smartdns 2>/dev/null) || return 1
   [[ "$installed" == $'installed\t'"$SMARTDNS_DEB_VERSION" && -f "$pin" && ! -L "$pin" ]] || return 1
   verification=$(LC_ALL=C dpkg --verify smartdns 2>/dev/null) || return 1
-  [[ -z "$verification" ]] || awk '$2 != "c" {exit 1}' <<<"$verification"
+  [[ -z "$verification" ]] || awk '$2 != "c" {exit 1}' < <(printf '%s\n' "$verification")
 }
 
 audit_session_key() {
@@ -4332,10 +4344,10 @@ audit_session_key() {
       since=$(ps -o lstart= -p "$pid") || return 1
       since=$(date -d "$since" '+%Y-%m-%d %H:%M:%S') || return 1
       logs=$(journalctl -b --since "$since" --no-pager -o cat "_PID=$pid" 2>/dev/null) || return 1
-      fp=$(awk -v ip="$ip" -v port="$port" '
+      fp=$(printf '%s\n' "$logs" | awk -v ip="$ip" -v port="$port" '
         $1 == "Accepted" && $2 == "publickey" && $5 == "from" && $6 == ip && $7 == "port" && $8 == port {
           for(i=9;i<=NF;i++) if($i ~ /^SHA256:[A-Za-z0-9+\/]+$/) print $i
-        }' <<<"$logs" | sort -u)
+        }' | sort -u)
       if [[ -n "$fp" ]]; then found+="$fp"$'\n'; fi
     fi
     parent=$(ps -o ppid= -p "$pid") || return 1
@@ -4370,10 +4382,10 @@ audit_keys() {
     count=$(ssh_public_key_fingerprints "$file" | sort -u | wc -l) || count=0
     # shellcheck disable=SC2094 # audit_add only appends an in-memory finding.
     while IFS= read -r line || [[ -n "$line" ]]; do
-      fp=$(ssh_public_key_fingerprints <<<"$line") || continue
+      fp=$(ssh_public_key_fingerprints < <(printf '%s\n' "$line")) || continue
       [[ -n "$fp" ]] || continue
-      comment=$(ssh-keygen -l -f /dev/stdin <<<"$line" 2>/dev/null || printf '%s' "$line")
-      if [[ -n "$recorded" ]] && grep -Fxq "$fp" <<<"$recorded"; then continue; fi
+      comment=$(ssh-keygen -l -f /dev/stdin < <(printf '%s\n' "$line") 2>/dev/null || printf '%s' "$line")
+      if [[ -n "$recorded" ]] && grep -Fxq "$fp" < <(printf '%s\n' "$recorded"); then continue; fi
       audit_add A key "$file" "$fp；$([[ -n "$recorded" ]] && echo '不是你提供的' || echo '没有归属记录，请选择保留哪些')；$comment；共 $count 把；当前会话=$([[ "$fp" == "$AUDIT_SESSION_KEY" ]] && echo 是 || echo 未匹配)"
     done <"$file"
   done
@@ -4440,7 +4452,7 @@ audit_cloud_network_classify() {
       $1 == "iface" && $2 != "lo" && $3 ~ /^inet6?$/ && $4 ~ /^(dhcp|static|auto)$/ {print $4}' "$file")
     [[ -n "$methods" ]] || continue
     kinds+=' ifupdown'
-    if grep -Fxq static <<<"$methods"; then static=true; fi
+    if grep -Fxq static < <(printf '%s\n' "$methods"); then static=true; fi
   done
   for file in "$AUDIT_ROOT"/etc/netplan/*.yaml; do
     audit_network_regular_file "$file" || continue
@@ -4563,12 +4575,10 @@ collect_security_audit() {
   AUDIT_FINDINGS=()
   AUDIT_SESSION_KEY=$(audit_session_key) || AUDIT_SESSION_KEY=''
   AUDIT_APT_SOURCES=$(audit_apt_policy || true)
-  AUDIT_DEBIAN_SOURCES=$(awk '
-    /^[ ]*[0-9]+ / {source=$0; sub(/^[ ]*[0-9]+ /,"",source)}
-    /release / && /(^|[, ])o=Debian([, ]|$)/ {print source}
-  ' <<<"$AUDIT_APT_SOURCES")
   local file package status unit path uid user effective command keys listener local_address pid exe cloud_detail exim4_found=false key_ok=true key_path
   local arch version audit_cache_mode=batched
+  local AUDIT_DEBIAN_SOURCES
+  AUDIT_DEBIAN_SOURCES=$(audit_debian_official_sources)
   local -a key_paths=() installed_packages=()
   # The origin helpers share these caches for the lifetime of this audit only.
   local -A AUDIT_APT_POLICIES=() AUDIT_PACKAGE_VERSIONS=()
@@ -4657,12 +4667,12 @@ collect_security_audit() {
     [[ "$uid" != 0 || "$user" == root ]] || audit_add C uid "$user" '除 root 外还有 UID 0 用户；建议用官方镜像重装'
   done <"$AUDIT_ROOT/etc/passwd"
   if effective=$(sshd -T 2>/dev/null); then
-    command=$(awk '$1=="authorizedkeyscommand" {$1=""; sub(/^ /, ""); print}' <<<"$effective")
-    keys=$(awk '$1=="authorizedkeysfile" {$1=""; sub(/^ /, ""); print}' <<<"$effective")
+    command=$(printf '%s\n' "$effective" | awk '$1=="authorizedkeyscommand" {$1=""; sub(/^ /, ""); print}')
+    keys=$(printf '%s\n' "$effective" | awk '$1=="authorizedkeysfile" {$1=""; sub(/^ /, ""); print}')
     [[ "$command" == none ]] || audit_add C ssh AuthorizedKeysCommand "公钥通过额外命令获取：$command；只报告，不改 sshd，建议官方重装"
     # Defaults are .ssh/authorized_keys (+ .ssh/authorized_keys2 on older OpenSSH); the
     # installer itself pins .ssh/authorized_keys. Anything else is reported.
-    IFS=' ' read -ra key_paths <<<"$keys"
+    IFS=' ' read -ra key_paths < <(printf '%s\n' "$keys")
     for key_path in "${key_paths[@]}"; do
       case "$key_path" in .ssh/authorized_keys|.ssh/authorized_keys2) ;; *) key_ok=false ;; esac
     done
@@ -5070,11 +5080,11 @@ print_report() {
   ui_box_kv 'SSH 实际监听  : ' "$ssh_display" "$ssh_warn"
   ui_box_kv 'UFW           : ' "$ufw_status" "$ufw_warn"
   if [[ ! "$printk_level" =~ ^[0-9]+$ ]]; then
-    ui_box_kv '控制台日志  : ' '未知' true
+    ui_box_kv '控制台日志    : ' '未知' true
   elif (( 10#$printk_level <= 4 )); then
-    ui_box_line '控制台日志  : 只显示错误及更严重的消息（UFW 拦截日志只记入 journal）'
+    ui_box_line '控制台日志    : 只显示错误及以上（UFW 拦截日志只记入 journal）'
   else
-    ui_box_kv '控制台日志  : ' "实际级别 $printk_level" true
+    ui_box_kv '控制台日志    : ' "实际级别 $printk_level" true
   fi
   ui_box_kv 'SmartDNS      : ' "$smartdns_ver" "$smartdns_warn"
   ui_box_line "SmartDNS 模式 : $smartdns_mode"

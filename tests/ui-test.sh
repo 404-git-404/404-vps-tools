@@ -59,6 +59,7 @@ check_uniform_width() {
   NETWORK_STACK='dual'
   SMARTDNS_TRANSPORT='h2'
   SAFE_CLEANUP_RESULT='已完成'
+  UI_WIDTH=72
   print_report
 ) >"$work/non-tty.out" 2>"$work/non-tty.err"
 
@@ -66,7 +67,9 @@ if has_escape "$work/non-tty.out"; then fail 'non-TTY stdout contained ANSI esca
 if has_escape "$work/non-tty.err"; then fail 'non-TTY stderr contained ANSI escapes'; fi
 grep -Fxq '[INFO] info line' "$work/non-tty.out" || fail 'log prefix broken on non-TTY'
 grep -Fxq '[WARN] warn line' "$work/non-tty.err" || fail 'warn prefix broken on non-TTY'
-grep -Fq '控制台日志  : 只显示错误及更严重的消息（UFW 拦截日志只记入 journal）' "$work/non-tty.out" || fail 'missing console logging report'
+printk_row=$(grep -E '^│ 控制台日志    : 只显示错误及以上（UFW 拦截日志只记入 journal） +│$' "$work/non-tty.out") || fail 'console logging report must fit on one row at width 72'
+ufw_row=$(grep -F 'UFW           : Status: active' "$work/non-tty.out")
+[[ "$(LC_ALL=C.UTF-8 wc -L <<<"${printk_row%%:*}")" == "$(LC_ALL=C.UTF-8 wc -L <<<"${ufw_row%%:*}")" ]] || fail 'console logging and UFW colons must align'
 # Audit headings: a title row with the count, then an indented description row (no brackets, no colon).
 grep -Eq '^│ A 建议删除（1 项） +│$' "$work/non-tty.out" || fail 'A audit heading row wrong'
 grep -Eq '^│   这些是登录钥匙或商家助手；确认不需要再处理，默认保留。 +│$' "$work/non-tty.out" || fail 'A audit description row wrong'
@@ -286,13 +289,13 @@ PROBE
       [[ "$ufw_row" == *$'\033[33m'* ]] || fail "UFW row not yellow for [$ufw_out]"
     fi
   done
-  for printk_level in 3 7 unknown; do
+  for printk_level in 3 4 5 7 unknown; do
     PRINTK_LEVEL=$printk_level UFW_OUT='Status: active' env -u NO_COLOR TERM=xterm-256color script -qec \
       "bash \"$work/report-probe.sh\"" /dev/null >"$work/pty-printk.out"
-    printk_row=$(grep -F '控制台日志  :' "$work/pty-printk.out")
+    printk_row=$(grep -F '控制台日志    :' "$work/pty-printk.out")
     case "$printk_level" in
-      3) [[ "$printk_row" == *'只显示错误及更严重的消息'* && "$printk_row" != *$'\033[33m'* ]] || fail 'printk level 3 should be normal' ;;
-      7) [[ "$printk_row" == *$'\033[33m实际级别 7'* ]] || fail 'unexpected printk level was not shown in yellow' ;;
+      3|4) [[ "$printk_row" == *'只显示错误及以上'* && "$printk_row" != *$'\033[33m'* ]] || fail "printk level $printk_level should be normal" ;;
+      5|7) [[ "$printk_row" == *$'\033[33m实际级别 '"$printk_level"* ]] || fail "printk level $printk_level was not shown in yellow" ;;
       unknown) [[ "$printk_row" == *$'\033[33m未知'* ]] || fail 'unreadable printk level was not shown as unknown in yellow' ;;
     esac
   done

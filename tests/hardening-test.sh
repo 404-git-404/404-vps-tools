@@ -414,6 +414,11 @@ printf 'auto eth0\niface eth0 inet dhcp\n' >"$root/etc/network/interfaces"
 echo '# cloud.cfg' >"$root/etc/cloud/cloud.cfg"
 printf '%s\n%s\n' "$current" "$other" >"$file"
 rm "$TRUSTED_KEYS_STATE"
+(
+  AUDIT_APT_SOURCES=$(audit_apt_policy)
+  audit_debian_package official || fail 'standalone audit rejected official Debian origin at priority 1001'
+  if audit_debian_package external; then fail 'standalone audit accepted non-official origin'; fi
+)
 collect_security_audit
 print_security_audit full >"$work/positive"
 (
@@ -512,11 +517,15 @@ audit_debian_package official || fail 'seven-space Debian origin at priority 100
     printf '%s\n' "${*:6}" >>"$work/apt-call-count"
     if (( $# == 8 )) && [[ "$7" == extra-501 && "$8" == extra-502 ]]; then
       case "$batch_failure" in
-        exit) return 1 ;;
+        exit) fixture_apt-cache "$@"; return 1 ;;
         unparseable) printf 'Unexpected policy output\n'; return 0 ;;
       esac
     fi
-    fixture_apt-cache "$@"
+    if (( $# == 306 )); then
+      fixture_apt-cache "$@" | awk '{print} /^  Version table:$/ {printf "%180s\n", ""}' | tee "$work/large-policy"
+    else
+      fixture_apt-cache "$@"
+    fi
   }
   readlink() {
     if [[ "$2" == "$root/proc/324/exe" ]]; then echo /usr/lib/libmulti-fixture; else command readlink "$@"; fi
@@ -530,7 +539,9 @@ audit_debian_package official || fail 'seven-space Debian origin at priority 100
   : >"$work/apt-call-count"
   : >"$work/dpkg-query-count"
   batch_failure=none
-  collect_security_audit
+  TMPDIR="$work/missing-audit-tmp" collect_security_audit 2>"$work/large-audit.err"
+  (( $(wc -c <"$work/large-policy") > 65536 )) || fail 'batch policy fixture must exceed 64 KiB'
+  if grep -Fq 'cannot create temp file' "$work/large-audit.err"; then fail 'large batch tried to create a temporary file'; fi
   apt_calls=$(wc -l <"$work/apt-call-count")
   version_queries=$(grep -c '^-W ' "$work/dpkg-query-count")
   [[ "$apt_calls" == 3 ]] || fail "300 packages plus a cache miss made $apt_calls apt-cache calls, expected 3"
@@ -669,6 +680,7 @@ snapshot() { find "$root" -printf '%P %y %m %U %G %s %T@ %l\n'; find "$root" -ty
   }
   ss() {
     printf 'udp UNCONN 0 0 %s 0.0.0.0:* users:(("smartdns",pid=323,fd=3))\n' "$smartdns_address"
+    printf 'tcp LISTEN 0 128 %s 0.0.0.0:* users:(("smartdns",pid=323,fd=4))\n' "$smartdns_address"
   }
   pin="$root$SMARTDNS_APT_PIN"
   mkdir -p "${pin%/*}"
@@ -681,8 +693,9 @@ snapshot() { find "$root" -printf '%P %y %m %U %G %s %T@ %l\n'; find "$root" -ty
 
   for smartdns_address in 0.0.0.0:53 '[::]:53' 127.0.0.1:5353; do
     collect_security_audit
-    [[ ${#AUDIT_FINDINGS[@]} == 1 ]] || fail "unexpected findings for SmartDNS on $smartdns_address"
-    has_finding $'^B\tport\t323\t' || fail "missing port finding for SmartDNS on $smartdns_address"
+    [[ ${#AUDIT_FINDINGS[@]} == 2 ]] || fail "unexpected findings for SmartDNS on $smartdns_address"
+    has_finding $'^B\tport\t323\tudp UNCONN' || fail "missing UDP finding for SmartDNS on $smartdns_address"
+    has_finding $'^B\tport\t323\ttcp LISTEN' || fail "missing TCP finding for SmartDNS on $smartdns_address"
   done
   smartdns_address=127.0.0.1:53
 
