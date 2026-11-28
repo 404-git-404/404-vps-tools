@@ -148,6 +148,14 @@ jobs:
           test ! -e scripts/update-smartdns.sh
           bash debian-init.sh --help
 
+      - name: Remove Microsoft APT sources from the runner
+        run: |
+          for source in /etc/apt/sources.list.d/*; do
+            if [[ -f "$source" ]] && grep -Fqs -- 'packages.microsoft.com' "$source"; then
+              sudo rm -f -- "$source"
+            fi
+          done
+
       - name: Install ShellCheck, jq, and mawk
         run: |
           sudo apt-get update

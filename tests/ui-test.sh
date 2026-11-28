@@ -52,13 +52,14 @@ check_uniform_width() {
   ufw() { echo 'Status: active'; }
   smartdns() { echo 'smartdns fixture'; }
   sing-box() { echo 'sing-box fixture'; }
-  sysctl() { echo 'bbr'; }
+  sysctl() { if [[ "$2" == kernel.printk ]]; then printf '4\t4\t1\t7\n'; else echo bbr; fi; }
   security_updates_enabled() { return 1; }
   BOOT_REPORT=$'ssh.service: enabled / active \n'
   BACKUP_DIR='/root/vps-init-backups/fixture'
   NETWORK_STACK='dual'
   SMARTDNS_TRANSPORT='h2'
   SAFE_CLEANUP_RESULT='已完成'
+  UI_WIDTH=72
   print_report
 ) >"$work/non-tty.out" 2>"$work/non-tty.err"
 
@@ -66,6 +67,9 @@ if has_escape "$work/non-tty.out"; then fail 'non-TTY stdout contained ANSI esca
 if has_escape "$work/non-tty.err"; then fail 'non-TTY stderr contained ANSI escapes'; fi
 grep -Fxq '[INFO] info line' "$work/non-tty.out" || fail 'log prefix broken on non-TTY'
 grep -Fxq '[WARN] warn line' "$work/non-tty.err" || fail 'warn prefix broken on non-TTY'
+printk_row=$(grep -E '^│ 控制台日志    : 只显示错误及以上（UFW 拦截日志只记入 journal） +│$' "$work/non-tty.out") || fail 'console logging report must fit on one row at width 72'
+ufw_row=$(grep -F 'UFW           : Status: active' "$work/non-tty.out")
+[[ "$(LC_ALL=C.UTF-8 wc -L <<<"${printk_row%%:*}")" == "$(LC_ALL=C.UTF-8 wc -L <<<"${ufw_row%%:*}")" ]] || fail 'console logging and UFW colons must align'
 # Audit headings: a title row with the count, then an indented description row (no brackets, no colon).
 grep -Eq '^│ A 建议删除（1 项） +│$' "$work/non-tty.out" || fail 'A audit heading row wrong'
 grep -Eq '^│   这些是登录钥匙或商家助手；确认不需要再处理，默认保留。 +│$' "$work/non-tty.out" || fail 'A audit description row wrong'
@@ -262,7 +266,14 @@ fail2ban_package_installed() { return 0; }
 ufw() { printf '%s\n' "\$UFW_OUT"; echo 'second line'; }
 smartdns() { echo 'smartdns fixture'; }
 sing-box() { echo 'sing-box fixture'; }
-sysctl() { echo bbr; }
+sysctl() {
+  if [[ "\$2" == kernel.printk ]]; then
+    [[ "\${PRINTK_LEVEL:-4}" != unknown ]] || return 1
+    printf '%s\t4\t1\t7\n' "\${PRINTK_LEVEL:-4}"
+  else
+    echo bbr
+  fi
+}
 security_updates_enabled() { return 0; }
 BOOT_REPORT=''
 BACKUP_DIR=/fixture NETWORK_STACK=dual NETWORK_REQUEST=auto SMARTDNS_TRANSPORT=h2 SAFE_CLEANUP_RESULT=ok
@@ -277,6 +288,16 @@ PROBE
     else
       [[ "$ufw_row" == *$'\033[33m'* ]] || fail "UFW row not yellow for [$ufw_out]"
     fi
+  done
+  for printk_level in 3 4 5 7 unknown; do
+    PRINTK_LEVEL=$printk_level UFW_OUT='Status: active' env -u NO_COLOR TERM=xterm-256color script -qec \
+      "bash \"$work/report-probe.sh\"" /dev/null >"$work/pty-printk.out"
+    printk_row=$(grep -F '控制台日志    :' "$work/pty-printk.out")
+    case "$printk_level" in
+      3|4) [[ "$printk_row" == *'只显示错误及以上'* && "$printk_row" != *$'\033[33m'* ]] || fail "printk level $printk_level should be normal" ;;
+      5|7) [[ "$printk_row" == *$'\033[33m实际级别 '"$printk_level"* ]] || fail "printk level $printk_level was not shown in yellow" ;;
+      unknown) [[ "$printk_row" == *$'\033[33m未知'* ]] || fail 'unreadable printk level was not shown as unknown in yellow' ;;
+    esac
   done
 
   # In a PTY the audit heading keeps its level color and the description row is dim.
