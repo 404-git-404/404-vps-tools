@@ -539,8 +539,8 @@ audit_debian_package official || fail 'seven-space Debian origin at priority 100
   grep -Fxq -- '-W -f=${Version} -- official' "$work/dpkg-query-count" || fail 'uncached owner version was not queried separately'
   grep -Fxq -- '-- official' "$work/apt-call-count" || fail 'uncached listener owner was not queried separately'
   if has_finding $'^B\tport\t'; then fail 'official owner found via fallback was reported'; fi
-  [[ "${#AUDIT_FINDINGS[@]}" == 1 ]] && has_finding $'^B\tpackage\tlibmulti:i386\t' ||
-    fail 'native and foreign apt-cache headings were not kept distinct'
+  [[ "${#AUDIT_FINDINGS[@]}" == 1 ]] || fail 'multiarch fixture produced unexpected findings'
+  has_finding $'^B\tpackage\tlibmulti:i386\t' || fail 'native and foreign apt-cache headings were not kept distinct'
   expected_findings=$(printf '%s\n' "${AUDIT_FINDINGS[@]}")
   for batch_failure in exit unparseable; do
     : >"$work/apt-call-count"
@@ -681,7 +681,8 @@ snapshot() { find "$root" -printf '%P %y %m %U %G %s %T@ %l\n'; find "$root" -ty
 
   for smartdns_address in 0.0.0.0:53 '[::]:53' 127.0.0.1:5353; do
     collect_security_audit
-    [[ ${#AUDIT_FINDINGS[@]} == 1 ]] && has_finding $'^B\tport\t323\t' || fail "wrong findings for SmartDNS on $smartdns_address"
+    [[ ${#AUDIT_FINDINGS[@]} == 1 ]] || fail "unexpected findings for SmartDNS on $smartdns_address"
+    has_finding $'^B\tport\t323\t' || fail "missing port finding for SmartDNS on $smartdns_address"
   done
   smartdns_address=127.0.0.1:53
 
