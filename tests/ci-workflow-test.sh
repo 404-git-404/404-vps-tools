@@ -79,6 +79,39 @@ export CI_FETCH_ATTEMPTS=3 CI_FETCH_MAX_TIME=20
 # A made-up credential must be used only for API requests and never printed.
 export GH_TOKEN='test-only-not-a-real-credential'
 fail() { echo "FAIL: $*" >&2; exit 1; }
+
+shopt -s nullglob
+uses_key="^[[:space:]]*(-[[:space:]]+)?['\"]?uses['\"]?[[:space:]]*:[[:space:]]*(.*)$"
+uses_value="^['\"]?([^[:space:]'\"#]+)['\"]?([[:space:]]+#.*|[[:space:]]*)$"
+for workflow in "$repo"/.github/workflows/*.{yml,yaml}; do
+  while IFS= read -r line; do
+    [[ "$line" =~ $uses_key ]] || continue
+    value=${BASH_REMATCH[2]}
+    [[ "$value" =~ $uses_value ]] || fail "$workflow: invalid uses entry: $line"
+    target=${BASH_REMATCH[1]}
+    if [[ "$target" != ./* && ! "$target" =~ @([0-9a-f]{40})$ ]]; then
+      fail "$workflow: external uses entry is not pinned to a full commit SHA: $target"
+    fi
+  done <"$workflow"
+done
+shopt -u nullglob
+
+publish_job=$(awk '/^  publish:$/ { publish=1; next } publish && /^  [^ ]/ { exit } publish' \
+  "$repo/.github/workflows/release.yml")
+expected_publish_checkout=$(cat <<'YAML'
+      - name: Check out the tagged commit
+        # actions/checkout v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          ref: ${{ github.sha }}
+
+      - name: Checked-out commit is the verified commit
+        run: test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+YAML
+)
+[[ "$publish_job" == *"$expected_publish_checkout"$'\n'* ]] || fail 'publish must check out github.sha and verify HEAD before packaging'
+echo 'PASS: workflow action SHA pins and verified release checkout'
+
 for scenario in ok transient network timeout bad-certificate local-io primary secondary forbidden redirect-forbidden unauthenticated throttled long-wait permanent missing allow-missing empty anonymous; do
   HTTP_FIXTURE_SCENARIO=$scenario
   args=(--github-api)
