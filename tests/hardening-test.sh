@@ -527,6 +527,13 @@ audit_debian_package official || fail 'seven-space Debian origin at priority 100
       fixture_apt-cache "$@"
     fi
   }
+  read() {
+    # Bash may fall back to /tmp even when TMPDIR is unavailable.
+    if [[ "${FUNCNAME[1]:-}" == audit_preload_apt_policies && ! -e "$work/batch-policy-input" ]]; then
+      command readlink "/proc/$BASHPID/fd/0" >"$work/batch-policy-input"
+    fi
+    builtin read -r "$@"
+  }
   readlink() {
     if [[ "$2" == "$root/proc/324/exe" ]]; then echo /usr/lib/libmulti-fixture; else command readlink "$@"; fi
   }
@@ -542,6 +549,7 @@ audit_debian_package official || fail 'seven-space Debian origin at priority 100
   TMPDIR="$work/missing-audit-tmp" collect_security_audit 2>"$work/large-audit.err"
   (( $(wc -c <"$work/large-policy") > 65536 )) || fail 'batch policy fixture must exceed 64 KiB'
   if grep -Fq 'cannot create temp file' "$work/large-audit.err"; then fail 'large batch tried to create a temporary file'; fi
+  [[ "$(<"$work/batch-policy-input")" == pipe:\[*\] ]] || fail 'large batch policy was not read from a pipe'
   apt_calls=$(wc -l <"$work/apt-call-count")
   version_queries=$(grep -c '^-W ' "$work/dpkg-query-count")
   [[ "$apt_calls" == 3 ]] || fail "300 packages plus a cache miss made $apt_calls apt-cache calls, expected 3"
