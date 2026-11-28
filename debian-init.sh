@@ -3841,19 +3841,38 @@ fail2ban_reality_available() {
   logs=$(journalctl -u sing-box.service -b --no-pager -o cat -n 500) || return 1
   grep -Eq 'inbound/vless\[[^]]+\].*REALITY:' <<<"$logs" && return 0
   grep -Eq 'inbound/vless\[[^]]+\]' <<<"$logs" || return 1
-  python3 - "$SINGBOX_CONFIG" <<'PY'
+  python3 - "${SINGBOX_CONFIG%/*}" <<'PY'
 import json
+import os
 import sys
 
 try:
-    with open(sys.argv[1]) as config:
-        inbounds = json.load(config).get("inbounds", [])
-    sys.exit(not any(
-        inbound.get("type") == "vless"
-        and inbound.get("tls", {}).get("enabled") is True
-        and inbound["tls"].get("reality", {}).get("enabled") is True
-        for inbound in inbounds
-    ))
+    config_dir = sys.argv[1]
+    paths = (os.path.join(config_dir, name) for name in os.listdir(config_dir) if name.endswith(".json"))
+    config_files = sorted(path for path in paths if os.path.isfile(path))
+    if not config_files:
+        sys.exit(1)
+
+    inbounds = []
+    for path in config_files:
+        with open(path, encoding="utf-8") as config:
+            document = json.load(config)
+        if not isinstance(document, dict):
+            sys.exit(1)
+        entries = document.get("inbounds", [])
+        if not isinstance(entries, list) or not all(isinstance(entry, dict) for entry in entries):
+            sys.exit(1)
+        inbounds.extend(entries)
+
+    found = False
+    for inbound in inbounds:
+        if (
+            inbound.get("type") == "vless"
+            and inbound.get("tls", {}).get("enabled") is True
+            and inbound["tls"].get("reality", {}).get("enabled") is True
+        ):
+            found = True
+    sys.exit(0 if found else 1)
 except (OSError, ValueError, AttributeError, TypeError):
     sys.exit(1)
 PY

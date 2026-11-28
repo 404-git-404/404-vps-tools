@@ -20,7 +20,8 @@ jobs:
     timeout-minutes: 15
     steps:
       - name: Check out repository
-        uses: actions/checkout@v6
+        # actions/checkout v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
 
       - name: Fetch actual Release asset names and URLs
         env:
@@ -161,7 +162,8 @@ jobs:
         arch: [amd64, arm64]
     steps:
       - name: Check out repository
-        uses: actions/checkout@v6
+        # actions/checkout v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
       - name: Install validation tools
         run: |
           apt-get update
@@ -262,7 +264,8 @@ jobs:
             version: 40+dfsg-1
             repeat: 'true'
     steps:
-      - uses: actions/checkout@v6
+      # actions/checkout v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
       - name: Start Debian with systemd
         env:
           DEBIAN_VERSION: ${{ matrix.debian }}
@@ -659,7 +662,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v6
+      # actions/checkout v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
       - name: Require every package and integration job to succeed
         env:
           NEEDS_JSON: ${{ toJSON(needs) }}

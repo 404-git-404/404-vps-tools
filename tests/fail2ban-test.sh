@@ -127,6 +127,80 @@ MATRIX
   exit 0
 fi
 
+(
+  sed "s|^readonly SINGBOX_CONFIG=.*|readonly SINGBOX_CONFIG=\"\$config_dir/config.json\"|" \
+    "$TEST_DIR/../debian-init.sh" >"$TEST_TMP/reality-installer"
+  reality_config='{"inbounds":[{"type":"vless","tls":{"enabled":true,"reality":{"enabled":true}}}]}'
+  other_config='{"inbounds":[{"type":"vless","tls":{"enabled":true,"reality":{"enabled":false}}}]}'
+  for scenario in single split no-reality malformed array non-list non-object bad-tls non-utf8 no-json missing-dir ignore-backup symlink dangling-symlink; do
+    config_dir="$TEST_TMP/reality-$scenario"
+    mkdir "$config_dir"
+    expected=0
+    case "$scenario" in
+      single) printf '%s\n' "$reality_config" >"$config_dir/config.json" ;;
+      split)
+        printf '%s\n' "$reality_config" >"$config_dir/10-in.json"
+        echo '{}' >"$config_dir/config.json"
+        ;;
+      no-reality)
+        printf '%s\n' "$other_config" >"$config_dir/10-in.json"
+        printf '%s\n' "$other_config" >"$config_dir/config.json"
+        expected=1
+        ;;
+      malformed|array|non-list|non-object|bad-tls|non-utf8)
+        printf '%s\n' "$reality_config" >"$config_dir/10-in.json"
+        case "$scenario" in
+          malformed) echo '{' ;;
+          array) echo '[]' ;;
+          non-list) echo '{"inbounds":{}}' ;;
+          non-object) echo '{"inbounds":[123]}' ;;
+          bad-tls) echo '{"inbounds":[{"type":"vless","tls":null}]}' ;;
+          non-utf8) printf '\377\376' ;;
+        esac >"$config_dir/config.json"
+        expected=1
+        ;;
+      no-json)
+        mkdir "$config_dir/directory.json"
+        ln -s missing.data "$config_dir/dangling.json"
+        expected=1
+        ;;
+      missing-dir)
+        rmdir "$config_dir"
+        expected=1
+        ;;
+      ignore-backup)
+        printf '%s\n' "$reality_config" >"$config_dir/config.json"
+        echo '{' >"$config_dir/config.json.bak"
+        ;;
+      symlink)
+        printf '%s\n' "$reality_config" >"$config_dir/config.data"
+        ln -s config.data "$config_dir/10-in.json"
+        ;;
+      dangling-symlink)
+        ln -s missing.data "$config_dir/00-dangling.json"
+        printf '%s\n' "$reality_config" >"$config_dir/config.json"
+        ;;
+    esac
+    result=0
+    bash -s -- "$TEST_TMP/reality-installer" "$config_dir" <<'BASH' || result=$?
+set -Eeuo pipefail
+config_dir=$2
+source "$1"
+systemctl() {
+  local IFS=' '
+  [[ "$*" == 'is-active --quiet sing-box.service' ]]
+}
+journalctl() {
+  local IFS=' '
+  [[ "$*" == '-u sing-box.service -b --no-pager -o cat -n 500' ]] || return 1
+  echo 'inbound/vless[test]: started'
+}
+fail2ban_reality_available || exit $?
+BASH
+    [[ "$result" == "$expected" ]] || fail "REALITY config directory ($scenario): expected $expected, got $result"
+  done
+)
+
 for scenario in fresh repeat reality config-error action-error no-backend; do
   (
     FAIL2BAN_DIR="$TEST_TMP/$scenario/etc"
