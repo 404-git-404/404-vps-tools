@@ -61,6 +61,7 @@ quick_fixture() {
   configure_system_dns() { DNS_TX=false; }
   configure_ssh() { :; }
   configure_ufw() { :; }
+  configure_console_logging() { :; }
   configure_cf8443() { :; }
   remove_legacy_network_stack_state() { :; }
   run_safe_cleanup() { :; }

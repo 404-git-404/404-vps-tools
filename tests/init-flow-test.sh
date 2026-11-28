@@ -9,6 +9,7 @@ work=$(mktemp -d)
 # Policy files the flow may read or write stay inside the work directory.
 sed -e "s|/dev/tty|$work/tty|g" \
   -e "s|^readonly NETWORK_SYSCTL=.*|readonly NETWORK_SYSCTL='$work/network.conf'|" \
+  -e "s|^readonly PRINTK_SYSCTL=.*|readonly PRINTK_SYSCTL='$work/sysctl.d/99-vps-init-printk.conf'|" \
   -e "s|^readonly LEGACY_IPV6_SYSCTL=.*|readonly LEGACY_IPV6_SYSCTL='$work/legacy.conf'|" \
   -e "s|^readonly LEGACY_NETWORK_UNIT=.*|readonly LEGACY_NETWORK_UNIT='$work/legacy.service'|" \
   -e "s|^readonly IPV4_POLICY_HELPER=.*|readonly IPV4_POLICY_HELPER='$work/ipv4-helper'|" \
@@ -156,6 +157,7 @@ for scenario in port22 default custom-port preserve reuse missing-keygen existin
     configure_system_dns() { execute dns; DNS_TX=false; }
     configure_ssh() { if [[ "$PRESERVE_SSH" == false ]]; then execute ssh; fi; }
     configure_ufw() { if [[ "$PRESERVE_SSH" == false ]]; then execute ufw; fi; }
+    configure_console_logging() { execute printk; }
     configure_cf8443() { :; }
     configure_fail2ban() { execute fail2ban; }
     remove_legacy_network_stack_state() { execute legacy-state; }
@@ -200,18 +202,48 @@ for scenario in port22 default custom-port preserve reuse missing-keygen existin
       esac ;;
   esac
   if [[ "$scenario" == custom-base || "$scenario" == base ]]; then
-    if grep -Eq '^execute (ssh|ufw|key|network|smartdns|singbox|cleanup|legacy-state)$' "$trace"; then fail 'base-only changed components'; fi
+    if grep -Eq '^execute (ssh|ufw|printk|key|network|smartdns|singbox|cleanup|legacy-state)$' "$trace"; then fail 'base-only changed components'; fi
   fi
   case "$scenario" in
     base|custom-base|multi-cancel|ipv6-guard|cancel) ;;
     *)
       grep -Fxq 'execute cleanup' "$trace"
+      grep -Fxq 'execute printk' "$trace"
+      if [[ "$scenario" != preserve ]]; then
+        awk '/^execute ufw$/ {getline; found=($0 == "execute printk")} END {exit !found}' "$trace" || fail 'printk must follow UFW'
+      fi
       [[ "$(tail -n 4 "$trace")" == $'execute legacy-state\nexecute cleanup\nexecute boot-check\nexecute report' ]] || fail 'legacy-state, cleanup, boot check, report order'
       ;;
   esac
   if grep -Fq 'prompt 是否卸载 QEMU Guest Agent？' "$trace"; then fail "$scenario asked about QGA"; fi
   if grep -Fxq 'execute remove-qemu-agent' "$trace"; then fail "$scenario removed QGA"; fi
 done
+
+(
+  BACKUP_DIR="$work/backup-printk"
+  sysctl() {
+    [[ "$#" == 3 && "$1" == -q && "$2" == -p && "$3" == "$PRINTK_SYSCTL" ]] || fail 'unexpected printk sysctl command'
+    printf 'applied\n' >>"$work/printk-applies"
+    if [[ ${sysctl_fails:-false} == true ]]; then echo 'fixture permission denied' >&2; return 1; fi
+  }
+  expected=$'# 由 404-vps-tools 写入：UFW 拦截日志保留在 journal，避免刷屏控制台。\nkernel.printk = 4 4 1 7'
+  configure_console_logging
+  cmp "$PRINTK_SYSCTL" <(printf '%s\n' "$expected")
+  [[ "$(stat -c %a "$PRINTK_SYSCTL")" == 644 ]]
+  [[ ! -e "$BACKUP_DIR" ]]
+  touch -d '2000-01-01' "$PRINTK_SYSCTL"
+  before=$(stat -c '%i %y' "$PRINTK_SYSCTL")
+  configure_console_logging
+  [[ "$(stat -c '%i %y' "$PRINTK_SYSCTL")" == "$before" ]]
+  [[ "$(wc -l <"$work/printk-applies")" == 1 && ! -e "$BACKUP_DIR" ]]
+
+  printf 'kernel.printk = 7 4 1 7\n' >"$PRINTK_SYSCTL"
+  sysctl_fails=true configure_console_logging 2>"$work/printk.warn"
+  cmp "$PRINTK_SYSCTL" <(printf '%s\n' "$expected")
+  grep -Fxq 'kernel.printk = 7 4 1 7' "$BACKUP_DIR/files$PRINTK_SYSCTL"
+  grep -Fxq '[WARN] 控制台日志级别未能生效：fixture permission denied' "$work/printk.warn"
+  [[ "$(wc -l <"$work/printk-applies")" == 2 ]]
+)
 
 for scenario in ipv6-restore ipv6-keep; do
   grep -Fq '重启后 IPv6：将被现有配置关闭' "$work/$scenario.output" || fail "$scenario summary lacks the reboot-state line"

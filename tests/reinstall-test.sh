@@ -355,12 +355,15 @@ grep -Fq '主机名确认通过' "$work/last.out" || fail 'confirmation with the
 
 t_valid_hostname_summary() {
   use_host
+  UI_WIDTH=200
+  REINSTALL_V6_MODE=none
   REINSTALL_HOST='VPS-Test'
   reinstall_pick_new_hostname
   reinstall_print_summary
 }
 expect_ok 'valid hostname summary' t_valid_hostname_summary
 grep -Fq '主机名：vps-test' "$work/last.out" || fail 'lowercased hostname not shown'
+grep -Fq 'IPv6：不配置（当前系统没有 IPv6 默认路由；若面板分配了 IPv6，重装后需手动添加）' "$work/last.out" || fail 'missing IPv6 no-default-route guidance'
 if grep -Fq '不合法' "$work/last.out"; then fail 'valid hostname reported as invalid'; fi
 if grep -Fq '将先安装 gpgv' "$work/last.out"; then fail 'gpgv line shown although gpgv is present'; fi
 
@@ -1181,6 +1184,8 @@ t_drain() {
   if reinstall_drain_tty; then fail 'blank lines reported as more pasted lines'; fi
   : >"$work/tty"
   if reinstall_drain_tty; then fail 'nothing buffered but reported'; fi
+  printf '%262144s' '' >"$work/tty"
+  reinstall_drain_tty || fail 'exactly 256 KiB did not hit the paste limit'
 }
 expect_ok 'drain buffered terminal input' t_drain
 : >"$work/tty"
@@ -1351,6 +1356,11 @@ grep -Fq '检测到多行内容，请只粘贴一行公钥' "$work/pty-private.o
 if grep -Fq '公钥无效' "$work/pty-private.out.txt"; then fail 'PTY: private key lines leaked into the next paste prompt'; fi
 grep -Fq "KEY0=[$paste_pub] COUNT=1" "$work/pty-private.out.txt" || { cat "$work/pty-private.out.txt" >&2; fail 'PTY: key pasted after the private key not taken as is'; }
 grep -Fq 'STTY=same' "$work/pty-private.out.txt" || fail 'PTY paste: terminal mode not restored'
+pty_run "$work/pty-paste.sh" "$work/pty-partial.out" \
+  "$second_pub\\n"'partial second line' @3 "$paste_pub\\n" @3 'y\n'
+grep -Fxq '[WARN] 检测到多行内容，请只粘贴一行公钥' "$work/pty-partial.out.txt" ||
+  { cat "$work/pty-partial.out.txt" >&2; fail 'PTY warning did not start on a new line after a partial second line'; }
+grep -Fq "KEY0=[$paste_pub] COUNT=1" "$work/pty-partial.out.txt" || fail 'PTY partial paste polluted the next prompt'
 
 # ---- test switch for the key file -----------------------------------------------
 t_keys_file_alone() { unset VPS_INIT_REINSTALL_TEST; VPS_INIT_REINSTALL_KEYS_FILE="$work/ak-none"; reinstall_parse_test_mode; }

@@ -28,6 +28,7 @@ readonly IPV4_POLICY_TIMER='/etc/systemd/system/vps-init-ipv4-only.timer'
 readonly IPV4_POLICY_IFUP='/etc/network/if-pre-up.d/vps-init-ipv4-only'
 readonly -a IPV4_POLICY_FILES=("$IPV4_POLICY_HELPER" "$IPV4_POLICY_SERVICE" "$IPV4_POLICY_TIMER" "$IPV4_POLICY_IFUP")
 readonly TCP_SYSCTL='/etc/sysctl.d/99-vps-init-tcp.conf'
+readonly PRINTK_SYSCTL='/etc/sysctl.d/99-vps-init-printk.conf'
 readonly BBR_MODULES='/etc/modules-load.d/vps-init-bbr.conf'
 readonly TRUSTED_KEYS_STATE='/var/lib/404-vps-tools/trusted-key-fingerprints'
 readonly LEGACY_NETWORK_STACK_STATE='/var/lib/404-vps-tools/network-stack'
@@ -39,6 +40,7 @@ HARDENING_KEY_DELETED=false
 HARDENING_MAIL_PURGED=false
 AUDIT_SESSION_KEY=''
 AUDIT_APT_SOURCES=''
+AUDIT_DEBIAN_SOURCES=''
 readonly SMARTDNS_CONF='/etc/smartdns/smartdns.conf'
 readonly SMARTDNS_CACHE='/var/cache/smartdns/smartdns.cache'
 readonly SMARTDNS_APT_PIN='/etc/apt/preferences.d/vps-init-smartdns'
@@ -580,13 +582,13 @@ ensure_dir() {
 }
 
 make_mutable() {
-  local path=$1 out flags
+  local path=$1 failure=${2:-fatal} out flags
   [[ -e "$path" && ! -L "$path" ]] || return 0
   if [[ -n "$BACKUP_DIR" ]]; then
     local backup="$BACKUP_DIR/files$path"
     if [[ ! -e "$backup" && ! -L "$backup" ]]; then
-      install -d -m 0700 "$(dirname "$backup")"
-      cp -a -- "$path" "$backup"
+      install -d -m 0700 "$(dirname "$backup")" || return 1
+      cp -a -- "$path" "$backup" || return 1
     fi
   fi
   command -v lsattr >/dev/null 2>&1 || return 0
@@ -598,7 +600,10 @@ make_mutable() {
   fi
   if [[ "$flags" == *i* || "$flags" == *a* ]]; then
     log "临时解除文件属性 i/a：$path"
-    chattr -i -a -- "$path" || die "无法解除 $path 的 immutable/append-only 属性。"
+    if ! chattr -i -a -- "$path"; then
+      [[ "$failure" == fatal ]] || return 1
+      die "无法解除 $path 的 immutable/append-only 属性。"
+    fi
   fi
 }
 
@@ -3749,6 +3754,24 @@ WantedBy=timers.target
 EOF
 }
 
+configure_console_logging() {
+  local content output
+  content=$'# 由 404-vps-tools 写入：UFW 拦截日志保留在 journal，避免刷屏控制台。\nkernel.printk = 4 4 1 7'
+  if [[ -L "$PRINTK_SYSCTL" || ( -e "$PRINTK_SYSCTL" && ! -f "$PRINTK_SYSCTL" ) ]]; then
+    warn "$PRINTK_SYSCTL 不是普通文件，已跳过控制台日志配置。"
+    return 0
+  fi
+  if cmp -s -- "$PRINTK_SYSCTL" <(printf '%s\n' "$content"); then return 0; fi
+  if ! ensure_dir "${PRINTK_SYSCTL%/*}" || ! make_mutable "$PRINTK_SYSCTL" nonfatal ||
+    ! printf '%s\n' "$content" >"$PRINTK_SYSCTL" || ! chmod 0644 "$PRINTK_SYSCTL"; then
+    warn "无法写入控制台日志配置 $PRINTK_SYSCTL。"
+    return 0
+  fi
+  if ! output=$(sysctl -q -p "$PRINTK_SYSCTL" 2>&1); then
+    warn "控制台日志级别未能生效：$output"
+  fi
+}
+
 configure_cf8443() {
   CURRENT_STEP='配置 Cloudflare 8443'
   [[ "$PRESERVE_SSH" == false ]] || return 0
@@ -4191,6 +4214,54 @@ audit_apt_policy() {
   LC_ALL=C apt-cache -o Dir::Cache::pkgcache= -o Dir::Cache::srcpkgcache= policy "$@" 2>/dev/null
 }
 
+audit_preload_apt_policies() {
+  local arch=$1 batch policy line key
+  shift
+  for (( batch = 0; batch < $#; batch += 500 )); do
+    policy=$(audit_apt_policy -- "${@:batch+1:500}") || return 1
+    key=''
+    while IFS= read -r line; do
+      if [[ "$line" =~ ^([a-z0-9][a-z0-9+.-]*(:[a-z0-9-]+)?):$ ]]; then
+        key=${BASH_REMATCH[1]}
+        AUDIT_APT_POLICIES[$key]=''
+      elif [[ -n "$key" ]]; then
+        AUDIT_APT_POLICIES[$key]+="$line"$'\n'
+      fi
+    done <<<"$policy"
+    [[ -n "$key" ]] || return 1
+  done
+  # APT omits the native architecture in its heading, even for e.g. libc6:amd64.
+  [[ -n "$arch" ]] || return 0
+  for key in "${!AUDIT_APT_POLICIES[@]}"; do
+    if [[ "$key" != *:* ]]; then
+      AUDIT_APT_POLICIES[$key:$arch]=${AUDIT_APT_POLICIES[$key]}
+    fi
+  done
+}
+
+audit_read_package_policy() {
+  local package=$1
+  local -n result=$2
+  if [[ ${audit_cache_mode:-off} == batched && -n "${AUDIT_APT_POLICIES[$package]+x}" ]]; then
+    result=${AUDIT_APT_POLICIES[$package]}
+  else
+    result=$(audit_apt_policy -- "$package") || return 1
+    if [[ ${audit_cache_mode:-off} == batched ]]; then AUDIT_APT_POLICIES[$package]=$result; fi
+  fi
+}
+
+audit_read_package_version() {
+  local package=$1
+  local -n result=$2
+  if [[ ${audit_cache_mode:-off} != off && -n "${AUDIT_PACKAGE_VERSIONS[$package]-}" ]]; then
+    result=${AUDIT_PACKAGE_VERSIONS[$package]}
+  else
+    result=$(dpkg-query -W -f='${Version}' -- "$package" 2>/dev/null) || return 1
+    if [[ ${audit_cache_mode:-off} != off ]]; then AUDIT_PACKAGE_VERSIONS[$package]=$result; fi
+  fi
+  [[ -n "$result" ]]
+}
+
 audit_apt_version_sources() {
   printf '%s\n' "$2" | awk -v version="$1" '
     /^[ ]*Version table:[ ]*$/ { in_table=1; selected=0; next }
@@ -4208,15 +4279,10 @@ audit_apt_version_sources() {
 audit_debian_package() {
   # Require the *installed version* to have an official origin in the local APT cache.
   # No network access. Unknown/obsolete versions are intentionally reported for review.
-  local version policy sources
-  version=$(dpkg-query -W -f='${Version}' -- "$1" 2>/dev/null) || return 1
-  [[ -n "$version" ]] || return 1
-  policy=$(audit_apt_policy -- "$1") || return 1
-  sources=$(awk '
-    /^[ ]*[0-9]+ / {source=$0; sub(/^[ ]*[0-9]+ /,"",source)}
-    /release / && /(^|[, ])o=Debian([, ]|$)/ {print source}
-  ' <<<"$AUDIT_APT_SOURCES")
-  audit_apt_version_sources "$version" "$policy" | awk -v sources="$sources" '
+  local version policy
+  audit_read_package_version "$1" version || return 1
+  audit_read_package_policy "$1" policy || return 1
+  audit_apt_version_sources "$version" "$policy" | awk -v sources="$AUDIT_DEBIAN_SOURCES" '
     BEGIN {n=split(sources,s,"\n"); for(i=1;i<=n;i++) official[s[i]]=1}
     {sub(/^[ ]*-?[0-9]+[ ]+/,""); if(official[$0]) ok=1}
     END {exit !ok}'
@@ -4224,9 +4290,8 @@ audit_debian_package() {
 
 audit_singbox_sagernet_origin() {
   local version policy
-  version=$(dpkg-query -W -f='${Version}' -- sing-box 2>/dev/null) || return 1
-  [[ -n "$version" ]] || return 1
-  policy=$(audit_apt_policy -- sing-box) || return 1
+  audit_read_package_version sing-box version || return 1
+  audit_read_package_policy sing-box policy || return 1
   audit_apt_version_sources "$version" "$policy" | awk '
     $2 ~ /^https:\/\/deb\.sagernet\.org\/?$/ { found=1 }
     END { exit !found }
@@ -4246,6 +4311,14 @@ audit_sagernet_repo_matches() {
     LC_ALL=C grep -Fqi -- sagernet.org "$file" 2>/dev/null || status=$?
     [[ "$status" == 1 ]] || return 1
   done
+}
+
+audit_smartdns_tool_origin() {
+  local installed verification pin="$AUDIT_ROOT$SMARTDNS_APT_PIN"
+  installed=$(dpkg-query -W -f='${db:Status-Status}\t${Version}' -- smartdns 2>/dev/null) || return 1
+  [[ "$installed" == $'installed\t'"$SMARTDNS_DEB_VERSION" && -f "$pin" && ! -L "$pin" ]] || return 1
+  verification=$(LC_ALL=C dpkg --verify smartdns 2>/dev/null) || return 1
+  [[ -z "$verification" ]] || awk '$2 != "c" {exit 1}' <<<"$verification"
 }
 
 audit_session_key() {
@@ -4431,7 +4504,7 @@ audit_agent_comm_prefix() {
 }
 
 audit_agents() {
-  local pid comm exe name unit frag exec prefix path kind package status owner seen=$'\n' key
+  local pid comm exe name unit frag exec prefix path kind package owner seen=$'\n' key
   local -a evidence=() units=()
   while IFS=' ' read -r pid comm; do
     [[ "$pid" =~ ^[0-9]+$ ]] || continue
@@ -4458,11 +4531,10 @@ audit_agents() {
       /^ExecStart=/ { if (match($0, /path=[^ ;]+/)) ex = substr($0, RSTART + 5, RLENGTH - 5) }
       END { flush() }' || true)
   fi
-  while IFS=$'\t' read -r package status; do
-    [[ "$status" == installed ]] || continue
+  for package; do
     name=$(audit_agent_name_for "${package%%:*}" || true)
     [[ -z "$name" ]] || evidence+=("$name"$'\t'package$'\t'"$package")
-  done < <(dpkg-query -W -f='${binary:Package}\t${db:Status-Status}\n' 2>/dev/null || true)
+  done
   for prefix in /usr/local /usr/local/share /usr/local/qcloud /opt /usr/sbin /usr/bin /usr/local/sbin /usr/local/bin; do
     for name in "${VENDOR_AGENT_NAMES[@]}"; do
       for path in "$prefix/$name" "$prefix/${name,,}"; do
@@ -4491,8 +4563,32 @@ collect_security_audit() {
   AUDIT_FINDINGS=()
   AUDIT_SESSION_KEY=$(audit_session_key) || AUDIT_SESSION_KEY=''
   AUDIT_APT_SOURCES=$(audit_apt_policy || true)
-  local file package status unit path uid user effective command keys listener pid exe cloud_detail exim4_found=false key_ok=true key_path
-  local -a key_paths=()
+  AUDIT_DEBIAN_SOURCES=$(awk '
+    /^[ ]*[0-9]+ / {source=$0; sub(/^[ ]*[0-9]+ /,"",source)}
+    /release / && /(^|[, ])o=Debian([, ]|$)/ {print source}
+  ' <<<"$AUDIT_APT_SOURCES")
+  local file package status unit path uid user effective command keys listener local_address pid exe cloud_detail exim4_found=false key_ok=true key_path
+  local arch version audit_cache_mode=batched
+  local -a key_paths=() installed_packages=()
+  # The origin helpers share these caches for the lifetime of this audit only.
+  local -A AUDIT_APT_POLICIES=() AUDIT_PACKAGE_VERSIONS=()
+  arch=$(dpkg --print-architecture 2>/dev/null) || arch=''
+  while IFS=$'\t' read -r package status version; do
+    [[ "$status" == installed ]] || continue
+    installed_packages+=("$package")
+    AUDIT_PACKAGE_VERSIONS[$package]=$version
+    if [[ -n "$arch" ]]; then
+      case "$package" in
+        *:"$arch") AUDIT_PACKAGE_VERSIONS[${package%:*}]=$version ;;
+        *:*) ;;
+        *) AUDIT_PACKAGE_VERSIONS[$package:$arch]=$version ;;
+      esac
+    fi
+  done < <(dpkg-query -W -f='${binary:Package}\t${db:Status-Status}\t${Version}\n' 2>/dev/null || true)
+  if ! audit_preload_apt_policies "$arch" "${installed_packages[@]}"; then
+    AUDIT_APT_POLICIES=()
+    audit_cache_mode=per-package
+  fi
   audit_keys
   [[ -n "$AUDIT_SESSION_KEY" ]] || audit_add B keys session '无法确定当前 SSH 公钥，禁止删除任何公钥'
   if audit_cloud_init_present && [[ ! -e "$CLOUD_DISABLED_FLAG" ]]; then
@@ -4505,18 +4601,19 @@ collect_security_audit() {
     fi
   fi
   [[ $(qemu_guest_agent_status) != installed ]] || audit_add A qga qemu-guest-agent '面板通信助手，可复用现有安全卸载流程'
-  audit_agents
-  while IFS=$'\t' read -r package status; do
-    [[ "$status" == installed ]] || continue
+  audit_agents "${installed_packages[@]}"
+  for package in "${installed_packages[@]}"; do
     case "${package%%:*}" in exim4|exim4-*) exim4_found=true ;; esac
     if audit_debian_package "$package"; then continue; fi
     if [[ "$package" == sing-box ]] && audit_singbox_sagernet_origin; then
       if audit_sagernet_repo_matches; then continue; fi
       audit_add B package "$package" 'sing-box 来自 deb.sagernet.org，但源配置或密钥文件不是本工具写入的版本，请核实'
+    elif [[ "$package" == smartdns ]] && audit_smartdns_tool_origin; then
+      continue
     else
       audit_add B package "$package" '本地缓存不能证明已安装版本来自 Debian 官方源（包括缓存缺失或旧版本），请核实'
     fi
-  done < <(dpkg-query -W -f='${binary:Package}\t${db:Status-Status}\n' 2>/dev/null || true)
+  done
   if [[ "$exim4_found" == true ]]; then
     audit_add A mail exim4 'Debian 邮件服务，VPS 上一般用不上；卸载后 cron 任务的输出邮件将无法投递。先模拟 purge，连带删除其他包时还需额外确认'
   fi
@@ -4540,11 +4637,19 @@ collect_security_audit() {
     audit_add B sudo "$file" '额外的提权规则，请确认谁可以获得 root 权限'
   done
   while IFS= read -r listener; do
+    IFS=$' \t' read -r _ _ _ _ local_address _ <<<"$listener"
     while IFS= read -r pid; do
       [[ -n "$pid" ]] || continue
       exe=$(readlink -f "$AUDIT_ROOT/proc/$pid/exe" 2>/dev/null || true)
       package=$(audit_package_owner "$exe" || true)
-      if [[ -z "$package" ]] || ! audit_debian_package "$package"; then audit_add B port "$pid" "$listener；程序=$exe；来源=${package:-不属于软件包}"; fi
+      if [[ "$package" == smartdns ]] && audit_smartdns_tool_origin; then
+        [[ "$local_address" != 127.0.0.1:53 ]] || continue
+      elif [[ -n "$package" ]] && audit_debian_package "$package"; then
+        continue
+      elif [[ "$package" == sing-box ]] && audit_singbox_sagernet_origin && audit_sagernet_repo_matches; then
+        continue
+      fi
+      audit_add B port "$pid" "$listener；程序=$exe；来源=${package:-不属于软件包}"
     done < <(grep -oE 'pid=[0-9]+' <<<"$listener" | cut -d= -f2 | sort -u)
   done < <(ss -H -lntup 2>/dev/null || true)
   [[ ! -s "$AUDIT_ROOT/etc/ld.so.preload" ]] || audit_add C preload /etc/ld.so.preload '存在全局预加载，可能影响每个程序；建议用官方镜像重装'
@@ -4915,7 +5020,7 @@ run_security_hardening() {
 print_report() {
   local ssh_listeners fail2ban_status='已安装、自启并运行；sshd 和 sshd-slow 已验证'
   local ssh_display ufw_status smartdns_ver smartdns_mode singbox_ver tcp_cc tcp_qdisc swap_val sys_dns auto_sec reboot_needed
-  local ipv6_lines line
+  local ipv6_lines line printk printk_level
   local ssh_warn=false ufw_warn=false smartdns_warn=false singbox_warn=false fail2ban_warn=false auto_sec_warn=false reboot_warn=false cleanup_warn=false
   ssh_listeners=$(ssh_listener_addresses | sort -u | paste -sd ' ' -) || ssh_listeners=''
   if [[ "$NETWORK_REQUEST" == ipv4 ]]; then verify_ipv4_policy; fi
@@ -4932,6 +5037,8 @@ print_report() {
   if [[ -z "$ssh_listeners" ]]; then ssh_warn=true; fi
   ufw_status=$(ufw status 2>/dev/null | sed -n '1p' || echo unavailable)
   if [[ "$ufw_status" != 'Status: active' ]]; then ufw_warn=true; fi
+  printk=$(sysctl -n kernel.printk 2>/dev/null) || printk=''
+  IFS=$' \t' read -r printk_level _ <<<"$printk"
   smartdns_ver=$(smartdns -v 2>/dev/null | head -1 || echo unavailable)
   if [[ "$smartdns_ver" == unavailable ]]; then smartdns_warn=true; fi
   smartdns_mode="$([[ "$NETWORK_STACK" == ipv4 ]] && echo 'A only' || echo 'A + AAAA') / $SMARTDNS_TRANSPORT"
@@ -4962,6 +5069,13 @@ print_report() {
   fi
   ui_box_kv 'SSH 实际监听  : ' "$ssh_display" "$ssh_warn"
   ui_box_kv 'UFW           : ' "$ufw_status" "$ufw_warn"
+  if [[ ! "$printk_level" =~ ^[0-9]+$ ]]; then
+    ui_box_kv '控制台日志  : ' '未知' true
+  elif (( 10#$printk_level <= 4 )); then
+    ui_box_line '控制台日志  : 只显示错误及更严重的消息（UFW 拦截日志只记入 journal）'
+  else
+    ui_box_kv '控制台日志  : ' "实际级别 $printk_level" true
+  fi
   ui_box_kv 'SmartDNS      : ' "$smartdns_ver" "$smartdns_warn"
   ui_box_line "SmartDNS 模式 : $smartdns_mode"
   ui_box_line 'SmartDNS 监听 : 127.0.0.1:53（UDP+TCP）'
@@ -6127,19 +6241,19 @@ reinstall_check_keys() {
 # accidental multi-line paste (a private key, say) never answers a later question. read -N
 # switches the terminal to non-canonical mode for that read and bash restores it afterwards, so
 # a last line without a newline is read too. At most 64 reads of up to 4096 bytes, each waiting
-# at most 0.2 s; more than 256 KiB counts as multi-line straight away. Succeeds only when the
-# discarded input holds more than blanks: extra Enter presses and CRLF line ends just vanish.
+# at most 0.2 s; 256 KiB counts as multi-line straight away. Below that limit, extra Enter
+# presses and CRLF line ends just vanish. End a partial echoed line before any warning.
 reinstall_drain_tty() {
   local LC_ALL=C chunk buf='' i
   for (( i = 0; i < 64; i++ )); do
     chunk=''
     IFS= read -r -t 0.2 -N 4096 chunk </dev/tty || true
     buf+=$chunk
-    if (( ${#buf} > 262144 )); then return 0; fi
+    if (( ${#buf} >= 262144 )); then break; fi
     [[ -n "$chunk" ]] || break
   done
-  buf=${buf//[$' \t\r\n']/}
-  [[ -n "$buf" ]]
+  (( ${#buf} >= 262144 )) || [[ -n "${buf//[$' \t\r\n']/}" ]] || return 1
+  if [[ "$buf" != *$'\n' ]]; then printf '\n' >/dev/tty || true; fi
 }
 
 # No usable key on this machine: ask for one pasted line. Nothing is written anywhere here; an
@@ -6384,7 +6498,7 @@ reinstall_print_summary() {
   fi
   ui_box_line "IPv4：$v4；MAC $REINSTALL_V4_MAC（当前网卡 $REINSTALL_V4_IFACE）"
   case "$REINSTALL_V6_MODE" in
-    none) ui_box_line 'IPv6：不配置' ;;
+    none) ui_box_line 'IPv6：不配置（当前系统没有 IPv6 默认路由；若面板分配了 IPv6，重装后需手动添加）' ;;
     auto) ui_box_line "IPv6：自动（SLAAC/RA，当前 $REINSTALL_V6_ADDR）；MAC $REINSTALL_V6_MAC（当前网卡 $REINSTALL_V6_IFACE）" ;;
     *) ui_box_line "IPv6：静态 $REINSTALL_V6_ADDR，网关 $REINSTALL_V6_GW；MAC $REINSTALL_V6_MAC（当前网卡 $REINSTALL_V6_IFACE）" ;;
   esac
@@ -7195,6 +7309,7 @@ main() {
   configure_system_dns
   configure_ssh
   configure_ufw
+  configure_console_logging
   if [[ "$PRESERVE_SSH" == false ]]; then record_trusted_keys; fi
   configure_cf8443
   if [[ "$PRESERVE_SSH" == true ]]; then

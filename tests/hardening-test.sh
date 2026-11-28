@@ -328,11 +328,16 @@ dpkg-query() {
         *'-S -- /lib/systemd/system/aliased.service'*) return 1 ;;
         *'/system/sing-box.service') echo 'sing-box: /usr/lib/systemd/system/sing-box.service' ;;
         *getty@.service*) echo 'systemd: /usr/lib/systemd/system/getty@.service' ;;
+        *'/usr/sbin/smartdns') echo 'smartdns: /usr/sbin/smartdns' ;;
+        *'/usr/bin/sing-box') echo 'sing-box: /usr/bin/sing-box' ;;
+        *'/usr/lib/libmulti-fixture') echo 'libmulti: /usr/lib/libmulti-fixture' ;;
         *) if [[ "$audit_mode" == negative || "$*" == *'/usr/bin/official'* ]]; then echo 'official: /usr/bin/official'; else return 1; fi ;;
       esac ;;
     -W)
-      if [[ "$*" == *'${Version}'* ]]; then echo 1.0
-      elif [[ "$*" == *'${binary:Package}'* ]]; then printf 'official\tinstalled\n'; [[ "$audit_mode" != positive ]] || printf 'external\tinstalled\nexim4-base\tinstalled\nwalinuxagent\tinstalled\nvendor-barad\tinstalled\n'
+      if [[ "$*" == *'${binary:Package}'* ]]; then
+        printf 'official\tinstalled\t1.0\n'
+        [[ "$audit_mode" != positive ]] || printf '%s\tinstalled\t1.0\n' external exim4-base walinuxagent vendor-barad
+      elif [[ "$*" == *'${Version}'* ]]; then echo 1.0
       else return 1; fi ;;
     *) return 1 ;;
   esac
@@ -345,17 +350,27 @@ check_audit_apt_cache_args() {
   }
 }
 apt-cache() {
-  local IFS=' '
+  local package
   check_audit_apt_cache_args "$@" || return 1
-  shift 4
-  if [[ "$*" == policy ]]; then
+  if (( $# == 5 )); then
     printf '1001 https://deb.debian.org/debian trixie/main amd64 Packages\n     release o=Debian,a=stable,n=trixie\n'
-  elif [[ "$*" == *'external'* || "$*" == *'vendor-barad'* ]]; then
-    printf '  Version table:\n *** 1.0 100\n        500 https://vendor.invalid stable/main amd64 Packages\n        100 /var/lib/dpkg/status\n     0.9 1001 (phased 50%%)\n       1001 https://deb.debian.org/debian trixie/main amd64 Packages\n'
-  else
-    printf '  Version table:\n *** 1.0 1001 (phased 50%%)\n       1001 https://deb.debian.org/debian trixie/main amd64 Packages\n        100 /var/lib/dpkg/status\n'
+    return
   fi
+  [[ "$6" == -- ]] || fail 'apt-cache package arguments need --'
+  shift 6
+  for package; do
+    printf '%s:\n' "${package%:amd64}"
+    case "$package" in
+      libmulti:i386)
+        printf '  Version table:\n *** 2.0 100\n        100 /var/lib/dpkg/status\n' ;;
+      external|vendor-barad|smartdns)
+        printf '  Version table:\n *** 1.0 100\n        500 https://vendor.invalid stable/main amd64 Packages\n        100 /var/lib/dpkg/status\n     0.9 1001 (phased 50%%)\n       1001 https://deb.debian.org/debian trixie/main amd64 Packages\n' ;;
+      *)
+        printf '  Version table:\n *** 1.0 1001 (phased 50%%)\n       1001 https://deb.debian.org/debian trixie/main amd64 Packages\n        100 /var/lib/dpkg/status\n' ;;
+    esac
+  done
 }
+dpkg() { [[ "$*" == --print-architecture ]] && echo amd64; }
 systemctl() {
   local IFS=' '
   case "$*" in
@@ -401,6 +416,12 @@ printf '%s\n%s\n' "$current" "$other" >"$file"
 rm "$TRUSTED_KEYS_STATE"
 collect_security_audit
 print_security_audit full >"$work/positive"
+(
+  audit_preload_apt_policies() { return 1; }
+  collect_security_audit
+  printf '%s\n' "${AUDIT_FINDINGS[@]}"
+) >"$work/per-package-findings"
+diff -u "$work/per-package-findings" <(printf '%s\n' "${AUDIT_FINDINGS[@]}")
 for detector in key cloud qga agent mail package service cron sudo port preload uid ssh; do
   printf '%s\n' "${AUDIT_FINDINGS[@]}" | grep -q $'\t'"$detector"$'\t' || fail "missing positive $detector"
 done
@@ -472,6 +493,63 @@ collect_security_audit
 [[ ${#AUDIT_FINDINGS[@]} == 0 ]] || { print_security_audit full; fail 'negative fixture has findings'; }
 audit_debian_package official || fail 'seven-space Debian origin at priority 1001 was rejected'
 
+(
+  eval "fixture_$(declare -f dpkg-query)"
+  eval "fixture_$(declare -f apt-cache)"
+  dpkg-query() {
+    local IFS=' '
+    printf '%s\n' "$*" >>"$work/dpkg-query-count"
+    if [[ "$1" == -W && "$2" == '-f=${binary:Package}\t${db:Status-Status}\t${Version}\n' ]]; then
+      printf 'pkg-%d\tinstalled\t1.0\n' {1..298}
+      printf 'libmulti:amd64\tinstalled\t1.0\nlibmulti:i386\tinstalled\t2.0\nremoved\tconfig-files\t1.0\n'
+      if [[ "$batch_failure" != none ]]; then printf 'extra-%d\tinstalled\t1.0\n' {301..502}; fi
+    else
+      fixture_dpkg-query "$@"
+    fi
+  }
+  apt-cache() {
+    local IFS=' '
+    printf '%s\n' "${*:6}" >>"$work/apt-call-count"
+    if (( $# == 8 )) && [[ "$7" == extra-501 && "$8" == extra-502 ]]; then
+      case "$batch_failure" in
+        exit) return 1 ;;
+        unparseable) printf 'Unexpected policy output\n'; return 0 ;;
+      esac
+    fi
+    fixture_apt-cache "$@"
+  }
+  readlink() {
+    if [[ "$2" == "$root/proc/324/exe" ]]; then echo /usr/lib/libmulti-fixture; else command readlink "$@"; fi
+  }
+  ss() {
+    printf 'tcp LISTEN 0 128 0.0.0.0:9999 0.0.0.0:* users:(("fixture",pid=321,fd=3))\n'
+    printf 'tcp LISTEN 0 128 0.0.0.0:9998 0.0.0.0:* users:(("fixture",pid=321,fd=4))\n'
+    printf 'tcp LISTEN 0 128 0.0.0.0:9997 0.0.0.0:* users:(("fixture",pid=324,fd=5))\n'
+  }
+  # The existing owner stub returns 'official', which is absent from this installed list.
+  : >"$work/apt-call-count"
+  : >"$work/dpkg-query-count"
+  batch_failure=none
+  collect_security_audit
+  apt_calls=$(wc -l <"$work/apt-call-count")
+  version_queries=$(grep -c '^-W ' "$work/dpkg-query-count")
+  [[ "$apt_calls" == 3 ]] || fail "300 packages plus a cache miss made $apt_calls apt-cache calls, expected 3"
+  # One inventory, one cloud-init status check and one listener version lookup.
+  [[ "$version_queries" == 3 ]] || fail "300 packages plus a cache miss made $version_queries dpkg-query -W calls, expected 3"
+  grep -Fxq -- '-W -f=${Version} -- official' "$work/dpkg-query-count" || fail 'uncached owner version was not queried separately'
+  grep -Fxq -- '-- official' "$work/apt-call-count" || fail 'uncached listener owner was not queried separately'
+  if has_finding $'^B\tport\t'; then fail 'official owner found via fallback was reported'; fi
+  [[ "${#AUDIT_FINDINGS[@]}" == 1 ]] && has_finding $'^B\tpackage\tlibmulti:i386\t' ||
+    fail 'native and foreign apt-cache headings were not kept distinct'
+  expected_findings=$(printf '%s\n' "${AUDIT_FINDINGS[@]}")
+  for batch_failure in exit unparseable; do
+    : >"$work/apt-call-count"
+    collect_security_audit
+    [[ "$(printf '%s\n' "${AUDIT_FINDINGS[@]}")" == "$expected_findings" ]] || fail "changed findings after $batch_failure batch"
+    grep -Fxq -- '-- pkg-1' "$work/apt-call-count" || fail "partial cache retained after $batch_failure batch"
+  done
+)
+
 # --audit dispatch has no writes, even to lock/backup/DNS; compare content + metadata
 # across the entire fixture, including hidden files and symlinks. Audit emits to stdout.
 snapshot() { find "$root" -printf '%P %y %m %U %G %s %T@ %l\n'; find "$root" -type f -exec sha256sum {} +; }
@@ -479,21 +557,32 @@ snapshot() { find "$root" -printf '%P %y %m %U %G %s %T@ %l\n'; find "$root" -ty
   eval "fixture_$(declare -f dpkg-query)"
   eval "fixture_$(declare -f apt-cache)"
   dpkg-query() {
-    if [[ "$1" == -W && "$2" == '-f=${binary:Package}\t${db:Status-Status}\n' ]]; then
-      printf 'sing-box\tinstalled\nexternal\tinstalled\n'
+    if [[ "$1" == -W && "$2" == '-f=${binary:Package}\t${db:Status-Status}\t${Version}\n' ]]; then
+      printf '%s\tinstalled\t1.0\n' sing-box external
     else
       fixture_dpkg-query "$@"
     fi
   }
   apt-cache() {
-    if [[ "$*" == *'sing-box' ]]; then
-      check_audit_apt_cache_args "$@" || return 1
-      printf '  Version table:\n *** 1.0 100\n        100 /var/lib/dpkg/status\n'
-      if [[ -n "$installed_origin" ]]; then printf '       1001 %s * Packages\n' "$installed_origin"; fi
-      printf '     1e0 500 (phased 50%%)\n        500 https://deb.sagernet.org/ * Packages\n'
-    else
-      fixture_apt-cache "$@"
-    fi
+    if (( $# == 5 )); then fixture_apt-cache "$@"; return; fi
+    check_audit_apt_cache_args "$@" || return 1
+    shift 6
+    local package
+    for package; do
+      if [[ "$package" == sing-box ]]; then
+        printf 'sing-box:\n  Version table:\n *** 1.0 100\n        100 /var/lib/dpkg/status\n'
+        if [[ -n "$installed_origin" ]]; then printf '       1001 %s * Packages\n' "$installed_origin"; fi
+        printf '     1e0 500 (phased 50%%)\n        500 https://deb.sagernet.org/ * Packages\n'
+      else
+        fixture_apt-cache -o Dir::Cache::pkgcache= -o Dir::Cache::srcpkgcache= policy -- "$package"
+      fi
+    done
+  }
+  readlink() {
+    if [[ "$2" == "$root/proc/322/exe" ]]; then echo /usr/bin/sing-box; else command readlink "$@"; fi
+  }
+  ss() {
+    echo 'tcp LISTEN 0 128 0.0.0.0:8443 0.0.0.0:* users:(("sing-box",pid=322,fd=3))'
   }
   curl() { fail 'audit attempted a download'; }
   gpg() { fail 'audit invoked gpg'; }
@@ -517,6 +606,7 @@ snapshot() { find "$root" -printf '%P %y %m %U %G %s %T@ %l\n'; find "$root" -ty
     audit_singbox_sagernet_origin || fail 'seven-space SagerNet origin at priority 1001 was rejected'
     collect_security_audit
     if package_finding sing-box ''; then fail 'managed sing-box was reported'; fi
+    if has_finding $'^B\tport\t322\t'; then fail 'managed sing-box port was reported'; fi
     package_finding external "$generic" || fail 'other third-party package was omitted'
   done
   snapshot >"$work/sager-after"
@@ -525,6 +615,7 @@ snapshot() { find "$root" -printf '%P %y %m %U %G %s %T@ %l\n'; find "$root" -ty
   for installed_origin in '' 'https://deb.sagernet.org.example.invalid' 'https://deb.sagernet.org/other'; do
     collect_security_audit
     package_finding sing-box "$generic" || fail 'unverified installed origin did not get the ordinary warning'
+    has_finding $'^B\tport\t322\t' || fail 'sing-box port with unverified origin was omitted'
   done
 
   installed_origin='https://deb.sagernet.org/'
@@ -533,6 +624,7 @@ snapshot() { find "$root" -printf '%P %y %m %U %G %s %T@ %l\n'; find "$root" -ty
     printf 'deb https://DeB.SaGeRnEt.OrG/ stable main\n' >"$extra_source"
     collect_security_audit
     package_finding sing-box "$foreign" || fail "duplicate SagerNet reference was accepted: $extra_source"
+    has_finding $'^B\tport\t322\t' || fail 'sing-box port with unmanaged repo was omitted'
     rm "$extra_source"
   done
 
@@ -554,6 +646,62 @@ snapshot() { find "$root" -printf '%P %y %m %U %G %s %T@ %l\n'; find "$root" -ty
   ln -s "$key_path.real" "$key_path"
   collect_security_audit
   package_finding sing-box "$foreign" || fail 'symlinked key was accepted'
+)
+(
+  eval "fixture_$(declare -f dpkg-query)"
+  eval "fixture_$(declare -f dpkg)"
+  dpkg-query() {
+    case "$2" in
+      '-f=${binary:Package}\t${db:Status-Status}\t${Version}\n') printf 'smartdns\tinstalled\t%s\n' "$smartdns_version" ;;
+      '-f=${db:Status-Status}\t${Version}') printf '%s\t%s' "$smartdns_status" "$smartdns_version" ;;
+      *) fixture_dpkg-query "$@" ;;
+    esac
+  }
+  dpkg() {
+    if [[ "$1" == --verify && "$2" == smartdns ]]; then
+      printf '%s' "$smartdns_verification"
+      return "$smartdns_verify_rc"
+    fi
+    fixture_dpkg "$@"
+  }
+  readlink() {
+    if [[ "$2" == "$root/proc/323/exe" ]]; then echo /usr/sbin/smartdns; else command readlink "$@"; fi
+  }
+  ss() {
+    printf 'udp UNCONN 0 0 %s 0.0.0.0:* users:(("smartdns",pid=323,fd=3))\n' "$smartdns_address"
+  }
+  pin="$root$SMARTDNS_APT_PIN"
+  mkdir -p "${pin%/*}"
+  touch "$pin"
+  smartdns_status=installed smartdns_version=$SMARTDNS_DEB_VERSION smartdns_verify_rc=0
+  smartdns_address=127.0.0.1:53
+  smartdns_verification=$'??5?????? c /etc/smartdns/smartdns.conf\n??5?????? c /etc/default/smartdns'
+  collect_security_audit
+  [[ ${#AUDIT_FINDINGS[@]} == 0 ]] || fail 'managed loopback SmartDNS was reported'
+
+  for smartdns_address in 0.0.0.0:53 '[::]:53' 127.0.0.1:5353; do
+    collect_security_audit
+    [[ ${#AUDIT_FINDINGS[@]} == 1 ]] && has_finding $'^B\tport\t323\t' || fail "wrong findings for SmartDNS on $smartdns_address"
+  done
+  smartdns_address=127.0.0.1:53
+
+  for problem in version status missing-pin symlink-pin binary verify-error; do
+    (
+      case "$problem" in
+        version) smartdns_version=1.0 ;;
+        status) smartdns_status='config-files' ;;
+        missing-pin) rm "$pin" ;;
+        symlink-pin) mv "$pin" "$pin.real"; ln -s "$pin.real" "$pin" ;;
+        binary) smartdns_verification+=$'\n??5??????   /usr/sbin/smartdns' ;;
+        verify-error) smartdns_verify_rc=1 ;;
+      esac
+      collect_security_audit
+      has_finding $'^B\tpackage\tsmartdns\t本地缓存不能证明已安装版本来自 Debian 官方源' || fail "SmartDNS package warning missing for $problem"
+      has_finding $'^B\tport\t323\t' || fail "SmartDNS port warning missing for $problem"
+    )
+    rm -f "$pin"
+    touch "$pin"
+  done
 )
 snapshot >"$work/before"
 (
